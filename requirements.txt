@@ -28,4 +28,16 @@ pyspark==4.0.4
 #
 # Ele fica em cache no ~/.ivy2 depois do primeiro download.
 
-# confluent-kafka  -> entra na Etapa 3, junto com o gerador de eventos.
+# --- Etapa 3: gerador de eventos --------------------------------------
+#
+# confluent-kafka e um binding da biblioteca C librdkafka. A alternativa
+# obvia, kafka-python, e Python puro e nao sustenta as taxas necessarias —
+# o gerador viraria o gargalo e o experimento estaria medindo o gerador.
+#
+# librdkafka 2.15.0 vem embutida no wheel; nao precisa instalar nada no
+# sistema.
+
+confluent-kafka==2.15.0
+
+# Le o shared/data-generator/config.yaml.
+PyYAML==6.0.2

@@ -1,0 +1,80 @@
+# Configuracao do gerador de eventos.
+#
+# Este arquivo e ARNES COMPARTILHADO: o pipeline Flink (OE 2) usa o mesmo
+# gerador com o mesmo config. Ver CONTRATO.md secao 5 — "Gerador e seed:
+# mesmo binario, mesma seed, mesmo config.yaml".
+#
+# Rodar:
+#   ~/.venvs/tcc/bin/python shared/data-generator/generator.py
+#
+# Sobrescrever sem editar o arquivo (util para varrer cargas na Etapa 11):
+#   RATE=1000 DURATION=600 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
+
+broker: "localhost:9092"
+topic: "ecommerce.events.v1"
+
+# --- Identidade da execucao -------------------------------------------
+# gen_id identifica o PROCESSO gerador; run_id identifica a EXECUCAO.
+# Varios geradores em paralelo tem gen_ids diferentes e o MESMO run_id.
+# run_id nulo = gerado automaticamente no formato 20260904T153000Z-r100.
+gen_id: 0
+run_id: null
+
+# Seed fixa. Sem ela a carga nao e reproduzivel e a comparacao com o Flink
+# deixa de valer (CONTRATO.md 5.1).
+seed: 42
+
+# --- Carga -------------------------------------------------------------
+rate_per_sec: 100
+duration_sec: 60
+
+# --- Dominio dos dados (CONTRATO.md secao 1) ---------------------------
+# users=2000 nao tem relacao com o volume de carga: ele controla quao
+# uniformemente as chaves se espalham pelas 24 particoes. Ver CONTRATO 1.4.
+users: 2000
+products: 10000
+
+# Mistura dos tipos de evento. Fica declarada aqui porque governa quantos
+# eventos tem `amount` nulo e, portanto, o tamanho medio do payload — que o
+# contrato exige medir e registrar.
+event_type_weights:
+  add_to_cart: 0.15
+  pageview: 0.70
+  payment: 0.05
+  purchase: 0.10
+
+amount_min: 5.0
+amount_max: 500.0
+
+# Probabilidade de um usuario iniciar nova sessao a cada evento. Com 0.05,
+# uma sessao dura ~20 eventos. Sessoes existem para que a ordem dentro da
+# sessao signifique alguma coisa — o que a escolha de user_id como chave da
+# mensagem garante (CONTRATO.md 1.3).
+session_rotate_prob: 0.05
+
+# --- Produtor Kafka (decisao 3.1, Etapa 3) -----------------------------
+producer:
+  # acks=all: o broker so confirma depois de gravar nas replicas in-sync.
+  # Sem isso, "evento perdido" pode ser falha do gerador e nao do pipeline.
+  acks: "all"
+
+  # lz4: mesma familia do snappy — rapido, taxa moderada. A taxa obtida e
+  # registrada porque afeta o custo de rede (planoNRT3 secao 6).
+  compression.type: "lz4"
+
+  # murmur2_random em vez do consistent_random (CRC32) padrao do librdkafka.
+  # Motivo: murmur2 e o que o cliente Java do Kafka usa, ou seja, o que todo
+  # o resto do ecossistema assume. Com ele, uma chave produzida pelo
+  # kafka-console-producer cai na MESMA particao que este gerador usaria —
+  # o que torna a verificacao manual possivel em vez de enganosa.
+  partitioner: "murmur2_random"
+
+  # O produtor espera ate 5 ms acumulando mensagens antes de enviar. A 100
+  # evt/s e irrelevante; a 17k evt/s e o que separa atingir a taxa de nao
+  # atingir, porque sem agrupamento seria uma ida e volta ao broker por
+  # evento, com acks=all.
+  #
+  # Estes 5 ms ENTRAM na latencia medida (o event_ts e carimbado antes da
+  # fila), mas sao 0,1% de um trigger de 5 s. So revisar se a Etapa 9
+  # mostrar que 17k nao fecha.
+  linger.ms: 5

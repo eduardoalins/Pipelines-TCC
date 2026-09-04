@@ -45,6 +45,20 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
 
+      # --- Onde os dados ficam -------------------------------------------
+      # OBRIGATORIO, e a armadilha custou a Etapa 1 inteira: a imagem
+      # apache/kafka DECLARA /var/lib/kafka/data como VOLUME, mas o
+      # log.dirs padrao dela aponta para /tmp/kafka-logs. Declaracao de
+      # volume e diretorio efetivamente usado sao coisas diferentes aqui —
+      # ao contrario da imagem da Confluent, onde coincidem.
+      #
+      # Sem esta linha o broker grava na camada gravavel do container: o
+      # topico sobrevive a `docker restart`, mas morre em qualquer
+      # `docker compose down`. O volume ficaria vazio o tempo todo, sem
+      # nenhum aviso, e o Experimento C reportaria como perda de dados do
+      # Kafka o que seria artefato do container.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
       # --- Replicacao ----------------------------------------------------
       # Fator 1 porque ha um broker so. Na AWS (Etapa 10) sobe para 3 com
       # min.insync.replicas=2, e o CONTRATO.md registra a diferenca: os
@@ -81,7 +95,8 @@ services:
 
     volumes:
       # A imagem apache/kafka declara TRES caminhos como VOLUME:
-      #   /var/lib/kafka/data   os dados (topico, particoes, mensagens)
+      #   /var/lib/kafka/data   os dados — SO se KAFKA_LOG_DIRS apontar
+      #                         para ca; ver o comentario la em cima
       #   /etc/kafka/secrets    certificados TLS — nao usamos
       #   /mnt/shared/config    config compartilhada — nao usamos
       #
