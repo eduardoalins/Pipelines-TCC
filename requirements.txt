@@ -1,0 +1,31 @@
+# Versoes travadas — decisao E7, Etapa 1.
+#
+# Estes numeros fazem parte do metodo experimental. Trocar qualquer um deles
+# no meio dos experimentos invalida as execucoes ja feitas, porque os
+# resultados deixam de ser comparaveis entre si.
+#
+# A cadeia foi verificada de ponta a ponta em 03/09/2026 por
+# scripts/check_chain.py, nao assumida:
+#
+#     Python 3.12.3 -> PySpark 4.0.4 -> JVM 17.0.20 -> conector Scala 2.13
+#                   -> broker Kafka 4.0.2 -> topico com 24 particoes
+#
+# Por que 4.0.x e nao 4.2: o 4.0 esta em campo desde meados de 2025 e tem
+# comunidade grande o bastante para que um erro colado no Google encontre
+# resposta. O 4.2 e recente demais para isso.
+#
+# Por que nao 3.5.x, que tem mais tutoriais: o suporte a Python 3.12 na
+# linha 3.5 e incerto, e esse atrito trava justamente a Etapa 4.
+
+pyspark==4.0.4
+
+# O conector do Kafka NAO e instalado por pip. O Spark o resolve do Maven em
+# tempo de execucao, e o sufixo de Scala precisa casar com a versao do Spark
+# (4.x usa Scala 2.13; a linha 3.x usava 2.12). Errar isso produz um
+# "ClassNotFoundException" que nao diz qual e a causa real:
+#
+#     org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.4
+#
+# Ele fica em cache no ~/.ivy2 depois do primeiro download.
+
+# confluent-kafka  -> entra na Etapa 3, junto com o gerador de eventos.

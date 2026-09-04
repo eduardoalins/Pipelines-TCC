@@ -1,0 +1,116 @@
+# Kafka em modo KRaft, um unico broker, para a fase local do TCC.
+#
+# KRaft = o Kafka gerencia os proprios metadados, sem ZooKeeper. Um processo
+# em vez de dois: menos memoria e uma peca a menos para explicar na
+# dissertacao sem que ela agregue nada a comparacao NRT vs Streaming.
+#
+# Subir:   docker compose up -d
+# Parar:   docker compose down          (mantem os dados)
+# Zerar:   docker compose down -v       (APAGA o topico e as mensagens)
+
+services:
+  kafka:
+    # Versao travada (decisao E7). Nao atualizar no meio dos experimentos:
+    # execucoes feitas com versoes diferentes deixam de ser comparaveis.
+    image: apache/kafka:4.0.2
+    container_name: kafka
+    hostname: kafka
+
+    ports:
+      # 9092 e a porta que o Spark, o Flink e o gerador usam.
+      # O controlador (9093) fica interno ao container de proposito: nenhum
+      # cliente deve falar com ele.
+      - "9092:9092"
+
+    environment:
+      # --- Identidade do no ---------------------------------------------
+      # Combined mode: este unico processo e broker e controlador ao mesmo
+      # tempo. So faz sentido com um no; em producao os papeis se separam.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- Listeners: a fonte numero 1 de "sobe mas ninguem conecta" -----
+      # O Kafka nao entrega so mensagens: ele entrega ao cliente o endereco
+      # onde o cliente deve se conectar dali em diante. Se anunciar um
+      # endereco que o cliente nao alcanca, a conexao inicial funciona e
+      # todas as seguintes falham — com um erro que nao diz isso.
+      #
+      # Por isso dois enderecos distintos:
+      #   INTERNAL (kafka:29092)   quem esta na rede do Docker
+      #   EXTERNAL (localhost:9092) o Spark e o gerador, que rodam no WSL
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # --- Replicacao ----------------------------------------------------
+      # Fator 1 porque ha um broker so. Na AWS (Etapa 10) sobe para 3 com
+      # min.insync.replicas=2, e o CONTRATO.md registra a diferenca: os
+      # numeros locais e os da nuvem nao sao intercambiaveis.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+
+      # --- Guarda de integridade experimental ----------------------------
+      # DESLIGADO DE PROPOSITO. Com auto-create ligado, um erro de digitacao
+      # no nome do topico nao falha: o Kafka cria um topico novo com UMA
+      # particao, o pipeline le vazio, o experimento roda com paralelismo 1
+      # e o numero reportado esta errado sem nenhum erro na tela.
+      # Desligado, um nome errado falha alto e na hora.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # Rebalanceamento imediato. O default de 3s existe para evitar
+      # rebalances em cascata em cluster grande; com um consumidor local
+      # so atrasa o inicio de cada execucao.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Retencao explicita em vez de implicita: 7 dias. Fica registrado
+      # para que ninguem precise adivinhar o default da versao usada.
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+      # --- Memoria (ver env/wslconfig) -----------------------------------
+      # O teto do WSL e um freio de emergencia; o controle preciso e este.
+      # 512m de heap sobra para 100 evt/s: a 200 bytes por evento isso da
+      # ~20 KB/s, e o Kafka guarda os dados em disco, nao em heap.
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+
+    # Teto do container: heap 512m + overhead da JVM + page cache.
+    mem_limit: 1g
+
+    volumes:
+      # A imagem apache/kafka declara TRES caminhos como VOLUME:
+      #   /var/lib/kafka/data   os dados (topico, particoes, mensagens)
+      #   /etc/kafka/secrets    certificados TLS — nao usamos
+      #   /mnt/shared/config    config compartilhada — nao usamos
+      #
+      # Os tres sao nomeados de proposito. Se um deles ficasse sem destino,
+      # o Docker criaria um volume ANONIMO a cada `up` — e `docker compose
+      # down` sem -v nao os remove. Ao longo dos Experimentos A e B, que
+      # sobem e derrubam o broker dezenas de vezes, o `docker volume ls`
+      # acumularia centenas de entradas de lixo, escondendo justamente o
+      # volume que precisa ser conferido antes de cada execucao.
+      - kafka-data:/var/lib/kafka/data
+      - kafka-secrets:/etc/kafka/secrets
+      - kafka-config:/mnt/shared/config
+
+    healthcheck:
+      # Pergunta ao proprio broker se ele responde. "started" no docker ps
+      # significa que o processo subiu, nao que o Kafka aceita conexao.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+    restart: unless-stopped
+
+volumes:
+  # Este e o unico que guarda algo. Apagar com `docker compose down -v`
+  # zera o topico e todas as mensagens — e o que se faz antes de comecar
+  # uma bateria oficial de benchmarks, para nenhuma execucao herdar dados
+  # da anterior.
+  kafka-data:
+  kafka-secrets:
+  kafka-config:

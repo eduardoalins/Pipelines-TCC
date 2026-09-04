@@ -1,0 +1,63 @@
+# Copia versionada do arquivo que deve ficar em C:\Users\<voce>\.wslconfig
+#
+# Este arquivo NAO tem efeito aqui dentro do repositorio. O WSL le apenas
+# C:\Users\<voce>\.wslconfig. Ele vive no git para que a configuracao da
+# maquina de experimentos seja parte do metodo, e nao um detalhe perdido.
+#
+# Para instalar numa maquina nova, rode no PowerShell do Windows:
+#     Copy-Item env\wslconfig "$env:USERPROFILE\.wslconfig"
+#     wsl --shutdown
+#     wsl -d Ubuntu -- free -h        # deve mostrar ~9.7Gi
+#
+# O scripts/setup_env.sh nao faz esse passo de proposito: ele roda dentro do
+# WSL, e o wsl --shutdown necessario para aplicar a config mataria a propria
+# sessao do script no meio da execucao.
+
+[wsl2]
+# Limite fixo de memoria: controle experimental do TCC.
+# Sem isso o WSL2 usa ate 50% da RAM de forma dinamica, o que faz cada
+# repeticao de um benchmark rodar sob um orcamento de memoria diferente.
+#
+# 4GB, dimensionado para a FASE DE APRENDIZADO (Etapas 1 a 7, 100 evt/s):
+#   Kafka heap 512m ....... ~800 MB
+#   Spark local, driver 1g  ~1.4 GB
+#   gerador Python ........ ~150 MB
+#   kernel WSL + Docker ... ~700 MB
+#   total ................. ~3.1 GB, com folga dentro dos 4GB
+#
+# Isto e um TETO, nao uma reserva. O WSL cresce sob demanda e devolve o que
+# nao usa: com o pipeline parado ele fica em ~1.9GB seja o teto 4 ou 10GB.
+# O teto e freio de emergencia — se o Spark surtar, ele morre com um erro
+# claro em vez de arrastar o Windows junto.
+#
+# HISTORICO: comecou em 10GB, seguindo a conta do plano sem checar o host.
+# O WSL congelou duas vezes com HCS_E_CONNECTION_TIMEOUT usando apenas
+# 2.2GB — a causa era o Windows cheio (16GB no total, ~14GB consumidos por
+# VS Code, Defender, Discord e Steam), nao o teto do WSL. Baixar o teto
+# ajuda de forma indireta, impedindo que o WSL piore uma situacao ja justa.
+#
+# O controle preciso NAO e este teto, e sim o limite de cada servico:
+# KAFKA_HEAP_OPTS no docker-compose e --driver-memory no spark-submit.
+#
+# REVISAR antes da Etapa 8, quando comeca a medicao local de verdade.
+# Ao portar para outra maquina, este numero e funcao da RAM total do host.
+memory=4GB
+
+# 8 de 12 nucleos. O i5-12500H tem 4 efficiency cores mais lentos; limitar
+# mantem a carga nos performance cores e reduz variancia entre repeticoes.
+processors=8
+
+# Swap desligado. Se o Spark estourar a memoria, quero que ele falhe de forma
+# visivel (OOM) em vez de degradar em silencio via disco e contaminar a latencia.
+swap=0
+
+# Localhost do Windows enxerga portas abertas dentro do WSL (Kafka 9092,
+# Spark UI 4040) sem precisar descobrir o IP da distro a cada reinicio.
+localhostForwarding=true
+
+[experimental]
+# Devolve memoria livre ao Windows em vez de segurar o balao alocado.
+# ATENCAO: no WSL 2.4.13 esta chave vive aqui. Em versoes mais novas ela
+# migrou para a secao [wsl2]; se aparecer o aviso "Chave desconhecida",
+# e isso.
+autoMemoryReclaim=gradual

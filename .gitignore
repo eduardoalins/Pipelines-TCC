@@ -1,0 +1,52 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.Python
+*.egg-info/
+
+# --- Dados e artefatos de execucao ---
+# Nada de saida de pipeline no git. Parquet, checkpoint e metricas brutas
+# ficam fora do repositorio; o que versionamos sao os CSVs agregados da analise.
+data/
+checkpoints/
+out/
+*.parquet
+*.crc
+_spark_metadata/
+
+# --- Logs ---
+logs/
+*.log
+spark-warehouse/
+derby.log
+metastore_db/
+
+# --- Segredos e credenciais ---
+# AWS Academy Learner Lab rotaciona credenciais a cada sessao; elas nunca
+# entram no repositorio.
+.env
+*.pem
+credentials
+aws_credentials
+.aws/
+
+# --- Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+.terraform.lock.hcl
+
+# --- Sistema operacional / IDE ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Temporarios ---
+_iotest.bin
+tmp/

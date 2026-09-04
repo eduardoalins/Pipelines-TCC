@@ -1,0 +1,23 @@
+# Este repositorio e editado no Windows mas executado dentro do WSL/Linux.
+# Sem estas regras o git converte LF em CRLF ao fazer checkout, e todo script
+# shell passa a falhar com "bad interpreter: /bin/bash^M" — um erro que nao
+# diz o que realmente aconteceu e custa horas para diagnosticar.
+
+* text=auto eol=lf
+
+# Consumidos por um interpretador Linux: CRLF quebra de forma dura.
+*.sh        text eol=lf
+*.py        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.conf      text eol=lf
+Dockerfile  text eol=lf
+
+# Arquivos de configuracao lidos pelo Windows.
+*.ps1       text eol=crlf
+
+# Binarios: nunca converter.
+*.parquet   binary
+*.jar       binary
+*.png       binary
+*.pdf       binary
