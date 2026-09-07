@@ -64,7 +64,9 @@ MASTER = os.getenv("MASTER", "local[*]")
 
 # --- Conector do Kafka ---------------------------------------------------
 # O conector NAO e instalado por pip: o Spark o resolve do Maven em tempo de
-# execucao e guarda em cache no ~/.ivy2.
+# execucao e guarda em cache no ~/.ivy2.5.2 — o diretorio leva a versao do Ivy
+# embutido no Spark (2.5.3 no Spark 4.0.4), e NAO e o ~/.ivy2 da convencao
+# antiga. Conferido no log de 07/09/2026.
 #
 # O sufixo de Scala precisa casar com a versao do Spark — a linha 4.x usa
 # 2.13, a 3.x usava 2.12 — e errar isso produz um ClassNotFoundException que

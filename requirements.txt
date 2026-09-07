@@ -26,7 +26,14 @@ pyspark==4.0.4
 #
 #     org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.4
 #
-# Ele fica em cache no ~/.ivy2 depois do primeiro download.
+# Ele fica em cache no ~/.ivy2.5.2 depois do primeiro download (o diretorio leva
+# a versao do Ivy embutido no Spark, nao e o ~/.ivy2 da convencao antiga).
+#
+# Ele arrasta 10 dependencias transitivas, entre elas o kafka-clients 3.9.1 —
+# ou seja, o cliente que o Spark usa NAO e da mesma versao do broker (4.0.2).
+# E normal, o protocolo do Kafka e compativel entre versoes, mas fica
+# registrado: essas versoes participam da medicao e sao fixadas indiretamente,
+# pela versao do conector.
 
 # --- Etapa 3: gerador de eventos --------------------------------------
 #

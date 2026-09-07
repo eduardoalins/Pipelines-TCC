@@ -199,7 +199,8 @@ deste tipo travam, e o erro típico — `ClassNotFoundException` — não indica
 causa real. Aqui ele aparece cedo e barato.
 
 O conector **não** vem por `pip`: o Spark o resolve do Maven em tempo de execução
-e guarda em cache no `~/.ivy2`. O sufixo `_2.13` precisa casar com a versão do
+e guarda em cache no `~/.ivy2.5.2` — o diretório leva a versão do Ivy embutido no
+Spark, e **não** é o `~/.ivy2` da convenção antiga. O sufixo `_2.13` precisa casar com a versão do
 Spark (a linha 4.x usa Scala 2.13; a 3.x usava 2.12). A primeira execução baixa
 os jars e demora; as seguintes usam o cache.
 
@@ -318,7 +319,13 @@ onde aparecem o número de linhas por batch e a duração de cada um.
 ```bash
 TRIGGER="30 seconds" bash pipeline-nrt/run_local.sh
 STARTING_OFFSETS=latest bash pipeline-nrt/run_local.sh
+DRIVER_MEMORY=2g bash pipeline-nrt/run_local.sh
 ```
+
+Para parar: `Ctrl+C`. O código de saída será **130** — a convenção do shell para
+"terminado por SIGINT". Isso é o esperado, não erro: o sinal vai para o grupo de
+processos e a JVM em primeiro plano encerra por ele. O job só terá um código de
+saída com significado quando ganhar uma condição de parada própria, na Etapa 8.
 
 > **Por que existe um lançador em vez de `python main.py`.** Duas configurações
 > precisam existir **antes** de a JVM do driver subir, e o código Python roda
