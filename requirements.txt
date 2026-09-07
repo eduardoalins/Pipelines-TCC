@@ -40,4 +40,10 @@ pyspark==4.0.4
 confluent-kafka==2.15.0
 
 # Le o shared/data-generator/config.yaml.
-PyYAML==6.0.2
+#
+# 6.0.3 e a versao efetivamente instalada e usada em todas as execucoes ate
+# aqui. O pin dizia 6.0.2 por engano — conferido com `pip list` em 08/09/2026 e
+# alinhado com a realidade, que e o criterio da decisao E7: o requirements.txt
+# precisa descrever a maquina que produziu os numeros, nao a que se pretendia
+# ter.
+PyYAML==6.0.3
