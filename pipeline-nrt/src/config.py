@@ -62,6 +62,55 @@ DRIVER_MEMORY = os.getenv("DRIVER_MEMORY", "1g")
 MASTER = os.getenv("MASTER", "local[*]")
 
 
+# --- Destino (CONTRATO.md secao 4) ---------------------------------------
+# Layout fixado pelo contrato:
+#
+#     <base>/events/run_id=<run_id>/dt=<YYYY-MM-DD>/hh=<HH>/part-*.parquet
+#
+# <base> e a UNICA diferenca entre local e nuvem, e por isso vive isolado aqui.
+# Local e ~/tcc-data/out e nao ./data/out dentro do repositorio: a Etapa 0 mediu
+# 1,2 GB/s em ext4 nativo contra 77,4 MB/s em /mnt/c (drvfs). Com a saida no
+# repositorio, o gargalo do pipeline seria o sistema de arquivos do Windows e o
+# Experimento A estaria medindo drvfs em vez de Spark.
+BASE_OUT = os.getenv("BASE", os.path.expanduser("~/tcc-data/out"))
+DIR_EVENTOS = f"{BASE_OUT}/events"
+
+# Codec do Parquet — CONTRATO.md secao 4.4, invariante de comparabilidade.
+#
+# Declarado explicitamente mesmo coincidindo com o padrao do Spark. Confiar no
+# default seria confiar que Spark e Flink escolhem o mesmo valor por conta
+# propria, sendo dois projetos independentes com versoes que mudam. Se
+# divergissem, os arquivos sairiam com tamanhos diferentes a partir da MESMA
+# entrada, e a comparacao de volume armazenado viraria artefato do motor.
+PARQUET_CODEC = os.getenv("PARQUET_CODEC", "snappy")
+
+# Fuso do particionamento — CONTRATO.md secao 4.1.
+#
+# dt e hh derivam de event_ts em UTC. Sem fixar o fuso da sessao, a mesma
+# entrada geraria diretorios diferentes na maquina local (America/Recife) e na
+# nuvem (us-east-1), e as execucoes deixariam de ser comparaveis.
+TIMEZONE = "UTC"
+
+
+# --- Checkpoint ----------------------------------------------------------
+# Caminho FIXO por job, nao por execucao (decisao da Etapa 5).
+#
+# E o que guarda os offsets ja processados, e o que torna o pipeline
+# reiniciavel — a base inteira do Experimento C.
+#
+# ARMADILHA QUE ESTA ESCOLHA DEIXA ABERTA: toda execucao herda os offsets da
+# anterior. Comecar uma bateria limpa exige apagar este diretorio, e esquecer
+# disso NAO falha — o job sobe, processa so o que chegou depois e reporta
+# numeros menores sem nenhum aviso.
+#
+# Mitigacao aqui: o job avisa em destaque na subida quando encontra um
+# checkpoint existente. Mitigacao definitiva: o run_experiment.sh da Etapa 8
+# zera o checkpoint antes de cada execucao medida e ABORTA se nao conseguir.
+CHECKPOINT_DIR = os.getenv(
+    "CHECKPOINT", os.path.expanduser("~/tcc-data/checkpoints/nrt")
+)
+
+
 # --- Conector do Kafka ---------------------------------------------------
 # O conector NAO e instalado por pip: o Spark o resolve do Maven em tempo de
 # execucao e guarda em cache no ~/.ivy2.5.2 — o diretorio leva a versao do Ivy
@@ -94,6 +143,10 @@ def resumo() -> str:
         ("topico", TOPIC),
         ("startingOffsets", STARTING_OFFSETS),
         ("trigger", TRIGGER),
+        ("destino", DIR_EVENTOS),
+        ("codec", PARQUET_CODEC),
+        ("fuso", TIMEZONE),
+        ("checkpoint", CHECKPOINT_DIR),
         ("spark", SPARK_VERSION),
         ("conector", KAFKA_CONNECTOR),
     ]

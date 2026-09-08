@@ -1,7 +1,7 @@
 # CONTRATO DE DADOS
 
-**Versão 1.0 — 04/09/2026**
-**Status: congelado**
+**Versão 1.1 — 08/09/2026**
+**Status: congelado, sem pendências**
 
 ---
 
@@ -174,6 +174,8 @@ consumer lag, e deve ser reportado como tal.
 | `compression.type` (tópico) | `producer` | O broker preserva a compressão aplicada pelo produtor |
 | `acks` (produtor) | `all` | Sem isso, "evento perdido" pode ser falha do gerador e não do pipeline |
 | Compressão (produtor) | `lz4` | Registrar a taxa obtida — afeta o custo de rede |
+| `partitioner` (produtor) | **`murmur2_random`** | ver 3.3 |
+| `linger.ms` (produtor) | **5** | ver 3.3 |
 | `auto.create.topics.enable` | `false` | Guarda de validade: com auto-create, um nome errado cria topico de 1 partição e o experimento roda com paralelismo 1 sem erro na tela |
 
 ### 3.1 Retenção por tempo — dois valores declarados
@@ -208,6 +210,34 @@ partição.
 original dos 20 GB, com mais de 3× de margem sobre a maior execução. Funciona
 como freio de segurança contra um gerador descontrolado; o controle do dia a dia
 é a retenção por tempo.
+
+### 3.3 Partitioner e `linger.ms` do produtor
+
+Fecha a pendência de partitioner declarada na versão 1.0. Ambos os valores foram
+decididos na Etapa 3, quando o gerador foi escrito, e são registrados aqui por
+serem parte do contrato e não da implementação.
+
+**`partitioner = murmur2_random`.** O `confluent-kafka` usa a biblioteca C
+`librdkafka`, cujo padrão é `consistent_random`, baseado em CRC32. O cliente Java
+do Kafka usa **murmur2**. Os dois espalham chaves uniformemente, mas produzem
+atribuições **diferentes** para a mesma chave.
+
+Adotado `murmur2_random` por dois motivos: é o comportamento que o resto do
+ecossistema assume, de modo que quem reproduzir o experimento com outro cliente
+cai nas mesmas partições; e faz o `kafka-console-producer`, que é Java, colocar
+uma chave na mesma partição que o gerador colocaria — o que torna a verificação
+manual possível em vez de enganosa.
+
+Não afeta a comparação Spark × Flink, porque o gerador é o mesmo binário nos
+dois. Afeta a reprodução por terceiros, que é critério declarado do trabalho.
+
+**`linger.ms = 5`.** O produtor espera até 5 ms acumulando mensagens antes de
+enviar. A 100 evt/s é irrelevante; a 17k evt/s é o que separa atingir a taxa de
+não atingir, porque sem agrupamento seria uma ida e volta ao broker por evento,
+com `acks=all`.
+
+**Custo declarado:** esses 5 ms **entram na latência medida**, porque o
+`event_ts` é carimbado antes da fila do produtor. São 0,1% de um trigger de 5 s.
 
 ---
 
@@ -258,13 +288,53 @@ estaria medindo drvfs em vez de Spark.
 |---|---|
 | Formato | Parquet |
 | Modo | `append` |
-| Codec de compressão | **pendente** — ver seção 7 |
+| Codec de compressão | **`snappy`** — ver 4.4 |
 | `repartition` / `coalesce` | **não usar** (decisão E3) |
 
 **Sobre a ausência de `repartition`.** Escreve-se com o paralelismo natural. O
 número de arquivos por execução é **registrado como métrica**, porque governa o
 custo de requisições PUT no S3 e é parte do trade-off latência-versus-custo da
 seção 6 do planoNRT3.
+
+### 4.4 Codec de compressão: `snappy`
+
+Fecha a pendência declarada na versão 1.0 deste contrato, antes da primeira
+escrita em Parquet (Etapa 5). Candidatos considerados: `snappy` (~2–3×, CPU
+muito baixa), `zstd` (~3–4×, mais CPU) e `lz4`.
+
+**Por que a escolha precisa existir, mesmo coincidindo com o padrão do Spark.**
+Confiar no default significa confiar que Spark e Flink escolhem o mesmo valor por
+conta própria — dois projetos independentes, com versões que mudam ao longo do
+tempo. Se divergirem, os arquivos saem com tamanhos diferentes **a partir da
+mesma entrada**, e a comparação de volume armazenado e de tráfego de rede vira
+artefato do motor em vez de resultado. Mesmo raciocínio da fixação do fuso em
+UTC (seção 4.1): não é que o valor seja melhor, é que "não fixado" produz
+divergência silenciosa.
+
+**Por que `snappy` e não `zstd`.** O tempo de compressão cai dentro da parcela
+**"processamento"** da latência decomposta (planoNRT3 §3.1) — precisamente a
+parcela que compete com o Flink. Um codec mais pesado adiciona uma constante aos
+dois motores, que não interessa à pergunta de pesquisa e só reduz a resolução da
+comparação. `snappy` é o de menor custo de CPU entre os que comprimem.
+
+Pesa também o ambiente local: teto de 4 GB no WSL e CPU disputada com o broker e
+o gerador durante a validação da Etapa 9.
+
+**Custo declarado da escolha.** `snappy` comprime menos que `zstd` — algo entre
+30% e 40% mais bytes em disco e na rede. Isso aparece em duas das cinco
+categorias de custo da §6 do plano (armazenamento e rede) e deve ser mencionado
+ao reportar o custo por GB armazenado. **Não** afeta a categoria dominante de
+custo em S3 apontada pelo plano, que é o número de requisições PUT: essa depende
+da **quantidade** de arquivos, não do tamanho deles.
+
+**Por que `lz4` foi descartado.** O Parquet tem duas variantes de LZ4 (`LZ4` e
+`LZ4_RAW`), e leitores diferentes esperam variantes diferentes — arquivos que um
+motor escreve e outro não lê. Num trabalho com dois escritores distintos e um
+reconciliador em DuckDB (decisão B3), é exatamente o tipo de incompatibilidade
+que custa tempo sem produzir conhecimento.
+
+**Sem dependência nova:** o jar `snappy-java` já vem entre as dependências
+transitivas do conector `spark-sql-kafka-0-10`.
 
 ---
 
@@ -285,7 +355,7 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Transformações | Mesma limpeza, mesmo broadcast join, mesmo cálculo de `watermark_ts` |
 | Tabela de referência | O mesmo `products.parquet` versionado |
 | Particionamento do destino | Derivado de `event_ts`, em UTC (seção 4.1) |
-| Codec do Parquet | O mesmo nos dois — valor pendente (seção 7) |
+| Codec do Parquet | `snappy`, declarado explicitamente nos dois (seção 4.4) |
 | Destino | Mesmo formato, mesmo particionamento, mesma política de escrita (sem `repartition`) |
 | Definições de métrica | planoNRT3 seção 3, sem alteração |
 | Análise | O mesmo `reconcile.py` |
@@ -326,10 +396,12 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 
 ## 7. Pendências deste contrato
 
-| Pendência | Prazo | Consequência de não resolver |
+**Nenhuma em aberto.** As duas declaradas na versão 1.0 foram fechadas:
+
+| Pendência | Prazo | Resolução |
 |---|---|---|
-| **Codec de compressão do Parquet.** Candidatos: `snappy` (padrão de fato, rápido, taxa ~2–3×), `zstd` (taxa ~3–4×, mais CPU), `lz4`. Afeta o tamanho dos arquivos e, portanto, o custo de armazenamento e o volume de PUTs | **Antes da Etapa 5** | O Spark usa o default dele silenciosamente e as execuções ficam gravadas sob um codec que nunca foi escolhido |
-| **Partitioner do produtor.** O `librdkafka` (`confluent-kafka`) usa `consistent_random` por padrão, baseado em CRC32; o cliente Java do Kafka usa murmur2. Os dois produzem atribuições de partição diferentes para a mesma chave | **Etapa 3** | Comparabilidade entre Spark e Flink não é afetada (o gerador é o mesmo), mas a reprodução por terceiros com outro cliente daria distribuição diferente |
+| Codec de compressão do Parquet | antes da Etapa 5 | **`snappy`** — seção 4.4, versão 1.1 |
+| Partitioner do produtor | Etapa 3 | **`murmur2_random`** — seção 3, versão 1.1 |
 
 ---
 
@@ -338,3 +410,4 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 1.1 | 08/09/2026 | Fechadas as duas pendências que a v1.0 declarava, **sem alterar nenhum item já fixado**. Codec do Parquet = `snappy` (seção 4.4), decidido antes da primeira escrita. Partitioner do produtor = `murmur2_random` e `linger.ms` = 5 (seção 3.3), decididos na Etapa 3 e transcritos para cá | **Nenhuma.** O codec entra antes de qualquer escrita em Parquet existir; o partitioner apenas registra o que já vigorava desde a Etapa 3 |
