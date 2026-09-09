@@ -28,8 +28,8 @@ esperar como saída e o que fazer quando não for isso. A ordem importa — nenh
 passo funciona sem o anterior.
 
 O documento acompanha o desenvolvimento: à medida que as etapas avançam, novos
-passos são acrescentados ao fim da sequência. Hoje ele vai até a **Etapa 4**
-(o Spark lendo o tópico).
+passos são acrescentados ao fim da sequência. Hoje ele vai até a **Etapa 5**
+(o Spark gravando Parquet com checkpoint).
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -296,9 +296,16 @@ Duas abas.
 bash pipeline-nrt/run_local.sh
 ```
 
-Imprime a configuração usada, resolve o conector e começa a consumir. Com
-`startingOffsets=earliest`, o `Batch: 0` traz os eventos que já estão no tópico.
-Depois o console fica quieto, porque não há dado novo chegando.
+Imprime a configuração usada, avisa se o checkpoint é novo ou está sendo
+retomado, resolve o conector e começa a consumir. Com `startingOffsets=earliest`,
+o `[batch 0]` engole de uma vez os eventos que já estão no tópico — devem ser os
+6000 do passo 6. Depois fica quieto, porque não há dado novo chegando.
+
+> **O primeiro lote é sempre atípico.** Ele processa o backlog inteiro com a JVM
+> ainda fria, então costuma estourar a janela do trigger e emitir
+> `Current batch is falling behind`. É o que a regra de aquecimento do protocolo
+> manda descartar. Se esse aviso aparecer de forma **persistente** durante uma
+> execução medida, aí sim é sinal de saturação.
 
 **Aba 2 — o gerador:**
 
@@ -306,10 +313,14 @@ Depois o console fica quieto, porque não há dado novo chegando.
 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
 ```
 
-Agora a aba 1 imprime **um lote a cada 5 segundos**, com ~500 eventos cada e a
-coluna `partition` variando entre 0 e 23. Esse é o micro-batch visível: cinco
-segundos de tela parada, depois o lote inteiro de uma vez. É a característica que
-define o paradigma NRT deste trabalho e o que o diferencia do Flink.
+Agora a aba 1 imprime **um lote a cada 5 segundos**, com ~500 eventos cada
+(100 evt/s × 5 s). Esse é o micro-batch visível: cinco segundos de tela parada,
+depois o lote inteiro de uma vez. É a característica que define o paradigma NRT
+deste trabalho e o que o diferencia do Flink.
+
+A soma dos lotes tem que fechar em **6000**. A oscilação em torno de 500 é efeito
+de fronteira — evento produzido a milissegundos do corte do trigger cai no lote
+seguinte.
 
 A **Spark UI** fica em <http://localhost:4040>, aba *Structured Streaming* — é
 onde aparecem o número de linhas por batch e a duração de cada um.
@@ -336,9 +347,73 @@ saída com significado quando ganhar uma condição de parada própria, na Etapa
 
 ---
 
+## Passo 10 — Conferir a saída em Parquet
+
+Com o job rodando, numa segunda aba:
+
+```bash
+find ~/tcc-data/out -type d | sort
+find ~/tcc-data/out -name "*.parquet" | wc -l
+du -h --max-depth=1 ~/tcc-data/out/events
+```
+
+A estrutura deve ser `events/run_id=…/dt=…/hh=…/`, o layout do `CONTRATO.md` §4.
+Dois `hh=` significam que a execução cruzou a virada de hora — previsto, é o preço
+de particionar por `event_ts`.
+
+**O número de arquivos é um resultado, não um defeito.** Cada micro-batch escreve
+um arquivo por partição do Kafka, porque não há `repartition` (decisão E3). Um
+lote único produz 24 arquivos; a mesma quantidade de eventos entregue em treze
+lotes produz ~312. A referência medida na máquina original, para 6000 eventos:
+
+| Forma de entrega | Arquivos | Tamanho |
+|---|---|---|
+| Lote único (backlog) | 24 | 632 KB |
+| Trigger de 5 s | ~300 | ~3,6 MB |
+
+É o trade-off latência-versus-custo: trigger curto entrega mais rápido, gera mais
+arquivos, e mais arquivos custam mais PUTs no S3 e mais espaço. O efeito é
+acentuado a 100 evt/s, onde cada arquivo fica com ~19 linhas; nas cargas de
+benchmark os arquivos têm milhares de linhas e o custo fixo amortiza.
+
+Não deve existir `_spark_metadata` no destino — só `_SUCCESS`. A escrita é feita
+em `foreachBatch`, e o escritor de lote não gera aquele diretório.
+
+---
+
+## Passo 11 — Testar a retomada
+
+Este é o critério de pronto do pipeline com checkpoint.
+
+Pare o job com `Ctrl+C`, anote o número do último batch, e suba de novo:
+
+```bash
+bash pipeline-nrt/run_local.sh
+```
+
+Agora, em vez de `>> checkpoint novo`, deve aparecer uma moldura de `!!!!`
+avisando que há checkpoint existente e qual foi o último micro-batch. E **nenhuma
+linha de eventos gravados** — se ele reprocessasse, o destino ganharia dados
+duplicados.
+
+Silêncio, aqui, é o resultado correto. Confirme que ele não travou gerando mais
+eventos: os lotes devem voltar a aparecer.
+
+> **Se você zerar o Kafka, zere o checkpoint junto.** O `~/tcc-data` não é volume
+> do Docker, então `docker compose down -v` não o toca. Com o tópico recriado e os
+> offsets em zero, o checkpoint continuaria apontando para offsets que não existem
+> mais, e o job **falharia na subida** — `failOnDataLoss` está em `true` de
+> propósito. O par correto é:
+>
+> ```bash
+> docker compose down -v && rm -rf ~/tcc-data/checkpoints/nrt
+> ```
+
+---
+
 ## Verificação final
 
-Se os nove passos acima funcionaram, o ambiente está reproduzido:
+Se os onze passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -348,7 +423,9 @@ Se os nove passos acima funcionaram, o ambiente está reproduzido:
 - [x] O gerador reporta tentados = confirmados, 0 erros
 - [x] As 24 partições recebem ~250 eventos cada
 - [x] Os eventos sobrevivem a `down` → `up`
-- [x] O Spark imprime um lote a cada 5 segundos
+- [x] O Spark grava um lote a cada 5 segundos, somando 6000 eventos
+- [x] O destino tem o layout `run_id=…/dt=…/hh=…` em Parquet
+- [x] O job reiniciado retoma sem reprocessar
 
 ---
 
@@ -410,7 +487,8 @@ shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   reference-data/         products.parquet e seu gerador           (Etapa 7)
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
   run_local.sh            lançador via spark-submit
-  src/config.py           trigger, endereços e recursos
+  src/config.py           trigger, endereços, destino, codec e checkpoint
+  src/esquema.py          o schema do CONTRATO.md como StructType   (Etapa 5)
   src/main.py             o job
 pipeline-streaming/       pipeline Flink                           (OE 2)
 benchmarks/               run_experiment.sh                        (Etapa 8)
@@ -455,7 +533,8 @@ O repositório guarda o que **executa**; a pasta de pesquisa guarda o que
       0 erros, payload médio de 253,8 bytes
 - [x] **Etapa 4** — Spark lê do Kafka e imprime no console: 15 micro-batches a
       cada ~5 s, as 24 partições lidas, garantia chave → partição confirmada
-- [ ] **Etapa 5** — Escrita em Parquet com checkpoint
+- [x] **Etapa 5** — Escrita em Parquet com checkpoint: layout do contrato,
+      codec `snappy`, retomada verificada, 13 micro-batches somando 6000 eventos
 - [ ] **Etapa 6** — Instrumento de medição
 - [ ] **Etapa 7** — Enriquecimento
 - [ ] **Etapa 8** — Arnês de benchmark

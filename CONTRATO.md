@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 1.1 — 08/09/2026**
+**Versão 1.2 — 09/09/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -289,12 +289,34 @@ estaria medindo drvfs em vez de Spark.
 | Formato | Parquet |
 | Modo | `append` |
 | Codec de compressão | **`snappy`** — ver 4.4 |
-| `repartition` / `coalesce` | **não usar** (decisão E3) |
+| `repartition` / `coalesce` | **não usar** — decisão E3, **definitiva** desde 08/09/2026 |
 
 **Sobre a ausência de `repartition`.** Escreve-se com o paralelismo natural. O
 número de arquivos por execução é **registrado como métrica**, porque governa o
 custo de requisições PUT no S3 e é parte do trade-off latência-versus-custo da
 seção 6 do planoNRT3.
+
+A decisão E3 estava marcada como PROVISÓRIA no plano. Foi **fechada em
+08/09/2026**, depois de a Etapa 5 produzir a contagem real de arquivos.
+
+**A evidência que a sustenta.** Três execuções de 6000 eventos cada, mesmo schema
+e mesmo codec, diferindo apenas em como o Spark fatiou a escrita: 24 arquivos e
+632 KB em lote único, contra 312 arquivos e 3,7 MB com trigger de 5 s. O número de
+arquivos não é ruído — é o resultado que a comparação existe para revelar.
+
+**Por que corrigi-lo seria pior do que reportá-lo.** Um `repartition` acrescenta
+um *shuffle*, e o custo desse shuffle cai dentro da parcela "processamento" da
+latência decomposta — exatamente a parcela que compete com o Flink. Como o shuffle
+do Spark e o do Flink têm custos diferentes, igualar o número de arquivos
+introduziria uma assimetria **maior** do que a que se pretendia remover. Um
+`coalesce` evita o shuffle, mas reduz o paralelismo de todo o estágio anterior, e
+não apenas o da escrita.
+
+**Limitação declarada.** Um pipeline de produção normalmente teria compactação
+posterior dos arquivos pequenos. Ela não é feita aqui, e não deve ser: é um job
+separado, cobrado à parte, e executá-lo dentro do pipeline misturaria seu custo ao
+da ingestão. A análise de custo da seção 6 do plano deve mencionar a compactação
+como mitigador conhecido do efeito medido.
 
 ### 4.4 Codec de compressão: `snappy`
 
@@ -410,4 +432,5 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 1.2 | 09/09/2026 | **Nenhum item alterado.** A decisão E3 (sem `repartition`/`coalesce`), que o plano marcava como PROVISÓRIA, foi fechada como definitiva e a seção 4.3 passou a registrar a evidência que a sustenta e a limitação declarada sobre compactação | **Nenhuma** |
 | 1.1 | 08/09/2026 | Fechadas as duas pendências que a v1.0 declarava, **sem alterar nenhum item já fixado**. Codec do Parquet = `snappy` (seção 4.4), decidido antes da primeira escrita. Partitioner do produtor = `murmur2_random` e `linger.ms` = 5 (seção 3.3), decididos na Etapa 3 e transcritos para cá | **Nenhuma.** O codec entra antes de qualquer escrita em Parquet existir; o partitioner apenas registra o que já vigorava desde a Etapa 3 |
