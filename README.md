@@ -28,8 +28,15 @@ esperar como saída e o que fazer quando não for isso. A ordem importa — nenh
 passo funciona sem o anterior.
 
 O documento acompanha o desenvolvimento: à medida que as etapas avançam, novos
-passos são acrescentados ao fim da sequência. Hoje ele vai até a **Etapa 5**
-(o Spark gravando Parquet com checkpoint).
+passos são acrescentados ao fim da sequência. É **uma receita só para os dois
+motores** — quem reproduz o trabalho precisa de ambos, e duas receitas separadas
+tenderiam a divergir.
+
+| Passos | O que reconstroem | Até onde chegou |
+|---|---|---|
+| 1 a 8 | ambiente, Kafka, tópico e gerador — **compartilhados** | Etapas 0 a 3 |
+| 9 a 11 | pipeline NRT (Spark) | Etapa 5 — Parquet com checkpoint |
+| 12 e 13 | pipeline Streaming (Flink) | Etapa RT-1 — cadeia verificada |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -411,9 +418,107 @@ eventos: os lotes devem voltar a aparecer.
 
 ---
 
+## Passo 12 — Construir a imagem do Flink
+
+Daqui em diante, o pipeline Streaming. Ele **não** usa o venv: roda num contêiner.
+
+**Por que um contêiner.** O Flink escolhido é o **1.20.5**, a versão LTS — e a
+linha com mais material de consulta, já que o Flink 2.0 removeu APIs e boa parte
+dos tutoriais existentes mira a 1.x. Mas o 1.20 não suporta Python 3.12, e o venv
+do projeto é 3.12.3. O contêiner traz o próprio Python (3.10), e o venv do host
+fica intocado: nada de PPA de terceiros, nada de segundo ambiente.
+
+```bash
+docker compose build flink
+docker images tcc-flink        # ~977 MB
+```
+
+A primeira construção leva cerca de dois minutos, quase todos no `pip install`.
+
+**O que a imagem contém**, e por que nessa forma:
+
+- **Só Java como base, não a imagem oficial do Flink.** A oficial já traz uma
+  instalação do Flink, e o `pip install apache-flink` traz outra, embutida no
+  pacote Python. Duas instalações do mesmo motor na mesma imagem é armadilha.
+  Aqui existe uma só — e ela chega do mesmo jeito que o Spark chega no host,
+  dentro do pacote Python.
+- **A JVM é a 17.0.20**, exatamente a mesma que o Spark usa no host.
+- **O conector Kafka é baixado e verificado no build.** Diferente do Spark, que
+  resolve o conector sozinho do Maven, o Flink precisa que o jar seja obtido e o
+  caminho declarado. O `Dockerfile` baixa o `flink-sql-connector-kafka-3.4.0-1.20`
+  e confere o SHA-1 publicado no Maven Central; se não bater, o build **falha**.
+- **As dependências estão travadas.** O `requirements.txt` fixa o PyFlink; o
+  `requirements.lock` fixa **todas** as dependências dele, que de outro modo o
+  `pip` escolheria de novo a cada build.
+
+> **O "OK" do checksum não aparece na tela.** O BuildKit recolhe a saída dos
+> passos que dão certo. Chegar ao `✔ flink Built` já prova que o checksum bateu.
+> Para ver com os próprios olhos:
+>
+> ```bash
+> docker run --rm tcc-flink:1.20.5 sha1sum /opt/flink-connectors/flink-sql-connector-kafka-3.4.0-1.20.jar
+> ```
+>
+> Tem que sair `266330f8f26fec4957339b5ff31aa67b81c31462`.
+
+---
+
+## Passo 13 — Verificar a cadeia até o Flink
+
+O espelho do passo 5. Precisa do Kafka no ar e do tópico **povoado** (passo 6):
+
+```bash
+docker compose run --rm flink python scripts/check_chain_flink.py
+```
+
+O `docker compose up -d` dos passos anteriores **não** sobe o Flink — ele está
+atrás de um perfil no `docker-compose.yml` e roda só quando chamado. O `run --rm`
+cria o contêiner, executa e o apaga ao terminar.
+
+**Esperado:**
+
+```
+Python   : 3.10.12
+PyFlink  : 1.20.5
+Java     : 17.0.20
+Conector : flink-sql-connector-kafka-3.4.0-1.20.jar
+Broker   : kafka:29092
+
+mensagens no topico      : 6000
+particoes com dado lido  : 24
+...
+CADEIA COMPLETA OK
+```
+
+**Esta verificação é mais forte que a do Spark.** O `check_chain.py` conta as
+partições *atribuídas*; esta conta as partições **de onde chegou dado** — prova
+que o Flink leu de cada uma das 24. Por isso exige o tópico povoado: com ele
+vazio, falha avisando para rodar o gerador.
+
+**O broker é `kafka:29092`, não `localhost:9092`.** O contêiner está na rede do
+Docker e usa o listener interno. É uma assimetria em relação ao Spark, que roda
+no host — declarada, e sem efeito sobre os resultados, porque a fase local não
+produz os números comparados.
+
+O aviso de `pkg_resources` depreciado que aparece no topo vem de dentro do
+`apache-beam`, uma dependência do PyFlink. É inofensivo: o `setuptools` vem do
+apt do Ubuntu 22.04 e não será atualizado para a versão que removeu a API.
+
+**Memória.** Para medir, amostre numa segunda aba enquanto a verificação roda —
+o contêiner vive só alguns segundos, e um `docker stats` comum costuma não pegá-lo:
+
+```bash
+while true; do docker stats --no-stream --format '{{.Name}}  {{.MemUsage}}' | grep -E 'flink|kafka'; sleep 1; done
+```
+
+Referência medida na máquina original: pico de **~830 MiB** no Flink e
+**~490–570 MiB** no Kafka — cerca de 1,4 GB somados, dentro do teto de 4 GB do WSL.
+
+---
+
 ## Verificação final
 
-Se os onze passos acima funcionaram, o ambiente está reproduzido:
+Se os treze passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -426,6 +531,8 @@ Se os onze passos acima funcionaram, o ambiente está reproduzido:
 - [x] O Spark grava um lote a cada 5 segundos, somando 6000 eventos
 - [x] O destino tem o layout `run_id=…/dt=…/hh=…` em Parquet
 - [x] O job reiniciado retoma sem reprocessar
+- [x] A imagem `tcc-flink:1.20.5` constrói, com o checksum do conector conferido
+- [x] `check_chain_flink.py` lê dado das 24 partições
 
 ---
 
@@ -442,6 +549,7 @@ Decisão E6: **código no Windows, dados em ext4 nativo do WSL.**
 | Parquet de saída | `~/tcc-data/out` |
 | Checkpoints do Spark | `~/tcc-data/checkpoints` |
 | Métricas coletadas | `~/tcc-data/metrics` |
+| Ambiente do Flink | imagem Docker `tcc-flink:1.20.5` — fora do venv |
 
 O motivo é medido, não estético: escrita sequencial em `/mnt/c` roda a
 **77 MB/s** contra **1,2 GB/s** no ext4 — 15,8×. Com a saída no `/mnt/c`, o
@@ -469,17 +577,26 @@ meio dos experimentos invalida as execuções já feitas.
 | Python | 3.12.3 | 03/09/2026 |
 | JVM | OpenJDK 17.0.20 | 03/09/2026 |
 | confluent-kafka | 2.15.0 (librdkafka 2.15.0) | 04/09/2026 |
+| Flink / PyFlink | 1.20.5 (LTS), em contêiner | 21/09/2026 |
+| Conector Kafka do Flink | `flink-sql-connector-kafka` 3.4.0-1.20 | 21/09/2026 |
+| Python do Flink | 3.10.12 (Ubuntu 22.04 da imagem) | 21/09/2026 |
+| JVM do Flink | Temurin 17.0.20 — a mesma do Spark | 21/09/2026 |
+
+As versões do Spark estão no `requirements.txt` da raiz. As do Flink estão em
+`pipeline-streaming/requirements.txt` e, travadas até as dependências
+transitivas, em `pipeline-streaming/requirements.lock`.
 
 ### Estrutura
 
 ```
 CONTRATO.md               schema e invariantes de comparabilidade   (Etapa 2)
-docker-compose.yml        Kafka 4.0.2 em modo KRaft, um broker
-requirements.txt          versões travadas (decisão E7)
+docker-compose.yml        Kafka 4.0.2 (KRaft) e o contêiner do Flink (perfil)
+requirements.txt          versões travadas do lado Spark (decisão E7)
 env/wslconfig             configuração da VM, versionada e comentada
 scripts/setup_env.sh      recria o ambiente do zero
 scripts/create_topic.sh   cria o tópico com 24 partições
 scripts/check_chain.py    verifica Python → Spark → JVM → Kafka
+scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1)
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   data-generator/         gerador de eventos                       (Etapa 3)
   analysis/               reconcile.py e report.py                 (Etapa 6)
@@ -490,7 +607,10 @@ pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
   src/config.py           trigger, endereços, destino, codec e checkpoint
   src/esquema.py          o schema do CONTRATO.md como StructType   (Etapa 5)
   src/main.py             o job
-pipeline-streaming/       pipeline Flink                           (OE 2)
+pipeline-streaming/       pipeline Flink                           (RT-1+)
+  Dockerfile              runtime: Java 17.0.20, Python, PyFlink, conector
+  requirements.txt        a versão do PyFlink
+  requirements.lock       todas as dependências, travadas
 benchmarks/               run_experiment.sh                        (Etapa 8)
 infra/                    Terraform                                (Etapa 10)
 results/                  CSVs e manifestos por run_id             (Etapa 11)
@@ -502,14 +622,16 @@ impede que o Flink acabe medido com um arnês ligeiramente diferente.
 ### Documentos de pesquisa
 
 Por decisão do autor, os documentos ficam **fora** deste repositório, junto com a
-dissertação, em `../../Informações/` e `../../Fala/`:
+dissertação, em `../../Informações/`:
 
 | Documento | Papel |
 |---|---|
-| `planoNRT3.md` | plano de implementação vigente — as 12 etapas e o protocolo experimental |
-| `EtapaNRT/DecisaoEtapaX.md` | registro de cada etapa: o que foi feito, como, e as decisões com a justificativa |
+| `planoNRT3.md` | plano do pipeline NRT (Spark) — as 12 etapas e o protocolo experimental |
+| `planoRT.md` | plano do pipeline Streaming (Flink) — complementa o `planoNRT3.md`, não o substitui |
+| `EtapaNRT/DecisaoEtapaX.md` | registro de cada etapa do NRT: o que foi feito, como, e as decisões com a justificativa |
+| `EtapaRT/DecisaoEtapaRT<N>.md` | o mesmo registro, para as etapas do Flink |
 | `Fala/PontosSensiveis.md` | o que a banca pode cobrar, com a resposta e a evidência de cada ponto |
-| `perguntas.txt` | registro das decisões de projeto, cada uma com a justificativa |
+| `perguntas.txt`, `perguntas2.txt` | decisões de projeto do NRT e do Flink, cada uma com a justificativa |
 | `planoNRT.md`, `planoNRT2.md` | versões anteriores, mantidas por rastreabilidade |
 
 Os `DecisaoEtapaX.md` são a matéria-prima do capítulo de metodologia. Eles
@@ -522,6 +644,23 @@ O repositório guarda o que **executa**; a pasta de pesquisa guarda o que
 ---
 
 ## Progresso
+
+O trabalho alternou para o Flink em 11/09/2026, com o NRT concluído até a Etapa 5.
+A Etapa 6 do NRT e a RT-4 do Flink são a **mesma etapa**: o instrumento de medição
+é construído uma vez, para os dois motores.
+
+### Pipeline Streaming (Flink) — `planoRT.md`
+
+- [x] **RT-1** — Versões travadas e cadeia verificada: Flink 1.20.5 LTS em
+      contêiner, conector 3.4.0, dado lido das 24 partições, ~830 MiB de pico
+- [ ] **RT-2** — Flink lê do Kafka e imprime
+- [ ] **RT-3** — Parquet + checkpoint
+- [ ] **RT-4** — Instrumento de medição, para os dois motores
+- [ ] **RT-5** — Enriquecimento
+- [ ] **RT-6** — Arnês unificado
+- [ ] **RT-7** — Validação local e caos
+
+### Pipeline NRT (Spark) — `planoNRT3.md`
 
 - [x] **Etapa 0** — Ambiente: WSL2 4 GB / 8 CPUs, Docker, OpenJDK 17.0.20,
       Python 3.12.3

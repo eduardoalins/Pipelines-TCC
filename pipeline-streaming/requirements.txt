@@ -1,0 +1,24 @@
+# Versoes travadas do pipeline Streaming (Flink) — decisao F1, Etapa RT-1.
+#
+# Instalado DENTRO da imagem (pipeline-streaming/Dockerfile), nunca no venv do
+# host. O venv continua com Python 3.12 para o Spark e o gerador; o Flink 1.20
+# nao suporta 3.12, e o conteiner traz o proprio Python (3.10, do Ubuntu 22.04).
+# Ver planoRT.md secao 0.5.
+#
+# Por que 1.20 e nao a linha 2.x: e a versao LTS, e sobretudo a linha com mais
+# material de consulta. O Flink 2.0 removeu APIs obsoletas, e boa parte dos
+# tutoriais e respostas existentes tem como alvo a 1.x. Mesmo criterio que
+# escolheu o Spark 4.0 em vez do 4.2: e preciso encontrar quem ja passou pelo
+# erro que se esta pesquisando.
+#
+# Como o pyspark, o apache-flink CONTEM a distribuicao inteira do motor — os
+# jars vem dentro do pacote Python. E por isso que a imagem base e so Java, e
+# nao a imagem oficial do Flink: evita duas instalacoes do mesmo motor.
+#
+# Trocar esta versao no meio dos experimentos invalida as execucoes ja feitas,
+# como vale para o pyspark==4.0.4 do requirements.txt da raiz.
+
+apache-flink==1.20.5
+
+# O conector Kafka NAO vem por pip. E um jar, baixado e verificado pelo
+# Dockerfile — ver o comentario la.

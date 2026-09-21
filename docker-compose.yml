@@ -121,6 +121,57 @@ services:
 
     restart: unless-stopped
 
+  # ==========================================================================
+  # Flink — pipeline Streaming (planoRT.md, a partir da Etapa RT-1)
+  # ==========================================================================
+  #
+  # Um conteiner unico, com o Flink rodando em MiniCluster DENTRO dele —
+  # decisao F3. E o espelho do Spark em local[*]: processo unico contra
+  # processo unico. Um cluster com JobManager e TaskManager separados seria
+  # comparar topologias, nao motores.
+  #
+  # Nao sobe com `docker compose up -d`: esta atras do perfil "flink". Roda
+  # sob demanda:
+  #
+  #   docker compose build flink
+  #   docker compose run --rm flink python scripts/check_chain_flink.py
+  flink:
+    build: ./pipeline-streaming
+    image: tcc-flink:1.20.5
+    profiles: ["flink"]
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    # --- Rede ------------------------------------------------------------
+    # O conteiner esta na rede do Compose e alcanca o broker por
+    # kafka:29092, o listener INTERNAL que existe desde a Etapa 1.
+    #
+    # ASSIMETRIA DECLARADA: o Spark, que roda no host, alcanca o mesmo broker
+    # por localhost:9092 (listener EXTERNAL, via publicacao de porta) — um
+    # salto de rede a mais. Efeito so na fase local, que nao produz os numeros
+    # comparados. Ver planoRT.md secao 0.5.
+    environment:
+      BOOTSTRAP: kafka:29092
+
+    # --- Codigo --------------------------------------------------------
+    # O repositorio montado em /app, somente leitura: a imagem e o runtime, o
+    # codigo vem do repo — do mesmo jeito que o Spark le o codigo do repo.
+    # Somente leitura porque nada aqui deve escrever no repositorio.
+    #
+    # A saida (Parquet) e o checkpoint entram na Etapa RT-3, num bind mount de
+    # ~/tcc-data. Nao aqui: a RT-1 so le.
+    volumes:
+      - ./:/app:ro
+
+    # --- Memoria (ver env/wslconfig) ------------------------------------
+    # Teto do conteiner, pela mesma logica do Kafka: o limite do WSL e freio de
+    # emergencia, o controle preciso e por servico. 1,5 GB e ponto de partida,
+    # a CONFIRMAR na RT-1 com `docker stats`: Kafka 1 GB + Flink 1,5 GB + kernel
+    # e daemon ~700 MB = ~3,2 GB dentro dos 4 GB do WSL.
+    mem_limit: 1536m
+
 volumes:
   # Este e o unico que guarda algo. Apagar com `docker compose down -v`
   # zera o topico e todas as mensagens — e o que se faz antes de comecar
