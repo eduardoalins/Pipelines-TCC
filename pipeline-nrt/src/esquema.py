@@ -1,9 +1,14 @@
 """
-O schema do evento, transcrito do CONTRATO.md secao 1.1.
+O schema do evento, na forma que o Spark entende.
 
-Este arquivo e a fronteira entre o contrato e o codigo. Ate a Etapa 4 o `value`
-vindo do Kafka era tratado como texto; a partir daqui ele e interpretado, e para
-isso o schema precisa estar declarado.
+Os campos NAO estao escritos aqui: vem de shared/schema/evento.json, a fonte
+unica do schema, que o pipeline Flink tambem le (decisao da Etapa RT-3). Este
+arquivo so traduz os tipos logicos de la para os tipos do Spark. Assim o schema
+do Spark e o do Flink nao tem como divergir — uma mudanca so pode ser feita num
+lugar, e chega aos dois.
+
+Ate a Etapa RT-3 os campos eram escritos a mao aqui. A troca nao mudou o schema
+produzido: verificado comparando o simpleString() antes e depois.
 
 POR QUE DECLARADO E NAO INFERIDO. O Spark consegue inferir schema de JSON, mas
 so lendo os dados antes — o que uma consulta de streaming nao pode fazer, porque
@@ -17,6 +22,9 @@ Campos malformados viram NULL em vez de derrubar a consulta. A contagem de
 descartes entra na Etapa 7, junto com a limpeza.
 """
 
+import json
+from pathlib import Path
+
 from pyspark.sql.types import (
     DoubleType,
     IntegerType,
@@ -26,32 +34,35 @@ from pyspark.sql.types import (
     StructType,
 )
 
+# src/ -> pipeline-nrt/ -> raiz do repositorio
+ARQUIVO_SCHEMA = Path(__file__).resolve().parents[2] / "shared" / "schema" / "evento.json"
 
-# Tres destes campos nao tem relacao com e-commerce e existem apenas para a
-# medicao (CONTRATO.md secao 1.1):
-#
-#   seq     sequencial monotonico por gerador. Sem ele so e possivel contar
-#           totais, o que esconde perda compensada por duplicacao. Buracos na
-#           sequencia sao perda; repeticoes sao duplicata.
-#   gen_id  identifica o processo gerador, para varias instancias produzirem em
-#           paralelo sem colidir a sequencia.
-#   run_id  etiqueta a execucao, e e por ele que o destino e particionado.
-#
-# event_ts e epoch em MILISSEGUNDOS, nao texto ISO: havera aritmetica temporal
-# sobre milhoes de linhas, e o parse de string viraria gargalo do proprio
-# instrumento de medicao.
-EVENTO = StructType(
-    [
-        StructField("event_id", StringType(), True),
-        StructField("seq", LongType(), True),
-        StructField("gen_id", IntegerType(), True),
-        StructField("run_id", StringType(), True),
-        StructField("event_type", StringType(), True),
-        StructField("user_id", IntegerType(), True),
-        StructField("product_id", IntegerType(), True),
-        # Nulo para pageview e add_to_cart, por definicao do contrato.
-        StructField("amount", DoubleType(), True),
-        StructField("session_id", StringType(), True),
-        StructField("event_ts", LongType(), True),
-    ]
-)
+# Tipos logicos do evento.json -> tipos do Spark. O lado do Flink tem a tabela
+# equivalente no pipeline-streaming/src/esquema.py.
+TIPOS = {
+    "string": StringType(),
+    "int32": IntegerType(),
+    "int64": LongType(),
+    "float64": DoubleType(),
+}
+
+
+def _montar() -> StructType:
+    campos = json.loads(ARQUIVO_SCHEMA.read_text(encoding="utf-8"))["campos"]
+    estrutura = []
+    for campo in campos:
+        tipo = campo["tipo"]
+        # Tipo desconhecido FALHA em vez de virar um padrao qualquer: um palpite
+        # aqui produziria um schema diferente do Flink, em silencio.
+        if tipo not in TIPOS:
+            raise ValueError(
+                f"tipo '{tipo}' do campo '{campo['nome']}' em {ARQUIVO_SCHEMA} "
+                f"nao tem traducao para o Spark. Tipos conhecidos: {sorted(TIPOS)}"
+            )
+        # Todos anulaveis: um campo malformado vira NULL em vez de derrubar a
+        # consulta. O Flink tambem declara todos anulaveis.
+        estrutura.append(StructField(campo["nome"], TIPOS[tipo], True))
+    return StructType(estrutura)
+
+
+EVENTO = _montar()

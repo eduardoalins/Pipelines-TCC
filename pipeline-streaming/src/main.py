@@ -1,12 +1,13 @@
 """
-Etapa RT-2 — o Flink le o topico em streaming e imprime na tela.
+Etapa RT-3 — o Flink le o topico em streaming e grava Parquet, com checkpoint.
 
-Espelho da Etapa 4 do NRT. Sem Parquet, sem transformacao, sem medicao. O
-objetivo e um so: ver o modelo evento-a-evento acontecer.
+Espelho da Etapa 5 do NRT: o `print` sai, entra escrita em arquivo no layout do
+contrato. Ainda sem as colunas de medicao — elas entram na RT-4, nos dois
+motores.
 
-A diferenca para o Spark aparece na tela: la o console ficava parado durante o
-trigger e depois despejava o lote inteiro. Aqui NAO EXISTE trigger — cada evento
-atravessa o job assim que chega, e as linhas aparecem continuamente.
+A etapa testa a hipotese central do planoRT.md secao 1: no Flink, o Parquet so
+fica visivel quando um checkpoint completa. Se isso se confirmar, o intervalo de
+checkpoint tem, na visibilidade do dado, o papel que o trigger tem no Spark.
 
 Roda dentro do conteiner, pelo lancador:
 
@@ -21,107 +22,143 @@ from pathlib import Path
 
 from pyflink.table import EnvironmentSettings, TableEnvironment
 
-# O conteiner monta o repositorio em /app e executa este arquivo pelo caminho;
-# a pasta dele nao entra sozinha no sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
+import esquema  # noqa: E402
 
-# Estados em que o job nao volta mais a rodar.
 ESTADOS_FINAIS = ("FINISHED", "FAILED", "CANCELED")
 
 
+def ultimo_checkpoint(raiz: str) -> Path | None:
+    """O checkpoint completo mais recente, ou None se nao houver nenhum.
+
+    DIFERENCA DE MECANISMO EM RELACAO AO SPARK, e ela e dado do criterio D1. O
+    Spark retoma sozinho: basta apontar o checkpointLocation. O Flink nao. Cada
+    execucao do job ganha um identificador novo, e os checkpoints ficam em
+    <raiz>/<id-do-job>/chk-<n>/. Para retomar, e preciso ENCONTRAR o ultimo e
+    informa-lo explicitamente. E so conta um checkpoint que terminou — o
+    _metadata e gravado por ultimo, entao a presenca dele e a prova.
+    """
+    completos = [meta.parent for meta in Path(raiz).glob("*/chk-*/_metadata")]
+    if not completos:
+        return None
+    return max(completos, key=lambda chk: (chk / "_metadata").stat().st_mtime)
+
+
 def main() -> int:
-    print("\n=== Etapa RT-2 — Flink lendo o Kafka ===")
+    print("\n=== Etapa RT-3 — Flink gravando Parquet ===")
     print(config.resumo())
     print()
 
-    # Modo STREAMING: a fonte nao tem fim e o job fica vivo processando o que
-    # chegar. (A verificacao da RT-1 usou modo batch, com fonte limitada,
-    # justamente para terminar sozinha.)
     t_env = TableEnvironment.create(EnvironmentSettings.in_streaming_mode())
+    conf = t_env.get_config()
 
-    # O equivalente do --packages do Spark: o jar ja esta no disco da imagem, e
-    # o caminho e declarado aqui.
-    t_env.get_config().set("pipeline.jars", f"file://{config.KAFKA_CONNECTOR_JAR}")
+    conf.set("pipeline.jars", ";".join(f"file://{jar}" for jar in config.JARS))
 
-    # Paralelismo: deixado no padrao do MiniCluster, que e o numero de nucleos
-    # visiveis. O valor definitivo e a pergunta E2 do perguntas2.txt, a
-    # responder antes da RT-3. Na tela, cada linha sai prefixada com o numero da
-    # subtarefa que a imprimiu (ex.: "3>").
+    # CONTRATO.md secao 4.1: dt e hh derivam de event_ts em UTC. Fixado na
+    # SESSAO, como o spark.sql.session.timeZone do lado do Spark.
+    conf.set("table.local-time-zone", config.TIMEZONE)
+
+    # --- Checkpoint -----------------------------------------------------
+    # O intervalo e o equivalente do trigger do Spark. EXACTLY_ONCE e o padrao;
+    # declarado para que ninguem precise adivinhar.
+    conf.set("execution.checkpointing.interval", config.CHECKPOINT_INTERVAL)
+    conf.set("execution.checkpointing.mode", "EXACTLY_ONCE")
+    conf.set("state.checkpoints.dir", f"file://{config.CHECKPOINT_DIR}")
+
+    # O PADRAO DO FLINK E APAGAR os checkpoints quando o job e cancelado. Sem
+    # esta linha, o Ctrl+C destruiria justamente o que o teste de retomada
+    # precisa. O Spark nunca apaga o dele.
+    conf.set(
+        "execution.checkpointing.externalized-checkpoint-retention",
+        "RETAIN_ON_CANCELLATION",
+    )
+
+    # Retomada explicita — ver ultimo_checkpoint(). Mesmo aviso em destaque do
+    # lado do Spark: o caminho do checkpoint e fixo, entao toda execucao herda
+    # a anterior, e esquecer de limpa-lo antes de uma execucao medida NAO falha.
+    retomar = ultimo_checkpoint(config.CHECKPOINT_DIR)
+    if retomar is None:
+        print(f">> checkpoint novo: {config.CHECKPOINT_DIR}")
+    else:
+        conf.set("execution.savepoint.path", f"file://{retomar}")
+        barra = "!" * 72
+        print(barra)
+        print(f"!! CHECKPOINT EXISTENTE — retomando de {retomar}")
+        print("!! O job NAO reprocessa o topico, e o startup mode deixa de valer.")
+        print(f"!! Para comecar limpo:  rm -rf ~/tcc-data/checkpoints/rt")
+        print(barra)
+    print()
 
     # --- Fonte -----------------------------------------------------------
-    # 'raw' na chave e no valor: nada e interpretado. A Etapa 4 do NRT tambem
-    # mostrou o value como texto, e o criterio de pronto foi ver o schema do
-    # contrato chegar inteiro. Interpretar o JSON e trabalho da RT-3, como foi
-    # da Etapa 5 do lado do Spark.
+    # Agora o valor e INTERPRETADO: 'format' = 'json', com as colunas vindas da
+    # fonte unica do schema (shared/schema/evento.json). Primeiro JSON
+    # interpretado do lado do Flink — como o primeiro from_json foi na Etapa 5
+    # do lado do Spark.
     #
-    # A chave e o user_id em UTF-8 (CONTRATO.md secao 1.3). Para le-la junto com
-    # o valor, a chave vira uma coluna propria ('key.fields') e o valor passa a
-    # excluir essa coluna ('value.fields-include' = 'EXCEPT_KEY'). No Spark isso
-    # era um cast de uma coluna que ja vinha pronta — mais um dado de
-    # configuracao para o criterio D1.
+    # Sem a coluna da chave: o Spark da Etapa 5 tambem a descartou. O destino
+    # tem os dez campos do evento e mais nada.
     #
-    # `partition` e `offset` sao METADADOS do conector: vem do Kafka, nao do
-    # JSON. VIRTUAL significa que sao so de leitura.
-    #
-    # Sem 'properties.group.id': como o Spark, o job nao gerencia offsets por
-    # consumer group. Sem checkpoint, o Flink tambem nao os commita no broker.
+    # 'json.ignore-parse-errors': um evento malformado vira campos nulos em vez
+    # de derrubar o job, como o from_json do Spark. A equivalencia exata dos
+    # dois comportamentos e verificada na limpeza (RT-5).
     t_env.execute_sql(f"""
         CREATE TABLE eventos (
-            `chave`     STRING,
-            `evento`    STRING,
-            `partition` INT    METADATA VIRTUAL,
-            `offset`    BIGINT METADATA VIRTUAL
+            {esquema.colunas_ddl()}
         ) WITH (
             'connector'                    = 'kafka',
             'topic'                        = '{config.TOPIC}',
             'properties.bootstrap.servers' = '{config.BOOTSTRAP}',
             'scan.startup.mode'            = '{config.STARTUP_MODE}',
-            'key.format'                   = 'raw',
-            'key.fields'                   = 'chave',
-            'value.format'                 = 'raw',
-            'value.fields-include'         = 'EXCEPT_KEY'
+            'format'                       = 'json',
+            'json.ignore-parse-errors'     = 'true'
         )
     """)
 
-    # --- Saida -----------------------------------------------------------
-    # O conector 'print' escreve cada linha na saida padrao, no momento em que
-    # ela chega. E o equivalente do console sink do Spark, sem o lote.
+    # --- Destino ---------------------------------------------------------
+    # Layout do CONTRATO.md secao 4: PARTITIONED BY gera
+    # run_id=.../dt=.../hh=..., e as tres colunas saem do conteudo dos
+    # arquivos para o caminho — o mesmo que o partitionBy do Spark faz.
     #
-    # Sem checkpoint, de proposito — como o Spark da Etapa 4. Ele entra na RT-3.
-    t_env.execute_sql("""
-        CREATE TABLE tela (
-            `partition` INT,
-            `offset`    BIGINT,
-            `chave`     STRING,
-            `evento`    STRING
-        ) WITH (
-            'connector' = 'print'
+    # Sem repartition, como o Spark (decisao E3): cada subtarefa escreve os
+    # proprios arquivos, e o numero de arquivos e resultado medido.
+    #
+    # 'parquet.compression': o codec do contrato, declarado. O formato Parquet
+    # do Flink repassa as opcoes parquet.* para o escritor do parquet-hadoop.
+    t_env.execute_sql(f"""
+        CREATE TABLE destino (
+            {esquema.colunas_ddl()},
+            `dt` STRING,
+            `hh` STRING
+        ) PARTITIONED BY (`run_id`, `dt`, `hh`) WITH (
+            'connector'           = 'filesystem',
+            'path'                = 'file://{config.DIR_EVENTOS}',
+            'format'              = 'parquet',
+            'parquet.compression' = '{config.PARQUET_CODEC}'
         )
     """)
 
-    # execute_sql de um INSERT submete o job e volta na hora: o job passa a
-    # rodar em segundo plano, dentro do MiniCluster.
-    resultado = t_env.execute_sql("""
-        INSERT INTO tela
-        SELECT `partition`, `offset`, `chave`, `evento` FROM eventos
+    # dt e hh a partir de event_ts (milissegundos). FROM_UNIXTIME recebe
+    # segundos e formata no fuso da SESSAO — que e UTC, fixado acima.
+    colunas = ", ".join(f"`{nome}`" for nome in esquema.nomes())
+    resultado = t_env.execute_sql(f"""
+        INSERT INTO destino
+        SELECT {colunas},
+               FROM_UNIXTIME(`event_ts` / 1000, 'yyyy-MM-dd') AS `dt`,
+               FROM_UNIXTIME(`event_ts` / 1000, 'HH')         AS `hh`
+        FROM eventos
     """)
     job = resultado.get_job_client()
 
-    print(">> job no ar. Cada evento aparece assim que chega — nao ha trigger.")
+    print(f">> job no ar. Checkpoint a cada {config.CHECKPOINT_INTERVAL}.")
+    print(f">> destino: {config.DIR_EVENTOS}")
     print(">> Ctrl+C para parar.\n")
 
     # --- Encerramento ----------------------------------------------------
-    # Mesmo desenho do lado do Spark, e pelo mesmo motivo: o Python controla o
-    # motor por uma ponte py4j, e chamar a ponte de dentro do tratador de sinal
-    # pode quebrar uma leitura em andamento. O tratador so marca um
-    # sinalizador; o cancelamento acontece no laco, em ponto seguro.
-    #
-    # A diferenca em relacao ao Spark: aqui a JVM e filha do processo Python, e
-    # nao o contrario. Isso deve permitir um cancelamento limpo do job — o que
-    # no Spark nao foi possivel (DecisaoEtapa4.md secao 5.1). A verificar na
-    # primeira execucao.
+    # Mesmo desenho da RT-2: o tratador de sinal so marca um sinalizador, e o
+    # cancelamento acontece no laco, em ponto seguro. Com
+    # RETAIN_ON_CANCELLATION, o ultimo checkpoint completo sobrevive ao Ctrl+C.
     encerrar = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: encerrar.set())
     signal.signal(signal.SIGTERM, lambda *_: encerrar.set())
@@ -137,9 +174,6 @@ def main() -> int:
         print("\n>> cancelando o job...")
         job.cancel().result()
         print(">> encerrado pelo usuario.")
-        # 130 e a convencao de "interrompido por SIGINT" — a mesma semantica do
-        # lado do Spark, mas aqui emitida de proposito, apos um cancelamento
-        # limpo, em vez de herdada de um processo morto pelo sinal.
         return 130
 
     print(f"\n>> o job terminou sozinho, com estado {estado}.")

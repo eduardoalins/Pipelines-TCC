@@ -11,6 +11,7 @@
 # Overrides sem editar arquivo, no mesmo idioma do lado do Spark:
 #
 #     STARTUP_MODE=latest-offset bash pipeline-streaming/run_local.sh
+#     CHECKPOINT_INTERVAL="30 s" bash pipeline-streaming/run_local.sh
 #
 # Pre-requisitos: Kafka no ar (docker compose up -d) e a imagem construida
 # (docker compose build flink).
@@ -25,7 +26,7 @@ cd "$RAIZ"
 # Variaveis do host nao entram no conteiner sozinhas. Repassa apenas as que o
 # config.py conhece, e apenas se estiverem definidas — o resto fica no padrao.
 ARGS=()
-for var in BOOTSTRAP TOPIC STARTUP_MODE; do
+for var in BOOTSTRAP TOPIC STARTUP_MODE BASE CHECKPOINT CHECKPOINT_INTERVAL PARQUET_CODEC; do
   if [ -n "${!var:-}" ]; then
     ARGS+=(-e "$var=${!var}")
   fi

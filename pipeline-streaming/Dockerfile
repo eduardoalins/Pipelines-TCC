@@ -80,6 +80,67 @@ RUN mkdir -p /opt/flink-connectors \
     "https://repo1.maven.org/maven2/org/apache/flink/flink-sql-connector-kafka/${KAFKA_CONNECTOR_VERSION}/flink-sql-connector-kafka-${KAFKA_CONNECTOR_VERSION}.jar" \
  && echo "${KAFKA_CONNECTOR_SHA1}  ${FLINK_KAFKA_CONNECTOR_JAR}" | sha1sum -c -
 
+# --- Formato Parquet e Hadoop (Etapa RT-3) -------------------------------
+# O PyFlink traz o conector de sistema de arquivos (flink-connector-files) e o
+# formato JSON, mas NAO o formato Parquet — verificado listando pyflink/lib em
+# 21/09/2026. Ele entra aqui, como o conector Kafka.
+#
+# E o flink-sql-parquet embute o parquet-hadoop, mas NAO o Hadoop em si, que o
+# Parquet usa para configuracao e caminhos de arquivo — o POM confirma. O Flink
+# espera o Hadoop ja no classpath; no PyFlink ele nao esta.
+#
+# Hadoop 3.4.1, e nao outra versao: e EXATAMENTE o que o Spark carrega, como
+# dependencia transitiva do conector Kafka dele (hadoop-client-api e
+# hadoop-client-runtime 3.4.1, visiveis no bloco do Ivy de toda execucao). Os
+# dois motores gravam Parquet sobre o mesmo Hadoop.
+#
+# DADO PARA O CRITERIO D1: o Spark escreve Parquet sem nada a mais. O Flink
+# precisa destes tres jars, obtidos e declarados a mao.
+#
+# Todos com o SHA-1 publicado no Maven Central, conferido em 21/09/2026.
+ARG PARQUET_VERSION=1.20.5
+ARG PARQUET_SHA1=2d9ae9e0a49808f33761425ed65271f834154a4e
+ARG HADOOP_VERSION=3.4.1
+ARG HADOOP_API_SHA1=7e4cfae7f5c85cffdbc21fdf749262fc78d4463a
+ARG HADOOP_RUNTIME_SHA1=30ec07ceccb224b2ef17af34fbb593bff3e9e071
+
+ENV FLINK_PARQUET_JAR=/opt/flink-connectors/flink-sql-parquet-${PARQUET_VERSION}.jar \
+    HADOOP_API_JAR=/opt/flink-connectors/hadoop-client-api-${HADOOP_VERSION}.jar \
+    HADOOP_RUNTIME_JAR=/opt/flink-connectors/hadoop-client-runtime-${HADOOP_VERSION}.jar
+
+RUN set -e \
+ && MAVEN=https://repo1.maven.org/maven2 \
+ && curl -fsSL -o "${FLINK_PARQUET_JAR}" \
+    "${MAVEN}/org/apache/flink/flink-sql-parquet/${PARQUET_VERSION}/flink-sql-parquet-${PARQUET_VERSION}.jar" \
+ && curl -fsSL -o "${HADOOP_API_JAR}" \
+    "${MAVEN}/org/apache/hadoop/hadoop-client-api/${HADOOP_VERSION}/hadoop-client-api-${HADOOP_VERSION}.jar" \
+ && curl -fsSL -o "${HADOOP_RUNTIME_JAR}" \
+    "${MAVEN}/org/apache/hadoop/hadoop-client-runtime/${HADOOP_VERSION}/hadoop-client-runtime-${HADOOP_VERSION}.jar" \
+ && printf '%s  %s\n%s  %s\n%s  %s\n' \
+      "${PARQUET_SHA1}" "${FLINK_PARQUET_JAR}" \
+      "${HADOOP_API_SHA1}" "${HADOOP_API_JAR}" \
+      "${HADOOP_RUNTIME_SHA1}" "${HADOOP_RUNTIME_JAR}" \
+    | sha1sum -c -
+
+# --- Usuario 1000 (Etapa RT-3) -------------------------------------------
+# O docker-compose.yml roda o conteiner como uid 1000 — o mesmo do usuario do
+# WSL —, para que os arquivos gravados em ~/tcc-data saiam com o dono certo no
+# host. Mas o Linux so conhece usuarios por NUMERO; o NOME fica no /etc/passwd,
+# e o /etc/passwd do conteiner e o da imagem, que nao tinha ninguem com uid 1000.
+#
+# Sem esta linha, a primeira execucao da RT-3 falhou com
+#     KeyError: 'getpwuid(): uid not found: 1000'
+# porque o PyFlink pergunta o nome do usuario atual para montar o nome do log.
+# E o Hadoop tem uma falha conhecida pelo mesmo motivo ("invalid null input:
+# name") — registrar o usuario resolve os dois de uma vez, em vez de contornar
+# so o primeiro.
+#
+# Criado por ultimo de proposito: uma camada pequena no fim nao invalida o cache
+# do pip install, que e a parte demorada do build.
+RUN groupadd --gid 1000 flink \
+ && useradd --uid 1000 --gid 1000 --no-create-home --home-dir /tmp \
+      --shell /usr/sbin/nologin flink
+
 # --- Codigo -------------------------------------------------------------
 # Nada e copiado: o docker-compose.yml monta o repositorio em /app.
 WORKDIR /app

@@ -155,15 +155,45 @@ services:
     environment:
       BOOTSTRAP: kafka:29092
 
+      # --- Memoria da JVM (decisao D2, tuning simetrico) -----------------
+      # O equivalente do --driver-memory 1g do Spark. Sem isto, a JVM usaria
+      # o padrao dela dentro do conteiner, ~25% do mem_limit (~384 MB).
+      #
+      # Mesmo principio do lancador do Spark: o valor precisa existir ANTES
+      # de a JVM subir. O PyFlink le JVM_ARGS no momento em que a lanca —
+      # verificado no pyflink_gateway_server.py da 1.20, nao suposto.
+      JVM_ARGS: "-Xmx1g"
+
+      # --- Usuario 1000 (ver `user:` abaixo) -----------------------------
+      # O PyFlink grava logs dentro da propria pasta de instalacao, que
+      # pertence ao root. Com o usuario 1000 isso falharia; FLINK_LOG_DIR
+      # (lida pelo mesmo pyflink_gateway_server.py) manda os logs para um
+      # lugar gravavel. HOME aponta para /tmp porque o usuario 1000 nao tem
+      # pasta pessoal dentro da imagem.
+      FLINK_LOG_DIR: /tmp/flink-log
+      HOME: /tmp
+
+    # O SEU usuario do WSL (uid 1000, gid 1000, conferido com `id`), e nao
+    # root. Sem isto, tudo que o Flink gravar em ~/tcc-data sairia com dono
+    # root no host, e o `rm -rf ~/tcc-data/checkpoints/rt` de limpeza falharia
+    # com "permissao negada".
+    user: "1000:1000"
+
     # --- Codigo --------------------------------------------------------
     # O repositorio montado em /app, somente leitura: a imagem e o runtime, o
     # codigo vem do repo — do mesmo jeito que o Spark le o codigo do repo.
     # Somente leitura porque nada aqui deve escrever no repositorio.
     #
-    # A saida (Parquet) e o checkpoint entram na Etapa RT-3, num bind mount de
-    # ~/tcc-data. Nao aqui: a RT-1 so le.
+    # ~/tcc-data do host em /tcc-data no conteiner (Etapa RT-3): e onde vao o
+    # Parquet e o checkpoint. Precisam sobreviver ao conteiner e ser legiveis
+    # pelo host — gravar DENTRO do conteiner repetiria a armadilha do
+    # KAFKA_LOG_DIRS, e o dado morreria no primeiro `docker compose down`.
+    #
+    # A vazao deste bind mount NAO foi medida, por decisao explicita: a fase
+    # local nao produz os numeros comparados (planoRT.md secao 0.5).
     volumes:
       - ./:/app:ro
+      - ${HOME}/tcc-data:/tcc-data
 
     # --- Memoria (ver env/wslconfig) ------------------------------------
     # Teto do conteiner, pela mesma logica do Kafka: o limite do WSL e freio de

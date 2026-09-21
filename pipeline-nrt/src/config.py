@@ -72,7 +72,12 @@ MASTER = os.getenv("MASTER", "local[*]")
 # 1,2 GB/s em ext4 nativo contra 77,4 MB/s em /mnt/c (drvfs). Com a saida no
 # repositorio, o gargalo do pipeline seria o sistema de arquivos do Windows e o
 # Experimento A estaria medindo drvfs em vez de Spark.
-BASE_OUT = os.getenv("BASE", os.path.expanduser("~/tcc-data/out"))
+#
+# O <base> e POR MOTOR desde o CONTRATO.md 1.3: o Flink grava em
+# ~/tcc-data/out/flink. Com um <base> so, os dois motores lendo os mesmos run_id —
+# o que acontece no desenvolvimento — gravariam nas mesmas pastas, e a
+# reconciliacao acusaria duplicatas falsas.
+BASE_OUT = os.getenv("BASE", os.path.expanduser("~/tcc-data/out/spark"))
 DIR_EVENTOS = f"{BASE_OUT}/events"
 
 # Codec do Parquet — CONTRATO.md secao 4.4, invariante de comparabilidade.

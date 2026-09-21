@@ -36,7 +36,7 @@ tenderiam a divergir.
 |---|---|---|
 | 1 a 8 | ambiente, Kafka, tópico e gerador — **compartilhados** | Etapas 0 a 3 |
 | 9 a 11 | pipeline NRT (Spark) | Etapa 5 — Parquet com checkpoint |
-| 12 a 14 | pipeline Streaming (Flink) | Etapa RT-2 — lendo e imprimindo em streaming |
+| 12 a 16 | pipeline Streaming (Flink) | Etapa RT-3 — Parquet com checkpoint |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -359,10 +359,14 @@ saída com significado quando ganhar uma condição de parada própria, na Etapa
 Com o job rodando, numa segunda aba:
 
 ```bash
-find ~/tcc-data/out -type d | sort
-find ~/tcc-data/out -name "*.parquet" | wc -l
-du -h --max-depth=1 ~/tcc-data/out/events
+find ~/tcc-data/out/spark -type d | sort
+find ~/tcc-data/out/spark -name "*.parquet" | wc -l
+du -h --max-depth=1 ~/tcc-data/out/spark/events
 ```
+
+O destino é `~/tcc-data/out/spark`: desde o `CONTRATO.md` 1.3, cada motor tem o
+próprio `<base>`, porque os dois leem o mesmo tópico e, sem isso, gravariam nas
+mesmas pastas.
 
 A estrutura deve ser `events/run_id=…/dt=…/hh=…/`, o layout do `CONTRATO.md` §4.
 Dois `hh=` significam que a execução cruzou a virada de hora — previsto, é o preço
@@ -518,55 +522,41 @@ Referência medida na máquina original: pico de **~830 MiB** no Flink e
 
 ## Passo 14 — Rodar o pipeline Streaming (Flink)
 
-O espelho do passo 9. Duas abas.
-
-**Aba 1 — o pipeline:**
+O espelho do passo 9. O job lê o tópico, interpreta o JSON e grava Parquet em
+`~/tcc-data/out/flink`, com checkpoint a cada 5 s.
 
 ```bash
 bash pipeline-streaming/run_local.sh
 ```
 
 O lançador chama o contêiner do Flink; o código é montado do repositório, então
-**editar o código não exige reconstruir a imagem**.
+**editar o código não exige reconstruir a imagem** — só mudanças no `Dockerfile`
+exigem.
 
-Com `scan.startup.mode=earliest-offset`, os eventos que já estão no tópico
-aparecem de uma vez — o equivalente do `Batch: 0` do Spark. Depois a tela para.
+Esperado: o resumo, com destino, checkpoint e os quatro jars; `>> checkpoint
+novo`; e `>> job no ar. Checkpoint a cada 5 s`.
 
-**Aba 2 — o gerador:**
+**Depois disso o console fica praticamente em silêncio.** Não é travamento. O
+`[batch N] X eventos gravados` do Spark vem de uma linha nossa dentro do
+`foreachBatch`, chamado uma vez por lote — e o Flink não tem lote, logo não tem
+onde imprimir "terminei um bloco". O único rastro são linhas
+`Got brand-new compressor [.snappy]`: um escritor de Parquet sendo aberto, uma por
+subtarefa, confirmando de passagem o codec do contrato. **O progresso se vê nos
+arquivos** — passo 15.
 
-```bash
-~/.venvs/tcc/bin/python shared/data-generator/generator.py
-```
+> **A versão que imprime os eventos na tela** — a da Etapa RT-2, onde se vê cada
+> evento atravessar o job assim que chega, com o `seq` em sequência vindo de
+> partições diferentes — está no histórico do git, no commit da RT-2. Ela mostra
+> a diferença de modelo em relação ao Spark melhor do que qualquer arquivo.
 
-Agora as linhas **escorrem continuamente**, cerca de 100 por segundo, sem pausas.
-Cada uma tem a forma:
-
-```
-1> +I[2, 459, 1013, {"event_id":"c03b6576-...","seq":5996, ...}]
-```
-
-O `1>` é a subtarefa que imprimiu (vão de 1 a 8, o paralelismo padrão); o `+I`
-marca uma inserção; os três primeiros valores são partição, offset e chave.
-
-**Este é o contraste com o passo 9.** No Spark, o console fica parado cinco
-segundos e despeja um lote organizado **por partição** — dentro dele, o `seq`
-salta. Aqui não existe trigger: cada evento atravessa o job assim que chega, e o
-`seq` aparece **em sequência**, vindo de partições diferentes. É a diferença
-entre micro-batch e streaming, visível numa tela de texto.
-
-E vale conferir um evento específico: com o tópico no mesmo estado, o Flink
-recebe **exatamente os mesmos eventos** que o Spark recebeu no passo 9 — mesmo
-`event_id`, mesma partição, mesmo offset. É a invariante que torna a comparação
-válida.
-
-**Para parar:** `Ctrl+C`. Aqui o encerramento é limpo:
+**Para parar:** `Ctrl+C`. O encerramento é limpo:
 
 ```
 >> cancelando o job...
 >> encerrado pelo usuario.
 ```
 
-e o código de saída é **130**. É o mesmo código do Spark, mas por outro caminho: no
+com código de saída **130**. É o mesmo código do Spark, mas por outro caminho: no
 Spark a JVM morre pelo sinal antes de qualquer limpeza; no Flink a JVM é filha do
 processo Python, que cancela o job de forma ordenada.
 
@@ -574,13 +564,121 @@ processo Python, que cancela o job de forma ordenada.
 
 ```bash
 STARTUP_MODE=latest-offset bash pipeline-streaming/run_local.sh
+CHECKPOINT_INTERVAL="30 s" bash pipeline-streaming/run_local.sh
 ```
+
+**O que a imagem precisa para gravar Parquet**, e que o Spark não precisou: o
+PyFlink não traz o formato Parquet, e o formato não traz o Hadoop. Os três jars —
+`flink-sql-parquet` 1.20.5 e o `hadoop-client-api`/`runtime` 3.4.1, o mesmo Hadoop
+que o Spark carrega — são baixados e verificados no build. E o contêiner roda como
+o **seu** usuário (uid 1000), para os arquivos saírem com o dono certo no host.
+
+---
+
+## Passo 15 — Ver a visibilidade por checkpoint
+
+Este é o teste mais importante do lado do Flink: ele verifica a hipótese que
+governa o `planoRT.md` (§1). Três abas.
+
+**Aba 1:** o job, como no passo 14.
+
+**Aba 2** — conta, a cada segundo, os arquivos **em andamento** (o Flink os mantém
+ocultos, com um ponto no início do nome) e os **visíveis**:
+
+```bash
+while true; do
+  p=$(find ~/tcc-data/out/flink -type f -name '.*' 2>/dev/null | wc -l)
+  c=$(find ~/tcc-data/out/flink -type f ! -name '.*' 2>/dev/null | wc -l)
+  echo "$(date +%T)  em andamento: $p   visiveis: $c"
+  sleep 1
+done
+```
+
+**Aba 3:** o gerador.
+
+**Esperado, e é o ponto do teste:**
+
+```
+18:04:01  em andamento: 8   visiveis: 24
+18:04:02  em andamento: 8   visiveis: 32
+18:04:07  em andamento: 8   visiveis: 40
+18:04:12  em andamento: 8   visiveis: 48
+   ...
+18:05:07  em andamento: 0   visiveis: 128
+```
+
+Os **em andamento** ficam constantes em 8 — um por subtarefa, recebendo eventos sem
+parar. Os **visíveis** sobem em **degraus de 8, a cada 5 segundos**: cada degrau é
+um checkpoint completando. **O Flink processa continuamente, mas o dado só fica
+visível no destino quando o checkpoint completa** — o intervalo de checkpoint tem,
+na visibilidade, o papel que o trigger tem no Spark. É por isso que o trabalho
+reporta duas latências, a de processamento e a de visibilidade.
+
+**Contar as linhas gravadas.** O `pyarrow` já está na imagem e ignora os arquivos
+ocultos, então conta só o que foi commitado:
+
+```bash
+docker compose run --rm --no-deps flink python -c "import pyarrow.dataset as ds; d = ds.dataset('/tcc-data/out/flink/events', format='parquet', partitioning='hive'); print('linhas:', d.count_rows(), '  arquivos:', len(d.files))"
+```
+
+> **Os arquivos do Flink não têm extensão `.parquet`.** O nome é
+> `part-<uuid>-<subtarefa>-<contador>`. O contrato declara o nome dos arquivos
+> como não invariante (§6), mas qualquer `find -name "*.parquet"` encontra zero
+> arquivos do Flink. Procure pela pasta, não pela extensão.
+
+**O Flink gera um terço dos arquivos do Spark.** Para os mesmos 6000 eventos a 5 s,
+referência medida na máquina original:
+
+| Motor | Arquivos | Tamanho |
+|---|---|---|
+| Spark (passo 10) | ~300 | ~3,6 MB |
+| Flink | **104** | **980 KB** |
+
+No Spark cada partição do Kafka vira uma tarefa e escreve o próprio arquivo (24 por
+lote); no Flink as 24 partições se dividem entre 8 subtarefas, e cada uma escreve um
+arquivo por checkpoint. Como na Etapa 5, a magnitude é de 100 evt/s e amortiza nas
+cargas de benchmark.
+
+---
+
+## Passo 16 — Testar a retomada (Flink)
+
+O espelho do passo 11 — com uma diferença de mecanismo que vale entender.
+
+`Ctrl+C` no job e suba de novo:
+
+```bash
+bash pipeline-streaming/run_local.sh
+```
+
+Agora tem que aparecer:
+
+```
+!! CHECKPOINT EXISTENTE — retomando de /tcc-data/checkpoints/rt/<id-do-job>/chk-<n>
+```
+
+Conte as linhas: o número não muda. Rode o gerador de novo e conte: tem que subir
+**exatamente** 6000. Se o job tivesse reprocessado o tópico, subiria muito mais.
+
+**A diferença em relação ao Spark.** O Spark retoma sozinho: basta apontar o
+`checkpointLocation`. O Flink não. Cada execução ganha um identificador novo, e os
+checkpoints ficam em `<pasta>/<id-do-job>/chk-<n>/`; o `main.py` precisa
+**encontrar** o último checkpoint completo e informá-lo ao Flink. E o padrão do
+Flink é **apagar** os checkpoints quando o job é cancelado — o `main.py` o configura
+para retê-los, senão o `Ctrl+C` destruiria justamente o que a retomada precisa.
+
+> **Zerar o Kafka exige zerar o checkpoint do Flink junto**, pelo mesmo motivo do
+> passo 11:
+>
+> ```bash
+> docker compose down -v && rm -rf ~/tcc-data/checkpoints/nrt ~/tcc-data/checkpoints/rt
+> ```
 
 ---
 
 ## Verificação final
 
-Se os catorze passos acima funcionaram, o ambiente está reproduzido:
+Se os dezesseis passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -595,7 +693,9 @@ Se os catorze passos acima funcionaram, o ambiente está reproduzido:
 - [x] O job reiniciado retoma sem reprocessar
 - [x] A imagem `tcc-flink:1.20.5` constrói, com o checksum do conector conferido
 - [x] `check_chain_flink.py` lê dado das 24 partições
-- [x] O Flink imprime os eventos em fluxo contínuo e encerra com cancelamento limpo
+- [x] O Flink grava Parquet em `~/tcc-data/out/flink` e encerra com cancelamento limpo
+- [x] Os arquivos do Flink ficam visíveis em degraus, um por checkpoint
+- [x] O job do Flink reiniciado retoma do último checkpoint sem reprocessar
 
 ---
 
@@ -609,8 +709,8 @@ Decisão E6: **código no Windows, dados em ext4 nativo do WSL.**
 |---|---|
 | Código (este repo) | `/mnt/c/.../Pipelines-TCC` |
 | Ambiente Python | `~/.venvs/tcc` |
-| Parquet de saída | `~/tcc-data/out` |
-| Checkpoints do Spark | `~/tcc-data/checkpoints` |
+| Parquet de saída | `~/tcc-data/out/spark` e `~/tcc-data/out/flink` — um `<base>` por motor |
+| Checkpoints | `~/tcc-data/checkpoints/nrt` (Spark) e `~/tcc-data/checkpoints/rt` (Flink) |
 | Métricas coletadas | `~/tcc-data/metrics` |
 | Ambiente do Flink | imagem Docker `tcc-flink:1.20.5` — fora do venv |
 
@@ -661,6 +761,7 @@ scripts/create_topic.sh   cria o tópico com 24 partições
 scripts/check_chain.py    verifica Python → Spark → JVM → Kafka
 scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1)
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
+  schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
   data-generator/         gerador de eventos                       (Etapa 3)
   analysis/               reconcile.py e report.py                 (Etapa 6)
   monitoring/             collector.py, amostra consumer lag       (Etapa 6)
@@ -668,14 +769,15 @@ shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
   run_local.sh            lançador via spark-submit
   src/config.py           trigger, endereços, destino, codec e checkpoint
-  src/esquema.py          o schema do CONTRATO.md como StructType   (Etapa 5)
+  src/esquema.py          traduz o evento.json para StructType
   src/main.py             o job
 pipeline-streaming/       pipeline Flink                           (RT-1+)
   Dockerfile              runtime: Java 17.0.20, Python, PyFlink, conector
   requirements.txt        a versão do PyFlink
   requirements.lock       todas as dependências, travadas
   run_local.sh            lançador, via docker compose run         (RT-2)
-  src/config.py           endereços e opções
+  src/config.py           endereços, destino, checkpoint e intervalo
+  src/esquema.py          traduz o evento.json para a Table API     (RT-3)
   src/main.py             o job
 benchmarks/               run_experiment.sh                        (Etapa 8)
 infra/                    Terraform                                (Etapa 10)
@@ -721,7 +823,8 @@ A Etapa 6 do NRT e a RT-4 do Flink são a **mesma etapa**: o instrumento de medi
       contêiner, conector 3.4.0, dado lido das 24 partições, ~830 MiB de pico
 - [x] **RT-2** — Flink lê do Kafka e imprime: fluxo contínuo, os mesmos eventos
       que o Spark recebeu, encerramento limpo com código 130
-- [ ] **RT-3** — Parquet + checkpoint
+- [x] **RT-3** — Parquet + checkpoint: visibilidade por checkpoint confirmada,
+      retomada verificada (18000 → 24000), um terço dos arquivos do Spark
 - [ ] **RT-4** — Instrumento de medição, para os dois motores
 - [ ] **RT-5** — Enriquecimento
 - [ ] **RT-6** — Arnês unificado

@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 1.2 — 09/09/2026**
+**Versão 1.3 — 21/09/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -41,6 +41,12 @@ alteração é registrada na seção 8, com data, motivo e execuções invalidad
   "event_ts":   "int64  — epoch em MILISSEGUNDOS, momento da geração"
 }
 ```
+
+**Forma executável: `shared/schema/evento.json`.** É a fonte única deste schema
+desde 21/09/2026. Spark e Flink leem o arquivo e montam a forma nativa de cada um,
+de modo que as duas definições **não têm como divergir**. Mudar um nome, um tipo
+ou a ordem dos campos exige mudar o arquivo **e** esta seção, com as consequências
+da regra de alteração deste contrato.
 
 **Três campos não têm relação com e-commerce e existem apenas para a medição:**
 
@@ -268,12 +274,23 @@ diretórios em vez de um.
 
 ### 4.2 `<base>`
 
-| Ambiente | Valor |
-|---|---|
-| Local | `~/tcc-data/out` |
-| Nuvem | `s3a://<bucket>/` |
+| Ambiente | Spark (NRT) | Flink (Streaming) |
+|---|---|---|
+| Local | `~/tcc-data/out/spark` | `~/tcc-data/out/flink` |
+| Nuvem | `s3a://<bucket>/spark/` | `s3a://<bucket>/flink/` |
 
-`<base>` é a única diferença entre local e nuvem, isolada em configuração.
+`<base>` é **por motor** e é a única diferença entre ambientes, isolada em
+configuração. **Abaixo dele, o layout é idêntico nos dois** — é o layout, e não o
+`<base>`, que é invariante de comparabilidade.
+
+**Por que um `<base>` por motor (versão 1.3, 21/09/2026).** Com um `<base>` único,
+a separação entre os motores dependeria de cada execução ter `run_id` próprio. Isso
+vale nos benchmarks, mas não no desenvolvimento: os dois leem o **mesmo tópico**,
+com os **mesmos** `run_id` — verificado na RT-2, quando o Flink recebeu exatamente
+os eventos que o Spark havia recebido. Os arquivos dos dois motores se misturariam
+nas mesmas pastas, e a reconciliação acusaria duplicatas que não existem, em
+silêncio. Com um `<base>` por motor, a separação é garantida por construção, e o
+`reconcile.py` recebe o `<base>` de um motor e reconcilia só ele.
 
 **Por que o local não é `./data/out` dentro do repositório.** A Etapa 0 mediu a
 escrita sequencial de 512 MB nos dois sistemas de arquivos: **1,2 GB/s** em ext4
@@ -432,5 +449,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 1.3 | 21/09/2026 | **§4.2 alterado:** `<base>` passa a ser **por motor** (`~/tcc-data/out/spark` e `~/tcc-data/out/flink`; `s3a://<bucket>/spark/` e `s3a://<bucket>/flink/`). O layout abaixo do `<base>` não muda. Motivo: com um `<base>` único, os dois motores gravariam nas mesmas pastas sempre que lessem os mesmos `run_id`, como no desenvolvimento | **Nenhuma medida.** As execuções de aprendizado do Spark (Etapa 5) ficam no destino antigo, `~/tcc-data/out/events`, e podem ser descartadas |
+| 1.2.1 | 21/09/2026 | **Nenhum item alterado.** O §1.1 ganhou forma executável em `shared/schema/evento.json`, que passa a ser a fonte única do schema para Spark e Flink | **Nenhuma** — o schema produzido pelo Spark foi verificado idêntico antes e depois |
 | 1.2 | 09/09/2026 | **Nenhum item alterado.** A decisão E3 (sem `repartition`/`coalesce`), que o plano marcava como PROVISÓRIA, foi fechada como definitiva e a seção 4.3 passou a registrar a evidência que a sustenta e a limitação declarada sobre compactação | **Nenhuma** |
 | 1.1 | 08/09/2026 | Fechadas as duas pendências que a v1.0 declarava, **sem alterar nenhum item já fixado**. Codec do Parquet = `snappy` (seção 4.4), decidido antes da primeira escrita. Partitioner do produtor = `murmur2_random` e `linger.ms` = 5 (seção 3.3), decididos na Etapa 3 e transcritos para cá | **Nenhuma.** O codec entra antes de qualquer escrita em Parquet existir; o partitioner apenas registra o que já vigorava desde a Etapa 3 |

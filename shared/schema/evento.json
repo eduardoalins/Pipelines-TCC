@@ -1,0 +1,22 @@
+{
+  "_sobre": [
+    "FONTE UNICA do schema do evento. Transcricao executavel do CONTRATO.md secao 1.1.",
+    "Spark e Flink leem este arquivo e montam a forma nativa de cada um: StructType no pipeline-nrt/src/esquema.py, declaracao de tabela no pipeline-streaming/src/esquema.py. Assim os dois NAO TEM COMO divergir — decisao da Etapa RT-3.",
+    "JSON e nao YAML: e lido pela biblioteca padrao do Python, e o arquivo precisa funcionar nos dois ambientes — o venv do host (Spark) e o conteiner (Flink) —, que nao compartilham pacotes.",
+    "A ORDEM dos campos e parte do schema. Mudar a ordem, um nome ou um tipo e alterar o CONTRATO.md, com as consequencias da regra de alteracao dele.",
+    "Tipos logicos permitidos: string, int32, int64, float64. Cada esquema.py traduz para o tipo do seu motor e FALHA se encontrar um tipo que nao conhece — nunca adivinha."
+  ],
+  "versao_contrato": "1.2",
+  "campos": [
+    {"nome": "event_id",   "tipo": "string",  "descricao": "uuid, derivado do rng semeado"},
+    {"nome": "seq",        "tipo": "int64",   "descricao": "sequencial monotonico por gerador; buraco e perda, repeticao e duplicata"},
+    {"nome": "gen_id",     "tipo": "int32",   "descricao": "identificador do processo gerador"},
+    {"nome": "run_id",     "tipo": "string",  "descricao": "identificador da execucao; o destino e particionado por ele"},
+    {"nome": "event_type", "tipo": "string",  "descricao": "pageview | add_to_cart | purchase | payment"},
+    {"nome": "user_id",    "tipo": "int32",   "descricao": "1 a 2000, uniforme; e a chave da mensagem no Kafka"},
+    {"nome": "product_id", "tipo": "int32",   "descricao": "1 a 10000"},
+    {"nome": "amount",     "tipo": "float64", "descricao": "nulo para pageview e add_to_cart"},
+    {"nome": "session_id", "tipo": "string",  "descricao": "uuid, derivado do rng semeado"},
+    {"nome": "event_ts",   "tipo": "int64",   "descricao": "epoch em MILISSEGUNDOS, momento da geracao"}
+  ]
+}
