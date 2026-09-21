@@ -36,7 +36,7 @@ tenderiam a divergir.
 |---|---|---|
 | 1 a 8 | ambiente, Kafka, tópico e gerador — **compartilhados** | Etapas 0 a 3 |
 | 9 a 11 | pipeline NRT (Spark) | Etapa 5 — Parquet com checkpoint |
-| 12 e 13 | pipeline Streaming (Flink) | Etapa RT-1 — cadeia verificada |
+| 12 a 14 | pipeline Streaming (Flink) | Etapa RT-2 — lendo e imprimindo em streaming |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -516,9 +516,71 @@ Referência medida na máquina original: pico de **~830 MiB** no Flink e
 
 ---
 
+## Passo 14 — Rodar o pipeline Streaming (Flink)
+
+O espelho do passo 9. Duas abas.
+
+**Aba 1 — o pipeline:**
+
+```bash
+bash pipeline-streaming/run_local.sh
+```
+
+O lançador chama o contêiner do Flink; o código é montado do repositório, então
+**editar o código não exige reconstruir a imagem**.
+
+Com `scan.startup.mode=earliest-offset`, os eventos que já estão no tópico
+aparecem de uma vez — o equivalente do `Batch: 0` do Spark. Depois a tela para.
+
+**Aba 2 — o gerador:**
+
+```bash
+~/.venvs/tcc/bin/python shared/data-generator/generator.py
+```
+
+Agora as linhas **escorrem continuamente**, cerca de 100 por segundo, sem pausas.
+Cada uma tem a forma:
+
+```
+1> +I[2, 459, 1013, {"event_id":"c03b6576-...","seq":5996, ...}]
+```
+
+O `1>` é a subtarefa que imprimiu (vão de 1 a 8, o paralelismo padrão); o `+I`
+marca uma inserção; os três primeiros valores são partição, offset e chave.
+
+**Este é o contraste com o passo 9.** No Spark, o console fica parado cinco
+segundos e despeja um lote organizado **por partição** — dentro dele, o `seq`
+salta. Aqui não existe trigger: cada evento atravessa o job assim que chega, e o
+`seq` aparece **em sequência**, vindo de partições diferentes. É a diferença
+entre micro-batch e streaming, visível numa tela de texto.
+
+E vale conferir um evento específico: com o tópico no mesmo estado, o Flink
+recebe **exatamente os mesmos eventos** que o Spark recebeu no passo 9 — mesmo
+`event_id`, mesma partição, mesmo offset. É a invariante que torna a comparação
+válida.
+
+**Para parar:** `Ctrl+C`. Aqui o encerramento é limpo:
+
+```
+>> cancelando o job...
+>> encerrado pelo usuario.
+```
+
+e o código de saída é **130**. É o mesmo código do Spark, mas por outro caminho: no
+Spark a JVM morre pelo sinal antes de qualquer limpeza; no Flink a JVM é filha do
+processo Python, que cancela o job de forma ordenada.
+
+**Variar sem editar arquivo:**
+
+```bash
+STARTUP_MODE=latest-offset bash pipeline-streaming/run_local.sh
+```
+
+---
+
 ## Verificação final
 
-Se os treze passos acima funcionaram, o ambiente está reproduzido:
+Se os catorze passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -533,6 +595,7 @@ Se os treze passos acima funcionaram, o ambiente está reproduzido:
 - [x] O job reiniciado retoma sem reprocessar
 - [x] A imagem `tcc-flink:1.20.5` constrói, com o checksum do conector conferido
 - [x] `check_chain_flink.py` lê dado das 24 partições
+- [x] O Flink imprime os eventos em fluxo contínuo e encerra com cancelamento limpo
 
 ---
 
@@ -611,6 +674,9 @@ pipeline-streaming/       pipeline Flink                           (RT-1+)
   Dockerfile              runtime: Java 17.0.20, Python, PyFlink, conector
   requirements.txt        a versão do PyFlink
   requirements.lock       todas as dependências, travadas
+  run_local.sh            lançador, via docker compose run         (RT-2)
+  src/config.py           endereços e opções
+  src/main.py             o job
 benchmarks/               run_experiment.sh                        (Etapa 8)
 infra/                    Terraform                                (Etapa 10)
 results/                  CSVs e manifestos por run_id             (Etapa 11)
@@ -653,7 +719,8 @@ A Etapa 6 do NRT e a RT-4 do Flink são a **mesma etapa**: o instrumento de medi
 
 - [x] **RT-1** — Versões travadas e cadeia verificada: Flink 1.20.5 LTS em
       contêiner, conector 3.4.0, dado lido das 24 partições, ~830 MiB de pico
-- [ ] **RT-2** — Flink lê do Kafka e imprime
+- [x] **RT-2** — Flink lê do Kafka e imprime: fluxo contínuo, os mesmos eventos
+      que o Spark recebeu, encerramento limpo com código 130
 - [ ] **RT-3** — Parquet + checkpoint
 - [ ] **RT-4** — Instrumento de medição, para os dois motores
 - [ ] **RT-5** — Enriquecimento
