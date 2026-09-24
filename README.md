@@ -117,6 +117,31 @@ wsl -d Ubuntu -u root -- apt-get update
 wsl -d Ubuntu -u root -- apt-get install -y python3.12-venv openjdk-17-jdk-headless
 ```
 
+**Travar o Java — obrigatório, não opcional.** O Ubuntu atualiza pacotes sozinho
+(`unattended-upgrades`), e o OpenJDK é pacote do sistema, fora do controle do
+`requirements.txt`. Em 24/09/2026 ele passou de 17.0.20 para 17.0.20.1 **com o
+Spark rodando**, e o job morreu no primeiro micro-batch com dados:
+
+```
+Incorrect Java version: 17.0.20+8-1-24.04-Ubuntu
+jspawnhelper version 17.0.20.1+1-1-24.04-Ubuntu
+java.io.IOException: Cannot run program "chmod": error=0, Failed to exec spawn helper
+```
+
+A JVM carregada na memória era a antiga; o auxiliar que ela usa para lançar
+processos (`chmod`, `rm`) já era o novo, e recusou. Pior que a queda seria a
+troca silenciosa no meio de uma bateria: parte das execuções numa versão, parte
+na outra. Depois de instalar:
+
+```bash
+sudo apt-mark hold $(dpkg -l | awk '/openjdk-17/ {print $2}')
+apt-mark showhold            # deve listar os pacotes openjdk-17-*
+java -version                # registrar a versão exata
+```
+
+Para atualizar de propósito no futuro: `apt-mark unhold`, atualizar, refazer o
+passo 5 e registrar a nova versão.
+
 **Instalar as dependências Python:**
 
 ```bash
@@ -196,7 +221,7 @@ Sobe um Spark, resolve o conector do Kafka a partir do Maven, lê o tópico e
 confirma que enxerga as 24 partições. Ele verifica a cadeia inteira:
 
 ```
-Python 3.12.3 → PySpark 4.0.4 → JVM 17.0.20 → conector Scala 2.13
+Python 3.12.3 → PySpark 4.0.4 → JVM 17.0.20.1 → conector Scala 2.13
               → broker Kafka 4.0.2 → tópico com 24 partições
 ```
 
@@ -446,7 +471,12 @@ A primeira construção leva cerca de dois minutos, quase todos no `pip install`
   pacote Python. Duas instalações do mesmo motor na mesma imagem é armadilha.
   Aqui existe uma só — e ela chega do mesmo jeito que o Spark chega no host,
   dentro do pacote Python.
-- **A JVM é a 17.0.20**, exatamente a mesma que o Spark usa no host.
+- **A JVM é a Temurin 17.0.20+8**, e a imagem base está travada pelo **digest**,
+  não só pela tag — a tag `17.0.20_8-jre-jammy` foi republicada em 18/09/2026, e
+  tag nenhuma é imutável. O Spark no host usa o OpenJDK do Ubuntu, 17.0.20.1: a
+  mesma versão de feature e o mesmo nível de atualização, de fornecedores
+  diferentes, com um patch pontual a mais no host. Não existe Temurin 17.0.20.1
+  publicada para alinhar.
 - **O conector Kafka é baixado e verificado no build.** Diferente do Spark, que
   resolve o conector sozinho do Maven, o Flink precisa que o jar seja obtido e o
   caminho declarado. O `Dockerfile` baixa o `flink-sql-connector-kafka-3.4.0-1.20`
@@ -738,12 +768,12 @@ meio dos experimentos invalida as execuções já feitas.
 | Kafka | 4.0.2 (KRaft) | 03/09/2026 |
 | Spark / PySpark | 4.0.4 (Scala 2.13) | 03/09/2026 |
 | Python | 3.12.3 | 03/09/2026 |
-| JVM | OpenJDK 17.0.20 | 03/09/2026 |
+| JVM | OpenJDK 17.0.20.1 (Ubuntu), travado com `apt-mark hold` — era 17.0.20 até o `unattended-upgrades` de 24/09/2026 | 24/09/2026 |
 | confluent-kafka | 2.15.0 (librdkafka 2.15.0) | 04/09/2026 |
 | Flink / PyFlink | 1.20.5 (LTS), em contêiner | 21/09/2026 |
 | Conector Kafka do Flink | `flink-sql-connector-kafka` 3.4.0-1.20 | 21/09/2026 |
 | Python do Flink | 3.10.12 (Ubuntu 22.04 da imagem) | 21/09/2026 |
-| JVM do Flink | Temurin 17.0.20 — a mesma do Spark | 21/09/2026 |
+| JVM do Flink | Temurin 17.0.20+8; base travada pelo digest `sha256:e85989f3…` | 24/09/2026 |
 
 As versões do Spark estão no `requirements.txt` da raiz. As do Flink estão em
 `pipeline-streaming/requirements.txt` e, travadas até as dependências

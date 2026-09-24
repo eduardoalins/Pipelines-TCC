@@ -12,6 +12,7 @@ da Etapa 8 varrer um fator por execucao sem editar arquivo nenhum.
 """
 
 import os
+import time
 
 import pyspark
 
@@ -116,6 +117,34 @@ CHECKPOINT_DIR = os.getenv(
 )
 
 
+# --- Medicao (Etapa 6) ---------------------------------------------------
+# Log de progresso: uma linha JSON por micro-batch com batch_id, processed_ts,
+# committed_ts, linhas e offsets. E onde vive o committed_ts (CONTRATO.md 2.2),
+# que nao cabe dentro do Parquet porque e tomado DEPOIS que ele e escrito.
+#
+# Fica em ~/tcc-data/metrics, ao lado do manifesto do gerador. Um arquivo por
+# EXECUCAO DO PIPELINE, nomeado pelo instante de subida: o pipeline nao conhece
+# o run_id (ele vem dentro dos eventos, e um micro-batch pode ter mais de um).
+#
+# A ligacao com o Parquet e o par (batch_id, processed_ts), gravado nos dois
+# lugares. O batch_id sozinho nao basta: ele recomeca do zero quando o
+# checkpoint e apagado, e um batch refeito apos falha repete o mesmo batch_id —
+# e o processed_ts que distingue as duas tentativas.
+DATA_DIR = os.getenv("DATA_DIR", os.path.expanduser("~/tcc-data"))
+METRICS_DIR = f"{DATA_DIR}/metrics"
+INICIO_MS = int(time.time() * 1000)
+LOG_PROGRESSO = f"{METRICS_DIR}/spark.progresso.{INICIO_MS}.jsonl"
+
+# group.id sob o qual o pipeline COMMITA no Kafka os offsets ja gravados
+# (decisao D1, planoRT.md F7).
+#
+# O Spark nao faz isso sozinho: ele guarda os offsets no checkpoint e o Kafka
+# nunca fica sabendo do progresso. O commit aqui existe SO para medir consumer
+# lag com o mesmo instrumento nos dois motores (collector.py) — o Spark nunca
+# le este grupo de volta; quem manda na retomada continua sendo o checkpoint.
+GROUP_ID = os.getenv("GROUP_ID", "tcc-nrt-spark")
+
+
 # --- Conector do Kafka ---------------------------------------------------
 # O conector NAO e instalado por pip: o Spark o resolve do Maven em tempo de
 # execucao e guarda em cache no ~/.ivy2.5.2 — o diretorio leva a versao do Ivy
@@ -152,6 +181,8 @@ def resumo() -> str:
         ("codec", PARQUET_CODEC),
         ("fuso", TIMEZONE),
         ("checkpoint", CHECKPOINT_DIR),
+        ("log progresso", LOG_PROGRESSO),
+        ("group.id", GROUP_ID),
         ("spark", SPARK_VERSION),
         ("conector", KAFKA_CONNECTOR),
     ]

@@ -55,6 +55,15 @@ else
   echo "OK: $(java -version 2>&1 | head -1)"
 fi
 
+# O Java e pacote do sistema: o unattended-upgrades do Ubuntu o atualiza sozinho,
+# e em 24/09/2026 isso derrubou o Spark no meio de uma execucao ("Incorrect Java
+# version ... jspawnhelper"). Aqui so AVISA — travar exige root. Ver README, passo 2.
+if command -v apt-mark >/dev/null 2>&1 && ! apt-mark showhold | grep -q '^openjdk-17'; then
+  echo
+  echo "ATENCAO: o OpenJDK nao esta travado e pode ser trocado sem aviso."
+  echo "    sudo apt-mark hold \$(dpkg -l | awk '/openjdk-17/ {print \$2}')"
+fi
+
 # --- 2. Pastas de dados ----------------------------------------------------
 say "Criando pastas de dados em $DATA_DIR"
 mkdir -p "$DATA_DIR/out" "$DATA_DIR/checkpoints" "$DATA_DIR/metrics"

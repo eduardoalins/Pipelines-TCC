@@ -10,6 +10,12 @@
 #     Python 3.12.3 -> PySpark 4.0.4 -> JVM 17.0.20 -> conector Scala 2.13
 #                   -> broker Kafka 4.0.2 -> topico com 24 particoes
 #
+# JVM: a verificacao foi feita na 17.0.20. Em 24/09/2026 o unattended-upgrades
+# do Ubuntu levou o OpenJDK a 17.0.20.1 sozinho — com o Spark rodando, o que
+# derrubou o job. Aceita (nenhuma execucao medida havia sido feita) e travada com
+# `apt-mark hold`. A JVM nao vem do pip: e pacote do sistema, e este arquivo nao
+# a controla. Ver README, passo 2.
+#
 # Por que 4.0.x e nao 4.2: o 4.0 esta em campo desde meados de 2025 e tem
 # comunidade grande o bastante para que um erro colado no Google encontre
 # resposta. O 4.2 e recente demais para isso.
@@ -54,3 +60,12 @@ confluent-kafka==2.15.0
 # precisa descrever a maquina que produziu os numeros, nao a que se pretendia
 # ter.
 PyYAML==6.0.3
+
+# --- Etapa 6: reconciliacao ---------------------------------------------
+#
+# DuckDB le o Parquet dos DOIS motores com o mesmo leitor, que nao pertence a
+# nenhum deles — ler a saida do Flink com o Spark seria um motor julgando o
+# outro (decisao B3, a parte dela que sobreviveu). Biblioteca, nao servidor:
+# nao sobe processo nem porta. Versao conferida no PyPI em 24/09/2026 (1.5.5,
+# de 22/07/2026, wheel cp312 manylinux x86_64).
+duckdb==1.5.5

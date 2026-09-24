@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 1.3 — 21/09/2026**
+**Versão 1.4 — 23/09/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -117,37 +117,86 @@ característica do desenho, não como ameaça à validade.
 Não existem no Kafka. São gravadas pelo pipeline no `foreachBatch`,
 imediatamente antes da escrita.
 
+**Gravadas no arquivo Parquet:**
+
 | Coluna | Tipo | Origem |
 |---|---|---|
-| `batch_id` | int64 | Id do micro-batch (decisão B2) |
+| `batch_id` | int64 | Id do micro-batch no Spark; no Flink, ver 2.3 |
 | `processed_ts` | int64 | Epoch ms, momento imediatamente anterior à escrita |
-| `watermark_ts` | int64 | Ver 2.1 |
-| `is_late` | bool | `event_ts < watermark_ts` |
 
-### 2.1 Cálculo do watermark
+**Registrados fora do Parquet** (versão 1.4, 23/09/2026):
+
+| Dado | Onde vive | Origem |
+|---|---|---|
+| `committed_ts` | log por unidade de progresso, ao lado do manifesto | Epoch ms, **depois** do retorno da escrita — ver 2.2 |
+| `watermark_ts`, `is_late` | derivados na análise | Calculados pelo `reconcile.py` a partir dos `event_ts` gravados — ver 2.1 |
+
+### 2.1 O watermark é calculado na análise, não no pipeline
 
 **`watermark_ts` = (máximo de `event_ts` acumulado desde o início da execução)
-menos 60 segundos.**
+menos 60 segundos**, e `is_late` = `event_ts < watermark_ts`.
 
 **O máximo é acumulado, não por batch.** Um watermark é, por definição, uma
 fronteira monotônica não decrescente. Calculado como o máximo do batch corrente,
 ele retrocederia em intervalos de menor movimento — e eventos já marcados como
 atrasados deixariam de ser, dependendo apenas de em qual batch caíram.
 
-**Onde o valor vive.** Numa variável do driver, mantida entre micro-batches.
-Isso **não viola a decisão B1** (pipeline stateless): B1 trata de estado
-gerenciado pelo Spark, com state store e checkpoint de estado. Aqui é uma
-variável do processo driver.
+**Onde o cálculo acontece — decisão de 23/09/2026.** Na **análise**, pelo
+`reconcile.py`, a partir dos `event_ts` já gravados no destino. Não no caminho
+quente de nenhum dos dois motores.
 
-**Persistência, e por que ela é obrigatória.** O valor corrente é gravado num
-arquivo ao lado do checkpoint a cada batch, e recarregado na subida do job.
+**Por quê.** A definição acima foi desenhada para o Spark, onde o watermark é uma
+variável do driver — um ponto único que vê todos os eventos. **O Flink não tem
+esse ponto único:** cada subtarefa calcula o próprio watermark, e o operador a
+jusante vê o **mínimo** entre os das suas entradas. Uma definição fica governada
+pela partição mais adiantada, a outra pela mais atrasada; com 24 partições e o
+desequilíbrio de ±25% já medido, `is_late` mediria coisas diferentes nos dois
+motores.
 
-Sem isso, uma reinicialização zeraria o watermark. No cenário C4 do Experimento
-C — kill do driver Spark —, as contagens de `is_late` imediatamente após a
-recuperação estariam erradas, e o defeito apareceria como resultado do
-experimento de tolerância a falhas.
+As alternativas custavam caro. Replicar o cálculo do contrato dentro do Flink
+exigiria uma agregação global — um operador com paralelismo 1 vendo todos os
+eventos —, criando ali um gargalo que o Spark não tem e contaminando a medição de
+throughput. Usar o mecanismo nativo de cada um preservaria os motores, mas tornaria
+a coluna incomparável entre eles.
 
-### 2.2 O que `is_late` mede
+**Por que calcular fora é viável aqui, e não seria em outro trabalho.** O pipeline
+é **stateless** (decisão B1): o watermark não governa janela nenhuma, não dispara
+nada, não descarta nada — ele só preenche duas colunas de diagnóstico. Não há razão
+para ele ser calculado no caminho quente.
+
+**O que se ganha.** A invariante sobrevive intacta, os dois motores produzem
+exatamente o mesmo `is_late` para a mesma entrada, e nenhum deles é distorcido para
+acomodar o outro. Some também a persistência do watermark ao lado do checkpoint, e
+com ela o risco que a versão anterior desta seção descrevia: o cenário C4 zerando o
+watermark e contaminando as contagens logo após a recuperação.
+
+**O que se perde, e fica declarado.** `watermark_ts` deixa de ser "o que o motor
+sabia no momento do processamento" e passa a ser "o que era verdade sobre o dado".
+Como o uso é diagnóstico — detectar saturação —, a perda é pequena.
+
+### 2.2 `committed_ts` — o quarto instante
+
+**Epoch ms, tomado depois que a escrita retorna.**
+
+**Por que ele existe.** A decisão B6 manda reportar **duas** latências: a de
+**processamento** (`processed_ts − event_ts`) e a de **visibilidade**
+(`committed_ts − event_ts`). Sem este instante, a segunda não é mensurável — e ela
+é a definição que o Projeto de Pesquisa §3.2.1 adota para latência fim a fim.
+
+**Por que fora do Parquet.** Uma coluna gravada depois da escrita não pode estar
+dentro do arquivo que acabou de ser escrito. O valor é registrado num log por
+unidade de progresso — micro-batch no Spark, checkpoint no Flink —, ao lado do
+manifesto, e cruzado na análise pelo `batch_id`/`checkpoint_id`. O `reconcile.py`
+já cruza as duas fontes de qualquer forma.
+
+### 2.3 `batch_id` no Flink
+
+No Spark o valor vem de graça, como parâmetro do `foreachBatch`. No Flink um
+registro é processado **antes** de se saber a qual checkpoint pertencerá, o que
+torna o equivalente não trivial. **Pendência aberta** — a seção 6 já declara que os
+**valores** de `batch_id`/`checkpoint_id` não são invariantes.
+
+### 2.4 O que `is_late` mede
 
 O corte de 60 segundos precisa ser lido corretamente na análise.
 
@@ -387,7 +436,7 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Chave da mensagem | `user_id`, representação decimal em UTF-8 (seção 1.3) |
 | Distribuição de `user_id` | Uniforme em [1, 2000], seed fixa (seção 1.4) |
 | Colunas de saída | Seção 2; o equivalente de `batch_id` no Flink é o `checkpoint_id` |
-| Cálculo do watermark | Máximo acumulado de `event_ts` menos 60 s, monotônico e persistido (seção 2.1) |
+| Cálculo do watermark | Máximo acumulado de `event_ts` menos 60 s, monotônico — **derivado na análise**, igual para os dois motores (seção 2.1) |
 | Tópico e partições | `ecommerce.events.v1`, 24 partições |
 | Gerador e seed | Mesmo binário, mesma seed, mesmo `config.yaml` |
 | Carga | Mesmos níveis, mesma duração, mesmas repetições |
@@ -449,6 +498,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 1.4 | 23/09/2026 | **§2 reescrito.** `watermark_ts` e `is_late` deixam de ser gravados pelo pipeline e passam a ser **derivados na análise** (§2.1), porque a definição do contrato não tem equivalente no modelo distribuído do Flink. Acrescentado `committed_ts` (§2.2), registrado **fora do Parquet**, num log por unidade de progresso — sem ele a latência de visibilidade da decisão B6 não é mensurável. A persistência do watermark ao lado do checkpoint deixa de existir | **Nenhuma.** Nenhuma execução medida foi feita, e as de aprendizado não produziram as colunas em questão |
 | 1.3 | 21/09/2026 | **§4.2 alterado:** `<base>` passa a ser **por motor** (`~/tcc-data/out/spark` e `~/tcc-data/out/flink`; `s3a://<bucket>/spark/` e `s3a://<bucket>/flink/`). O layout abaixo do `<base>` não muda. Motivo: com um `<base>` único, os dois motores gravariam nas mesmas pastas sempre que lessem os mesmos `run_id`, como no desenvolvimento | **Nenhuma medida.** As execuções de aprendizado do Spark (Etapa 5) ficam no destino antigo, `~/tcc-data/out/events`, e podem ser descartadas |
 | 1.2.1 | 21/09/2026 | **Nenhum item alterado.** O §1.1 ganhou forma executável em `shared/schema/evento.json`, que passa a ser a fonte única do schema para Spark e Flink | **Nenhuma** — o schema produzido pelo Spark foi verificado idêntico antes e depois |
 | 1.2 | 09/09/2026 | **Nenhum item alterado.** A decisão E3 (sem `repartition`/`coalesce`), que o plano marcava como PROVISÓRIA, foi fechada como definitiva e a seção 4.3 passou a registrar a evidência que a sustenta e a limitação declarada sobre compactação | **Nenhuma** |

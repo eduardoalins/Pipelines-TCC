@@ -21,14 +21,23 @@
 # divergirem o job roda sobre a errada. Aqui existe UM Flink, e ele chega do
 # mesmo jeito que o Spark chega no host: dentro do pacote Python.
 #
-# Tag especifica, nao a flutuante `17-jre-jammy`: a flutuante muda a cada
-# atualizacao, e a decisao E7 trata versao como parte do metodo. A 17.0.20 e a
-# MESMA versao da JVM que o Spark usa no host (OpenJDK 17.0.20) — os dois
-# motores sobre a mesma JVM.
+# Travada pelo DIGEST, nao so pela tag. A decisao E7 trata versao como parte do
+# metodo, e tag nenhuma e imutavel: a `17.0.20_8-jre-jammy` foi REPUBLICADA em
+# 18/09/2026 (atualizacao do Ubuntu por baixo, mesma JVM). Com a tag sozinha, um
+# rebuild futuro traria outra imagem sem aviso. O digest abaixo e o da base que
+# produziu as medicoes da RT-1 e da RT-3, tirado do historico do BuildKit
+# (`docker buildx history inspect`) em 24/09/2026. A tag fica so para leitura.
+#
+# JVM: Temurin 17.0.20+8 (conferido com `java -version` dentro da imagem). O
+# host do Spark roda o OpenJDK do Ubuntu, que o unattended-upgrades levou a
+# 17.0.20.1 em 24/09/2026. Mesma versao de feature e mesmo nivel de atualizacao
+# (17.0.20), builds de fornecedores diferentes, e um patch pontual a mais no
+# host. Nao existe Temurin 17.0.20.1 publicada para alinhar. Ver
+# PontosSensiveis.md §5.5.
 #
 # jammy = Ubuntu 22.04, cujo Python do sistema e o 3.10. O PyFlink 1.20.5
 # publica wheel para 3.8 a 3.11; o 3.10 esta dentro.
-FROM eclipse-temurin:17.0.20_8-jre-jammy
+FROM eclipse-temurin:17.0.20_8-jre-jammy@sha256:e85989f3e4d136b3d7dde921e157fddb9c7016805a225c1ec483326b825b3ca5
 
 # --- Python ---------------------------------------------------------------
 # curl entra so para baixar o conector, logo abaixo.
