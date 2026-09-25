@@ -26,7 +26,7 @@ cd "$RAIZ"
 # Variaveis do host nao entram no conteiner sozinhas. Repassa apenas as que o
 # config.py conhece, e apenas se estiverem definidas — o resto fica no padrao.
 ARGS=()
-for var in BOOTSTRAP TOPIC STARTUP_MODE BASE CHECKPOINT CHECKPOINT_INTERVAL PARQUET_CODEC; do
+for var in BOOTSTRAP TOPIC STARTUP_MODE BASE CHECKPOINT CHECKPOINT_INTERVAL PARQUET_CODEC GROUP_ID; do
   if [ -n "${!var:-}" ]; then
     ARGS+=(-e "$var=${!var}")
   fi

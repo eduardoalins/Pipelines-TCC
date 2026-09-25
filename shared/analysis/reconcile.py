@@ -2,6 +2,7 @@
 Reconciliacao — Etapa 6 (= RT-4). A conferencia DEPOIS da execucao.
 
     RUN_ID=<run_id> ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
+    MOTOR=flink RUN_ID=<run_id> ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
     ~/.venvs/tcc/bin/python shared/analysis/reconcile.py          # lista os run_id
 
 Confere a "prateleira" (o Parquet gravado pelo motor) contra a "nota fiscal" (o
@@ -113,6 +114,86 @@ def linha_ms(nome: str, s: dict | None) -> str:
             f"media {s['media']:>6}  min {s['min']:>6}  max {s['max']:>6}   (ms, n={s['n']})")
 
 
+# --- Latencia no Flink (unidade de progresso = arquivo) ----------------------
+
+def latencia_por_arquivo(con, logs: list[Path]) -> dict:
+    """Latencias do Flink, com o committed_ts vindo do ctime de cada arquivo.
+
+    Sem batch nao ha "espera no trigger" nem "processamento do lote": o evento
+    e carimbado ao passar pelo job. A decomposicao fica em duas parcelas:
+
+        processamento           processed_ts - event_ts
+        espera pelo checkpoint  committed_ts - processed_ts
+        --------------------------------------------------
+        visibilidade            committed_ts - event_ts
+
+    O log de checkpoints NAO entra na conta: e so conferido contra o ctime.
+    """
+    con.execute("""
+        CREATE VIEW lat AS
+        SELECT * FROM (
+            SELECT gen_id, seq, event_ts, processed_ts, committed_ts, unidade,
+                   row_number() OVER (PARTITION BY gen_id, seq ORDER BY processed_ts) AS rn
+            FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL
+        ) WHERE rn = 1
+    """)
+    n_unidades, primeira = con.execute(
+        "SELECT count(DISTINCT unidade), min(unidade) FROM lat").fetchone()
+
+    # Aquecimento, pela mesma regra do Spark: descarta a primeira unidade de
+    # progresso (o primeiro checkpoint com dados).
+    regime = f"unidade > {primeira}"
+    metricas = {
+        "espera pelo checkpoint": "committed_ts - processed_ts",
+        "LAT. PROCESSAMENTO": "processed_ts - event_ts",
+        "LAT. VISIBILIDADE": "committed_ts - event_ts",
+    }
+    print(f"  checkpoints com dados .. {n_unidades}   (o 1o e descartado como aquecimento)")
+    print("  committed_ts ........... ctime de cada arquivo (CONTRATO.md 1.6, 2.2)")
+    print("\n  em regime (sem o 1o checkpoint):")
+    lat = {}
+    for nome, expr in metricas.items():
+        s = resumo(con, expr, "lat", regime)
+        lat[nome] = s
+        print(linha_ms(nome, s))
+    print("\n  execucao inteira (com o 1o checkpoint):")
+    for nome in ("LAT. PROCESSAMENTO", "LAT. VISIBILIDADE"):
+        s = resumo(con, metricas[nome], "lat")
+        lat[nome + " (com aquecimento)"] = s
+        print(linha_ms(nome, s))
+
+    # Conferencia: cada ctime deve cair a poucos ms do fim de um checkpoint no
+    # log (verificado a -7..+8 ms em 25/09/2026). Um desvio grande indica que
+    # algo tocou nos arquivos depois de gravados (chmod, copia...) — e a
+    # latencia de visibilidade estaria falsificada.
+    conferencia = None
+    if logs:
+        con.execute(f"""
+            CREATE VIEW ck AS
+            SELECT committed_ts::BIGINT AS fim
+            FROM read_json({lista_sql(logs)}, format = 'newline_delimited',
+                           union_by_name = true)
+            WHERE checkpoint_id IS NOT NULL
+        """)
+        d_min, d_max, n = con.execute("""
+            WITH u AS (SELECT DISTINCT unidade FROM lat),
+            par AS (
+                SELECT u.unidade, arg_min(u.unidade - ck.fim, abs(u.unidade - ck.fim)) AS d
+                FROM u, ck GROUP BY u.unidade
+            )
+            SELECT min(d), max(d), count(*) FROM par
+        """).fetchone()
+        conferencia = {"ctime_menos_fim_checkpoint_ms": [d_min, d_max], "unidades": n}
+        print(f"\n  conferencia ctime x log de checkpoints: {d_min}..{d_max} ms "
+              f"em {n} checkpoints")
+        if max(abs(d_min), abs(d_max)) > 1000:
+            print("  !! desvio acima de 1 s: os arquivos foram tocados depois de gravados?")
+    else:
+        print("\n  (sem log de checkpoints para conferir o ctime)")
+
+    return {"latencia_ms": lat, "conferencia_ctime": conferencia}
+
+
 # --- Principal --------------------------------------------------------------
 
 def main() -> int:
@@ -130,12 +211,45 @@ def main() -> int:
         return 2
 
     con = duckdb.connect()
+    # filename = true: cada linha traz o arquivo de onde veio. No Flink e ele
+    # que liga o evento ao instante de visibilidade (CONTRATO.md 1.6, 2.2).
     con.execute(f"""
-        CREATE VIEW ev AS
-        SELECT * FROM read_parquet({lista_sql(arqs)}, hive_partitioning = true)
+        CREATE VIEW ev_bruto AS
+        SELECT * FROM read_parquet({lista_sql(arqs)}, hive_partitioning = true,
+                                   filename = true)
     """)
-    colunas = {c[0] for c in con.execute("DESCRIBE ev").fetchall()}
-    relatorio: dict = {"motor": MOTOR, "run_id": RUN_ID}
+    tipos = {c[0]: c[1] for c in con.execute("DESCRIBE ev_bruto").fetchall()}
+    colunas = set(tipos)
+
+    # processed_ts e timestamp desde o CONTRATO.md 1.5 (2.5); antes era inteiro
+    # (epoch ms). Tudo aqui trabalha em epoch ms, que e tambem como os logs de
+    # progresso o guardam — entao o timestamp e convertido na entrada, e as
+    # execucoes gravadas antes da 1.5 continuam legiveis.
+    em_ms = "TIMESTAMP" in tipos.get("processed_ts", "").upper()
+    selecao = ("SELECT * REPLACE (epoch_ms(processed_ts) AS processed_ts)"
+               if em_ms else "SELECT *")
+    pts_ms = "epoch_ms(processed_ts)" if em_ms else "processed_ts"
+
+    # UNIDADE DE PROGRESSO — o que agrupa os eventos que ficaram visiveis juntos
+    # (CONTRATO.md 1.6, 2.2-2.3):
+    #   Spark  -> o micro-batch, identificado pelo processed_ts (um por batch);
+    #             o committed_ts vem do log de progresso.
+    #   Flink  -> o arquivo: sem batch_id, cada arquivo e finalizado por
+    #             exatamente um checkpoint, e o committed_ts e o ctime dele — o
+    #             instante em que deixou de ser oculto.
+    modo = "batch" if "batch_id" in colunas else "arquivo"
+    if modo == "arquivo":
+        con.execute("CREATE TABLE arq_ctime (filename VARCHAR, committed_ts BIGINT)")
+        con.executemany("INSERT INTO arq_ctime VALUES (?, ?)",
+                        [(str(a), int(a.stat().st_ctime * 1000)) for a in arqs])
+        con.execute(f"""
+            CREATE VIEW ev AS
+            {selecao}, committed_ts AS unidade
+            FROM ev_bruto JOIN arq_ctime USING (filename)
+        """)
+    else:
+        con.execute(f"CREATE VIEW ev AS {selecao}, {pts_ms} AS unidade FROM ev_bruto")
+    relatorio: dict = {"motor": MOTOR, "run_id": RUN_ID, "unidade_de_progresso": modo}
 
     print(f"=== reconcile — motor {MOTOR}, run_id {RUN_ID} ===\n")
 
@@ -224,9 +338,10 @@ def main() -> int:
     # --- 2. Latencia ---------------------------------------------------------
     print("\n--- 2. Latencia ---")
     logs = sorted(METRICS.glob(f"{MOTOR}.progresso.*.jsonl"))
-    if not {"batch_id", "processed_ts"} <= colunas:
-        print("  indisponivel: o destino nao tem batch_id/processed_ts "
-              "(no Flink, pendencia C2)")
+    if "processed_ts" not in colunas:
+        print("  indisponivel: o destino nao tem processed_ts")
+    elif modo == "arquivo":
+        relatorio.update(latencia_por_arquivo(con, logs))
     elif not logs:
         print(f"  indisponivel: sem log de progresso ({METRICS}/{MOTOR}.progresso.*.jsonl)")
     else:
@@ -292,22 +407,24 @@ def main() -> int:
     if "processed_ts" not in colunas:
         print("  indisponivel sem processed_ts (ordem de processamento)")
     else:
-        # Por unidade de progresso, na ordem em que foram gravadas: o watermark
-        # de um batch e o maior event_ts visto nos batches ANTERIORES, menos
-        # 60 s. Acumulado, nunca so do batch corrente — senao ele retrocederia
-        # e um evento deixaria de ser atrasado conforme o batch em que caiu.
+        # Por unidade de progresso, na ordem em que ficaram visiveis: o
+        # watermark de uma unidade e o maior event_ts visto nas unidades
+        # ANTERIORES, menos 60 s. Acumulado, nunca so da unidade corrente —
+        # senao ele retrocederia e um evento deixaria de ser atrasado conforme a
+        # unidade em que caiu. A unidade e o micro-batch no Spark e o
+        # checkpoint (o ctime do arquivo) no Flink: a mesma regra nos dois.
         atrasados, total = con.execute(f"""
-            WITH por_batch AS (
-                SELECT processed_ts, max(event_ts) AS mx FROM ev GROUP BY processed_ts
+            WITH por_unidade AS (
+                SELECT unidade, max(event_ts) AS mx FROM ev GROUP BY unidade
             ), wm AS (
-                SELECT processed_ts,
-                       max(mx) OVER (ORDER BY processed_ts
+                SELECT unidade,
+                       max(mx) OVER (ORDER BY unidade
                                      ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
                        - {ATRASO_WATERMARK_MS} AS watermark_ts
-                FROM por_batch
+                FROM por_unidade
             )
             SELECT count(*) FILTER (WHERE e.event_ts < w.watermark_ts), count(*)
-            FROM ev e JOIN wm w USING (processed_ts)
+            FROM ev e JOIN wm w USING (unidade)
         """).fetchone()
         print(f"  is_late ................ {atrasados} de {total}")
         relatorio["is_late"] = atrasados

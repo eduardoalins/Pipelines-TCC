@@ -12,6 +12,7 @@ repassa para dentro do conteiner.
 """
 
 import os
+import time
 
 from pyflink.version import __version__ as FLINK_VERSION
 
@@ -68,6 +69,26 @@ CHECKPOINT_DIR = os.getenv("CHECKPOINT", "/tcc-data/checkpoints/rt")
 CHECKPOINT_INTERVAL = os.getenv("CHECKPOINT_INTERVAL", "5 s")
 
 
+# --- Medicao (RT-4) ----------------------------------------------------------
+# group.id sob o qual o Flink COMMITA no Kafka os offsets de cada checkpoint
+# completo (decisao F7). O Flink faz isso nativamente; o Spark, por codigo
+# nosso. O collector.py mede os dois pelo mesmo metodo, trocando so o grupo.
+GROUP_ID = os.getenv("GROUP_ID", "tcc-rt-flink")
+
+# Porta da REST API do MiniCluster, DENTRO do conteiner — nao e publicada no
+# host. O main.py a consulta para imprimir um sinal por checkpoint completo e
+# gravar o log de progresso.
+REST_PORT = os.getenv("REST_PORT", "8081")
+
+# Log de progresso: uma linha JSON por checkpoint completo. NAO e a fonte do
+# committed_ts no Flink — essa e o ctime de cada arquivo (CONTRATO.md 1.6,
+# 2.2). Serve de CONFERENCIA: o ctime dos arquivos de um checkpoint deve cair a
+# poucos ms do fim dele aqui registrado.
+METRICS_DIR = os.getenv("METRICS_DIR", "/tcc-data/metrics")
+INICIO_MS = int(time.time() * 1000)
+LOG_PROGRESSO = f"{METRICS_DIR}/flink.progresso.{INICIO_MS}.jsonl"
+
+
 # --- Jars ----------------------------------------------------------------
 # Todos definidos no Dockerfile, que e onde sao baixados e tem o SHA-1
 # conferido. Lidos daqui para que cada versao exista em UM lugar so.
@@ -101,6 +122,8 @@ def resumo() -> str:
         ("fuso", TIMEZONE),
         ("checkpoint", CHECKPOINT_DIR),
         ("intervalo", CHECKPOINT_INTERVAL),
+        ("group.id", GROUP_ID),
+        ("log progresso", LOG_PROGRESSO),
         ("jars", ", ".join(os.path.basename(j) for j in JARS)),
     ]
     largura = max(len(k) for k, _ in itens)

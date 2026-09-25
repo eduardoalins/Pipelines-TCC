@@ -193,11 +193,22 @@ def escrever_lote(lote_df, batch_id: int) -> None:
         # (CONTRATO.md 2). E um lit(), nao current_timestamp(): o valor sai do
         # relogio do driver, o mesmo que produziu o committed_ts abaixo, e as
         # duas latencias ficam na mesma base.
+        #
+        # Gravado como TIMESTAMP em ms, nao como inteiro (CONTRATO.md 2.5, v1.5):
+        # e o tipo que o Flink consegue produzir por evento sem funcao Python, e
+        # a coluna precisa ter o mesmo tipo nos dois motores. No log de progresso
+        # (JSON) ele continua inteiro; a analise converte com epoch_ms.
+        #
+        # SEM marca de UTC (timestamp_ntz), por decisao de 25/09/2026: o Flink
+        # 1.20 nao consegue marcar (isAdjustedToUTC=false fixo no escritor dele),
+        # e os arquivos dos dois motores ficam identicos. O VALOR continua sendo
+        # o instante em UTC: a conversao para ntz usa o fuso da sessao, que e UTC.
         processed_ts = int(time.time() * 1000)
         saida = (
             lote_df.drop(*KAFKA_COLS)
             .withColumn("batch_id", lit(batch_id).cast("long"))
-            .withColumn("processed_ts", lit(processed_ts).cast("long"))
+            .withColumn("processed_ts",
+                        timestamp_millis(lit(processed_ts)).cast("timestamp_ntz"))
         )
         (
             saida.write.mode("append")
@@ -247,6 +258,12 @@ def main() -> int:
         # geraria diretorios diferentes na maquina local (America/Recife) e na
         # nuvem (us-east-1).
         .config("spark.sql.session.timeZone", config.TIMEZONE)
+        # Tira do legado INT96 qualquer coluna de timestamp COM marca de UTC. Nao
+        # afeta o processed_ts: ele e timestamp_ntz, que o Spark grava sempre
+        # como INT64 em microssegundos, ignorando esta opcao (verificado em
+        # 25/09/2026; CONTRATO.md 2.5). Fica para que uma coluna futura desse
+        # tipo nao caia no formato legado sem ninguem perceber.
+        .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MILLIS")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")

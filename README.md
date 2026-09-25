@@ -37,6 +37,7 @@ tenderiam a divergir.
 | 1 a 8 | ambiente, Kafka, tópico e gerador — **compartilhados** | Etapas 0 a 3 |
 | 9 a 11 | pipeline NRT (Spark) | Etapa 5 — Parquet com checkpoint |
 | 12 a 16 | pipeline Streaming (Flink) | Etapa RT-3 — Parquet com checkpoint |
+| 17 a 20 | instrumento de medição, nos dois motores | Etapa 6 / RT-4 — lag, reconciliação e latências |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -566,13 +567,17 @@ exigem.
 Esperado: o resumo, com destino, checkpoint e os quatro jars; `>> checkpoint
 novo`; e `>> job no ar. Checkpoint a cada 5 s`.
 
-**Depois disso o console fica praticamente em silêncio.** Não é travamento. O
-`[batch N] X eventos gravados` do Spark vem de uma linha nossa dentro do
-`foreachBatch`, chamado uma vez por lote — e o Flink não tem lote, logo não tem
-onde imprimir "terminei um bloco". O único rastro são linhas
-`Got brand-new compressor [.snappy]`: um escritor de Parquet sendo aberto, uma por
-subtarefa, confirmando de passagem o codec do contrato. **O progresso se vê nos
-arquivos** — passo 15.
+**Depois disso, uma linha por checkpoint completo** (desde a RT-4):
+
+```
+[checkpoint 4] completo  duracao=25 ms  estado=13280 bytes
+```
+
+O Flink não tem lote, logo não tem onde imprimir "terminei um bloco" como o
+`[batch N]` do Spark. O `main.py` consulta a REST API do próprio Flink a cada
+segundo e anuncia cada checkpoint — que é o momento em que os arquivos ficam
+visíveis (passo 15). As linhas `Got brand-new compressor [.snappy]` que aparecem
+de passagem são escritores de Parquet sendo abertos, uma por subtarefa.
 
 > **A versão que imprime os eventos na tela** — a da Etapa RT-2, onde se vê cada
 > evento atravessar o job assim que chega, com o `seq` em sequência vindo de
@@ -706,9 +711,190 @@ para retê-los, senão o `Ctrl+C` destruiria justamente o que a retomada precisa
 
 ---
 
+## Passo 17 — Medir o pipeline NRT (Spark)
+
+Daqui em diante, o **instrumento de medição** (Etapa 6 do NRT = RT-4 do Flink).
+Os pipelines já gravam o que é preciso para medir; os passos 17 a 20 mostram como
+coletar e conferir.
+
+**O que o Spark passou a registrar**, a cada micro-batch:
+
+| Onde | O quê |
+|---|---|
+| no Parquet | `batch_id` e `processed_ts` (data/hora, ver `CONTRATO.md` §2.5) |
+| em `~/tcc-data/metrics/spark.progresso.<inicio>.jsonl` | uma linha por batch: `inicio_ts`, `processed_ts`, `committed_ts`, linhas, offsets |
+| no Kafka | os offsets processados, commitados sob o grupo `tcc-nrt-spark` |
+
+O Spark **não** devolve offsets ao Kafka sozinho — ele os guarda no checkpoint. O
+commit é código nosso, e existe só para o consumer lag ser medido pelo mesmo
+método nos dois motores (decisão F7).
+
+**Três abas.** Aba 1, o pipeline, lendo só o que chegar:
+
+```bash
+rm -rf ~/tcc-data/checkpoints/nrt
+STARTING_OFFSETS=latest bash pipeline-nrt/run_local.sh
+```
+
+Espere o `[batch 0] vazio`. Aba 2, o gerador:
+
+```bash
+RATE=100 DURATION=60 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
+```
+
+Aba 3, **assim que aparecer o primeiro batch com eventos na aba 1**, o coletor de lag:
+
+```bash
+GROUP_ID=tcc-nrt-spark DURATION=75 ~/.venvs/tcc/bin/python shared/monitoring/collector.py
+```
+
+**Esperado na aba 1**, a cada ~5 s:
+
+```
+[batch 3] 500 eventos gravados  processamento=1268 ms  escrita=353 ms  particoes=24
+```
+
+**Esperado na aba 3**, de segundo em segundo, o **serrilhado** do lag: sobe ~100 por
+segundo e cai a cada batch.
+
+```
+     5.0s  lag total=    402
+     6.0s  lag total=    502
+     7.0s  lag total=    602
+     8.0s  lag total=    201      ← um batch acabou de gravar
+```
+
+**Os vales não vão a zero, e isso é o correto.** O vale fica em torno de **taxa ×
+duração do batch** (100 evt/s × ~2 s ≈ 200): são os eventos que chegaram enquanto o
+batch trabalhava. O que indica saturação é o vale **subir de um ciclo para o outro**,
+não a altura dele.
+
+> **Por que o coletor amostra a cada 1 s, e não a cada 5.** Com a amostra no mesmo
+> período do trigger, o coletor veria a fila sempre no mesmo ponto do ciclo — o
+> serrilhado sumiria e o lag pareceria constante.
+
+> **O coletor começa depois do primeiro batch**, de propósito, só neste teste: o
+> primeiro commit de um grupo novo pode receber `NOT_COORDINATOR` (o broker ainda
+> está elegendo o coordenador). O pipeline repete a tentativa; consultar o grupo
+> antes esconderia o erro.
+
+---
+
+## Passo 18 — Reconciliar a execução do Spark
+
+O `reconcile.py` confere o que foi gravado contra o manifesto do gerador. Sem
+`RUN_ID`, lista as execuções disponíveis:
+
+```bash
+~/.venvs/tcc/bin/python shared/analysis/reconcile.py
+```
+
+Para reconciliar a mais recente sem copiar nada à mão:
+
+```bash
+RUN=$(ls -1 ~/tcc-data/out/spark/events | tail -1 | sed 's/run_id=//'); echo "$RUN"
+RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
+```
+
+**Esperado** (referência medida na máquina original, 100 evt/s, trigger de 5 s):
+
+```
+    PERDAS (confirmados - distintos) 0
+    DUPLICATAS (gravados - distintos) 0
+  espera no trigger          P50   2612 ...
+  LAT. PROCESSAMENTO         P50   3903 ...
+  LAT. VISIBILIDADE          P50   4298 ...
+  is_late ................ 0 de 6000
+OK: perdas=0  duplicatas=0  invalidas=0
+```
+
+A **espera no trigger** com mediana perto de **metade do trigger** (2,6 s de 5 s) é a
+aritmética do micro-batch aparecendo no dado. O programa sai com **0** se não há
+perda nem duplicata, e com **1** se há — o arnês da Etapa 8 usa isso.
+
+**Ele lê com o DuckDB**, instalado no passo 2 pelo `requirements.txt`: o mesmo leitor
+para os dois motores, que não pertence a nenhum deles. Os arquivos são descobertos
+**pela pasta**, nunca pela extensão — os do Flink não têm `.parquet`.
+
+---
+
+## Passo 19 — Medir o pipeline Streaming (Flink)
+
+O Flink passou a gravar `processed_ts` **por evento** e a commitar offsets no Kafka a
+cada checkpoint, sob o grupo `tcc-rt-flink`. O console ganhou um sinal de vida: uma
+linha por checkpoint completo.
+
+```bash
+rm -rf ~/tcc-data/checkpoints/rt
+STARTUP_MODE=latest-offset bash pipeline-streaming/run_local.sh
+```
+
+Depois do `>> job no ar`, o gerador e o coletor como no passo 17, trocando o grupo:
+
+```bash
+GROUP_ID=tcc-rt-flink DURATION=75 ~/.venvs/tcc/bin/python shared/monitoring/collector.py
+```
+
+**Esperado no console do Flink**, a cada 5 s:
+
+```
+[checkpoint 4] completo  duracao=25 ms  estado=13280 bytes
+```
+
+> **Rodando o Flink de um script, e não do terminal**, duas armadilhas: o Python
+> acumula a saída e o log parece travado (usar `python -u`); e mandar sinal ao
+> processo do `docker compose run` **não para o contêiner** — o job segue rodando.
+> Parar com `docker stop` ou pelo `Ctrl+C` no terminal.
+
+**As três opções do destino que protegem o `processed_ts`** (`CONTRATO.md` §2.5),
+todas verificadas: `parquet.write.int64.timestamp` (sem ela, o formato legado
+INT96), `parquet.timestamp.time.unit=micros` (o mesmo que o Spark grava) e
+**`parquet.utc-timezone`** — sem esta, com a JVM fora de UTC, **todos os carimbos
+saem 3 h deslocados, sem erro**.
+
+---
+
+## Passo 20 — Reconciliar a execução do Flink
+
+```bash
+RUN=$(ls -1 ~/tcc-data/out/flink/events | tail -1 | sed 's/run_id=//'); echo "$RUN"
+MOTOR=flink RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
+```
+
+**Esperado** (referência medida na máquina original, 100 evt/s, checkpoint de 5 s):
+
+```
+    PERDAS (confirmados - distintos) 0
+    DUPLICATAS (gravados - distintos) 0
+  committed_ts ........... ctime de cada arquivo (CONTRATO.md 1.6, 2.2)
+  espera pelo checkpoint     P50   2618 ...
+  LAT. PROCESSAMENTO         P50      8 ...
+  LAT. VISIBILIDADE          P50   2626 ...
+  conferencia ctime x log de checkpoints: -6..4 ms em 7 checkpoints
+OK: perdas=0  duplicatas=0  invalidas=0
+```
+
+**É o achado central do trabalho, visível numa tela só.** Latência de
+**processamento**: 8 ms no Flink contra 3,9 s no Spark. Latência de
+**visibilidade**: 2,6 s contra 4,3 s. O Flink processa cada evento em milissegundos,
+mas o dado espera o checkpoint para ficar visível — o intervalo de checkpoint tem
+na visibilidade o papel do trigger no Spark. Por isso o trabalho reporta as duas.
+
+**Por que o Flink mede a visibilidade pelo arquivo.** O Flink não grava `batch_id`:
+cada arquivo é finalizado por exatamente um checkpoint, e o instante em que ele
+deixa de ser oculto — o `ctime`, gravado pelo sistema de arquivos na renomeação — é
+o instante de visibilidade. O Spark mede pelo log de progresso. A assimetria é
+declarada no `CONTRATO.md` §2.2, com o motivo e o tamanho do erro de cada um.
+
+> **Nada pode tocar nos arquivos do Flink depois de gravados.** `chmod`, `chown` ou
+> cópia mudam o `ctime` e falsificam a latência de visibilidade sem erro. A linha
+> "conferência" existe para pegar isso: um desvio acima de 1 s é sinalizado.
+
+---
+
 ## Verificação final
 
-Se os dezesseis passos acima funcionaram, o ambiente está reproduzido:
+Se os vinte passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -726,6 +912,11 @@ Se os dezesseis passos acima funcionaram, o ambiente está reproduzido:
 - [x] O Flink grava Parquet em `~/tcc-data/out/flink` e encerra com cancelamento limpo
 - [x] Os arquivos do Flink ficam visíveis em degraus, um por checkpoint
 - [x] O job do Flink reiniciado retoma do último checkpoint sem reprocessar
+- [x] O Spark registra o log de progresso e commita offsets sob `tcc-nrt-spark`
+- [x] O coletor mostra o serrilhado do lag, com vales estáveis
+- [x] O `reconcile.py` do Spark: 0 perdas, 0 duplicatas, espera no trigger ~metade do trigger
+- [x] O Flink imprime uma linha por checkpoint e commita offsets sob `tcc-rt-flink`
+- [x] O `reconcile.py` do Flink: 0 perdas, 0 duplicatas, processamento em ms, conferência do `ctime` em poucos ms
 
 ---
 
@@ -741,7 +932,7 @@ Decisão E6: **código no Windows, dados em ext4 nativo do WSL.**
 | Ambiente Python | `~/.venvs/tcc` |
 | Parquet de saída | `~/tcc-data/out/spark` e `~/tcc-data/out/flink` — um `<base>` por motor |
 | Checkpoints | `~/tcc-data/checkpoints/nrt` (Spark) e `~/tcc-data/checkpoints/rt` (Flink) |
-| Métricas coletadas | `~/tcc-data/metrics` |
+| Métricas coletadas | `~/tcc-data/metrics` — manifestos do gerador, logs de progresso dos dois motores, CSVs do coletor e relatórios do `reconcile.py` |
 | Ambiente do Flink | imagem Docker `tcc-flink:1.20.5` — fora do venv |
 
 O motivo é medido, não estético: escrita sequencial em `/mnt/c` roda a
@@ -770,6 +961,7 @@ meio dos experimentos invalida as execuções já feitas.
 | Python | 3.12.3 | 03/09/2026 |
 | JVM | OpenJDK 17.0.20.1 (Ubuntu), travado com `apt-mark hold` — era 17.0.20 até o `unattended-upgrades` de 24/09/2026 | 24/09/2026 |
 | confluent-kafka | 2.15.0 (librdkafka 2.15.0) | 04/09/2026 |
+| DuckDB (leitor do `reconcile.py`) | 1.5.5 | 24/09/2026 |
 | Flink / PyFlink | 1.20.5 (LTS), em contêiner | 21/09/2026 |
 | Conector Kafka do Flink | `flink-sql-connector-kafka` 3.4.0-1.20 | 21/09/2026 |
 | Python do Flink | 3.10.12 (Ubuntu 22.04 da imagem) | 21/09/2026 |
@@ -793,8 +985,8 @@ scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
   data-generator/         gerador de eventos                       (Etapa 3)
-  analysis/               reconcile.py e report.py                 (Etapa 6)
-  monitoring/             collector.py, amostra consumer lag       (Etapa 6)
+  analysis/reconcile.py   perdas, duplicatas, latências e is_late, via DuckDB (Etapa 6)
+  monitoring/collector.py consumer lag a cada 1 s, os dois motores (Etapa 6)
   reference-data/         products.parquet e seu gerador           (Etapa 7)
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
   run_local.sh            lançador via spark-submit
@@ -844,8 +1036,9 @@ O repositório guarda o que **executa**; a pasta de pesquisa guarda o que
 ## Progresso
 
 O trabalho alternou para o Flink em 11/09/2026, com o NRT concluído até a Etapa 5.
-A Etapa 6 do NRT e a RT-4 do Flink são a **mesma etapa**: o instrumento de medição
-é construído uma vez, para os dois motores.
+A Etapa 6 do NRT e a RT-4 do Flink foram a **mesma etapa**, concluída em
+25/09/2026: o instrumento de medição foi construído uma vez, para os dois motores.
+Os dois pipelines estão agora no mesmo ponto.
 
 ### Pipeline Streaming (Flink) — `planoRT.md`
 
@@ -855,7 +1048,9 @@ A Etapa 6 do NRT e a RT-4 do Flink são a **mesma etapa**: o instrumento de medi
       que o Spark recebeu, encerramento limpo com código 130
 - [x] **RT-3** — Parquet + checkpoint: visibilidade por checkpoint confirmada,
       retomada verificada (18000 → 24000), um terço dos arquivos do Spark
-- [ ] **RT-4** — Instrumento de medição, para os dois motores
+- [x] **RT-4** — Instrumento de medição, para os dois motores: `processed_ts` por
+      evento, visibilidade pelo `ctime` do arquivo, offsets no Kafka; 0 perdas,
+      processamento P50 8 ms e visibilidade P50 2,6 s a 100 evt/s
 - [ ] **RT-5** — Enriquecimento
 - [ ] **RT-6** — Arnês unificado
 - [ ] **RT-7** — Validação local e caos
@@ -874,7 +1069,9 @@ A Etapa 6 do NRT e a RT-4 do Flink são a **mesma etapa**: o instrumento de medi
       cada ~5 s, as 24 partições lidas, garantia chave → partição confirmada
 - [x] **Etapa 5** — Escrita em Parquet com checkpoint: layout do contrato,
       codec `snappy`, retomada verificada, 13 micro-batches somando 6000 eventos
-- [ ] **Etapa 6** — Instrumento de medição
+- [x] **Etapa 6** — Instrumento de medição: log de progresso, lag a cada 1 s,
+      `reconcile.py` que detecta perdas injetadas; 0 perdas, processamento P50
+      3,9 s e visibilidade P50 4,3 s a 100 evt/s
 - [ ] **Etapa 7** — Enriquecimento
 - [ ] **Etapa 8** — Arnês de benchmark
 - [ ] **Etapa 9** — Validação local e caos
