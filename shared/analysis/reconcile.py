@@ -52,6 +52,12 @@ METRICS = DATA_DIR / "metrics"
 # CONTRATO.md 2.1: watermark = maximo ACUMULADO de event_ts menos 60 s.
 ATRASO_WATERMARK_MS = 60_000
 
+# Flink: os arquivos de um mesmo checkpoint ficam visiveis quase juntos, mas nem
+# sempre no mesmo milissegundo (visto em 10/10/2026: 8 arquivos divididos em
+# .236 e .246). Arquivos cujo ctime dista ate este limite do anterior sao do
+# MESMO checkpoint. Tem de ficar bem abaixo do intervalo de checkpoint (5 s).
+AGRUPAR_CTIME_MS = 1_000
+
 
 # --- Descoberta de arquivos ------------------------------------------------
 
@@ -114,7 +120,26 @@ def linha_ms(nome: str, s: dict | None) -> str:
             f"media {s['media']:>6}  min {s['min']:>6}  max {s['max']:>6}   (ms, n={s['n']})")
 
 
-# --- Latencia no Flink (unidade de progresso = arquivo) ----------------------
+# --- Latencia no Flink (committed_ts = ctime do arquivo) ---------------------
+
+def agrupar_por_checkpoint(ctimes: dict[Path, int]) -> dict[Path, int]:
+    """A unidade de progresso de cada arquivo do Flink: o checkpoint que o fechou.
+
+    Sem batch_id nao ha numero de checkpoint no dado; o que existe e o ctime.
+    Percorre os arquivos em ordem de ctime e abre um grupo novo sempre que o
+    salto para o anterior passa de AGRUPAR_CTIME_MS. O grupo e identificado
+    pelo seu primeiro ctime.
+
+    So AGRUPA: o committed_ts de cada arquivo continua sendo o ctime dele.
+    """
+    unidade, inicio, anterior = {}, None, None
+    for arq, ct in sorted(ctimes.items(), key=lambda par: par[1]):
+        if anterior is None or ct - anterior > AGRUPAR_CTIME_MS:
+            inicio = ct
+        unidade[arq] = inicio
+        anterior = ct
+    return unidade
+
 
 def latencia_por_arquivo(con, logs: list[Path]) -> dict:
     """Latencias do Flink, com o committed_ts vindo do ctime de cada arquivo.
@@ -137,11 +162,13 @@ def latencia_por_arquivo(con, logs: list[Path]) -> dict:
             FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL
         ) WHERE rn = 1
     """)
-    n_unidades, primeira = con.execute(
-        "SELECT count(DISTINCT unidade), min(unidade) FROM lat").fetchone()
+    n_unidades, n_instantes, primeira = con.execute(
+        "SELECT count(DISTINCT unidade), count(DISTINCT committed_ts), min(unidade) FROM lat"
+    ).fetchone()
 
     # Aquecimento, pela mesma regra do Spark: descarta a primeira unidade de
-    # progresso (o primeiro checkpoint com dados).
+    # progresso (o primeiro checkpoint com dados) — INTEIRA, e por isso a
+    # unidade e o grupo de arquivos, nao o instante de cada um.
     regime = f"unidade > {primeira}"
     metricas = {
         "espera pelo checkpoint": "committed_ts - processed_ts",
@@ -149,6 +176,8 @@ def latencia_por_arquivo(con, logs: list[Path]) -> dict:
         "LAT. VISIBILIDADE": "committed_ts - event_ts",
     }
     print(f"  checkpoints com dados .. {n_unidades}   (o 1o e descartado como aquecimento)")
+    print(f"  instantes de ctime ..... {n_instantes}   (arquivos a ate {AGRUPAR_CTIME_MS} ms "
+          "um do outro = mesmo checkpoint)")
     print("  committed_ts ........... ctime de cada arquivo (CONTRATO.md 1.6, 2.2)")
     print("\n  em regime (sem o 1o checkpoint):")
     lat = {}
@@ -175,23 +204,27 @@ def latencia_por_arquivo(con, logs: list[Path]) -> dict:
                            union_by_name = true)
             WHERE checkpoint_id IS NOT NULL
         """)
+        # Por INSTANTE de ctime, nao por grupo: todo arquivo e conferido.
         d_min, d_max, n = con.execute("""
-            WITH u AS (SELECT DISTINCT unidade FROM lat),
+            WITH u AS (SELECT DISTINCT committed_ts AS ct FROM lat),
             par AS (
-                SELECT u.unidade, arg_min(u.unidade - ck.fim, abs(u.unidade - ck.fim)) AS d
-                FROM u, ck GROUP BY u.unidade
+                SELECT u.ct, arg_min(u.ct - ck.fim, abs(u.ct - ck.fim)) AS d
+                FROM u, ck GROUP BY u.ct
             )
             SELECT min(d), max(d), count(*) FROM par
         """).fetchone()
-        conferencia = {"ctime_menos_fim_checkpoint_ms": [d_min, d_max], "unidades": n}
+        conferencia = {"ctime_menos_fim_checkpoint_ms": [d_min, d_max],
+                       "unidades": n_unidades, "instantes": n}
         print(f"\n  conferencia ctime x log de checkpoints: {d_min}..{d_max} ms "
-              f"em {n} checkpoints")
+              f"em {n} instantes de ctime")
         if max(abs(d_min), abs(d_max)) > 1000:
             print("  !! desvio acima de 1 s: os arquivos foram tocados depois de gravados?")
     else:
         print("\n  (sem log de checkpoints para conferir o ctime)")
 
-    return {"latencia_ms": lat, "conferencia_ctime": conferencia}
+    return {"latencia_ms": lat, "conferencia_ctime": conferencia,
+            "agrupamento_ctime": {"checkpoints": n_unidades, "instantes": n_instantes,
+                                  "limite_ms": AGRUPAR_CTIME_MS}}
 
 
 # --- Principal --------------------------------------------------------------
@@ -234,17 +267,23 @@ def main() -> int:
     # (CONTRATO.md 1.6, 2.2-2.3):
     #   Spark  -> o micro-batch, identificado pelo processed_ts (um por batch);
     #             o committed_ts vem do log de progresso.
-    #   Flink  -> o arquivo: sem batch_id, cada arquivo e finalizado por
-    #             exatamente um checkpoint, e o committed_ts e o ctime dele — o
-    #             instante em que deixou de ser oculto.
+    #   Flink  -> o checkpoint, reconhecido pelos arquivos: sem batch_id, cada
+    #             arquivo e finalizado por exatamente um checkpoint, e o
+    #             committed_ts e o ctime dele — o instante em que deixou de ser
+    #             oculto. Os arquivos que ficaram visiveis juntos formam a
+    #             unidade (agrupar_por_checkpoint).
     modo = "batch" if "batch_id" in colunas else "arquivo"
     if modo == "arquivo":
-        con.execute("CREATE TABLE arq_ctime (filename VARCHAR, committed_ts BIGINT)")
-        con.executemany("INSERT INTO arq_ctime VALUES (?, ?)",
-                        [(str(a), int(a.stat().st_ctime * 1000)) for a in arqs])
+        ctimes = {a: int(a.stat().st_ctime * 1000) for a in arqs}
+        unidades = agrupar_por_checkpoint(ctimes)
+        con.execute("CREATE TABLE arq_ctime "
+                    "(filename VARCHAR, committed_ts BIGINT, unidade BIGINT)")
+        con.executemany("INSERT INTO arq_ctime VALUES (?, ?, ?)",
+                        [(str(a), ctimes[a], unidades[a]) for a in arqs])
+        # O `*` da selecao ja traz committed_ts e unidade, vindos de arq_ctime.
         con.execute(f"""
             CREATE VIEW ev AS
-            {selecao}, committed_ts AS unidade
+            {selecao}
             FROM ev_bruto JOIN arq_ctime USING (filename)
         """)
     else:
@@ -412,7 +451,7 @@ def main() -> int:
         # ANTERIORES, menos 60 s. Acumulado, nunca so da unidade corrente —
         # senao ele retrocederia e um evento deixaria de ser atrasado conforme a
         # unidade em que caiu. A unidade e o micro-batch no Spark e o
-        # checkpoint (o ctime do arquivo) no Flink: a mesma regra nos dois.
+        # checkpoint (os arquivos visiveis juntos) no Flink: a mesma regra nos dois.
         atrasados, total = con.execute(f"""
             WITH por_unidade AS (
                 SELECT unidade, max(event_ts) AS mx FROM ev GROUP BY unidade

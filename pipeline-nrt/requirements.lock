@@ -1,0 +1,24 @@
+# Travamento completo do ambiente Python do Spark — decisao E7 aplicada as
+# dependencias transitivas. Espelho do pipeline-streaming/requirements.lock.
+#
+# O requirements.txt fixa o pyspark e o confluent-kafka. As dependencias DELES
+# aceitam faixas de versao — o pyspark 4.0.4 aceita o py4j de 0.10.9.7 a
+# 0.10.9.9 —, e o pip escolhe dentro da faixa no momento do build. Sem este
+# arquivo, reconstruir a imagem depois poderia trazer outra versao, sem aviso.
+#
+# Origem: `pip3 freeze` dentro da imagem tcc-spark:4.0.4, construida em
+# 10/10/2026. Sao as MESMAS versoes que rodavam no venv do host (pyspark 4.0.4,
+# py4j 0.10.9.9, confluent-kafka 2.15.0), conferidas com `pip freeze` do venv no
+# mesmo dia. O typing_extensions e dependencia do confluent-kafka no Python
+# 3.10; no 3.12 do host ele nao era instalado.
+#
+# Usado pelo Dockerfile como arquivo de RESTRICAO (pip install -c): o
+# requirements.txt diz O QUE instalar, este arquivo diz EM QUAL versao.
+#
+# Para regenerar depois de mudar o requirements.txt:
+#     docker compose build spark
+#     docker run --rm tcc-spark:4.0.4 pip3 freeze
+confluent-kafka==2.15.0
+py4j==0.10.9.9
+pyspark==4.0.4
+typing_extensions==4.16.0

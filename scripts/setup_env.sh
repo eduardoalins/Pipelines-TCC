@@ -29,12 +29,12 @@ say() { printf '\n\033[1m>> %s\033[0m\n' "$*"; }
 # --- 1. Pacotes do sistema -------------------------------------------------
 # python3-venv: sem ele o Python nao cria ambientes isolados (o modulo venv
 #   existe, mas o ensurepip vem em pacote separado no Ubuntu).
-# openjdk-17: o Spark roda na JVM; o PySpark e so uma casca em Python que
-#   conversa com ela. A 17 serve tanto para Spark 3.5 quanto para 4.0.
+#
+# Java NAO e mais exigido no host: desde 10/10/2026 o Spark roda em conteiner,
+# como o Flink, e a JVM dos dois vem da imagem (fixada por digest).
 say "Verificando pacotes do sistema"
 FALTANDO=()
 python3 -c 'import ensurepip' 2>/dev/null || FALTANDO+=("python3.12-venv")
-command -v java >/dev/null 2>&1        || FALTANDO+=("openjdk-17-jdk-headless")
 
 if [ ${#FALTANDO[@]} -gt 0 ]; then
   echo "Faltam: ${FALTANDO[*]}"
@@ -52,16 +52,7 @@ if [ ${#FALTANDO[@]} -gt 0 ]; then
     exit 1
   fi
 else
-  echo "OK: $(java -version 2>&1 | head -1)"
-fi
-
-# O Java e pacote do sistema: o unattended-upgrades do Ubuntu o atualiza sozinho,
-# e em 24/09/2026 isso derrubou o Spark no meio de uma execucao ("Incorrect Java
-# version ... jspawnhelper"). Aqui so AVISA — travar exige root. Ver README, passo 2.
-if command -v apt-mark >/dev/null 2>&1 && ! apt-mark showhold | grep -q '^openjdk-17'; then
-  echo
-  echo "ATENCAO: o OpenJDK nao esta travado e pode ser trocado sem aviso."
-  echo "    sudo apt-mark hold \$(dpkg -l | awk '/openjdk-17/ {print \$2}')"
+  echo "OK: $(python3 -V)"
 fi
 
 # --- 2. Pastas de dados ----------------------------------------------------
@@ -70,9 +61,9 @@ mkdir -p "$DATA_DIR/out" "$DATA_DIR/checkpoints" "$DATA_DIR/metrics"
 ls -1 "$DATA_DIR"
 
 # --- 3. Ambiente virtual ---------------------------------------------------
-# O isolamento nao e frescura: as versoes exatas de pyspark e confluent-kafka
-# fazem parte do metodo experimental. Se mudarem no meio das execucoes, os
-# resultados deixam de ser comparaveis entre si.
+# O isolamento nao e frescura: as versoes exatas do gerador (confluent-kafka) e
+# do reconciliador (duckdb) fazem parte do metodo experimental. Se mudarem no
+# meio das execucoes, os resultados deixam de ser comparaveis entre si.
 say "Ambiente virtual em $VENV_DIR"
 if [ ! -x "$VENV_DIR/bin/python" ]; then
   python3 -m venv "$VENV_DIR"
@@ -83,8 +74,9 @@ fi
 "$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip
 
 # --- 4. Dependencias -------------------------------------------------------
-# requirements.txt ainda nao existe: as versoes de Spark e Kafka sao travadas
-# na Etapa 1 (decisao E7) e escritas no CONTRATO.md. Ate la, so o venv vazio.
+# O requirements.txt da raiz descreve so as ferramentas do host (gerador,
+# coletor, reconciliador). Spark e Flink sao instalados nas imagens, cada uma
+# pelo requirements.txt da sua pasta.
 if [ -f "$REPO_DIR/requirements.txt" ]; then
   say "Instalando dependencias"
   "$VENV_DIR/bin/pip" install -r "$REPO_DIR/requirements.txt"
@@ -98,7 +90,6 @@ printf '  repositorio : %s\n' "$REPO_DIR"
 printf '  venv        : %s\n' "$VENV_DIR"
 printf '  dados       : %s\n' "$DATA_DIR"
 printf '  python      : %s\n' "$("$VENV_DIR/bin/python" -V)"
-printf '  java        : %s\n' "$(java -version 2>&1 | head -1)"
 printf '  memoria WSL : %s\n' "$(free -h | awk '/^Mem:/{print $2}')"
 printf '  cpus WSL    : %s\n' "$(nproc)"
 echo

@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 1.6 — 25/09/2026**
+**Versão 1.7 — 10/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -193,13 +193,20 @@ dentro do arquivo que acabou de ser escrito.
 |---|---|---|
 | De onde vem | **log de progresso**, uma linha por micro-batch, tomada depois que o `write()` retorna | **`ctime` do arquivo**: o instante em que ele é renomeado de oculto (`.part-…inprogress`) para visível |
 | Como se liga ao evento | pelo par (`batch_id`, `processed_ts`), gravado nos dois lugares | pelo arquivo em que o evento foi gravado |
-| Exatidão medida | ~20 ms **depois** do arquivo ficar visível, sempre (batches 2 a 7 em 25/09) | −7 a +8 ms do fim do checkpoint registrado pela REST API do Flink (6 checkpoints em 25/09) |
+| Exatidão medida | ~20 ms **depois** do arquivo ficar visível, sempre (batches 2 a 7 em 25/09) | do fim do checkpoint registrado pela REST API do Flink: −7 a +8 ms (6 checkpoints em 25/09) e −10 a +7 ms (13 checkpoints em 10/10) |
 
 **Por que o Flink pelo arquivo.** Cada arquivo do Flink é finalizado por
 **exatamente um** checkpoint: a associação evento → instante de visibilidade é
 exata, sem código no caminho do dado e sem aproximação. Verificado em 25/09/2026:
 o `ctime` vem sempre depois do último evento do arquivo, 20–40 ms depois do
-`mtime` (a última escrita), e os 8 arquivos de um checkpoint têm `ctime` idêntico.
+`mtime` (a última escrita), e os 8 arquivos de cada checkpoint tinham `ctime`
+idêntico.
+
+**Os arquivos de um checkpoint nem sempre têm o mesmo `ctime` (versão 1.7).** Em
+10/10/2026, em 2 de 13 checkpoints os 8 arquivos saíram divididos em dois
+instantes, a 10 ms um do outro (7 + 1 e 3 + 5). O instante de visibilidade de cada
+evento continua sendo o `ctime` do **próprio arquivo**; o que muda é como os
+arquivos são agrupados em checkpoints (2.3).
 
 **Por que o Spark não pelo arquivo.** Quando a pasta de destino ainda não existe —
 o primeiro batch da execução e **toda virada de hora** (`hh=` novo) —, o Spark move
@@ -213,9 +220,10 @@ provável, não verificada). O log não tem esse erro.
   Flink: o fim do checkpoint pela REST API (`latest_ack_timestamp`).
 - **Nada pode tocar nos arquivos do Flink depois de gravados.** `chmod`, `chown` ou
   cópia mudam o `ctime` e falsificam a latência de visibilidade, sem erro.
-- **Os dois instrumentos erram em sentidos opostos e pequenos:** o log do Spark
-  ~20 ms tarde; o `ctime` do Flink ±8 ms. Numa latência de visibilidade de
-  segundos, a diferença é desprezível, mas existe e está registrada.
+- **Os dois instrumentos têm erros pequenos e diferentes:** o log do Spark ~20 ms
+  tarde; o `ctime` do Flink dentro de ±10 ms (as duas medições acima). Numa
+  latência de visibilidade de segundos, a diferença é desprezível, mas existe e
+  está registrada. A causa da faixa do `ctime` não foi verificada.
 
 ### 2.3 `batch_id` no Flink — não existe (versão 1.6, 25/09/2026)
 
@@ -224,11 +232,26 @@ registro é processado **antes** de se saber a qual checkpoint pertencerá: não
 em SQL uma coluna "checkpoint atual", e etiquetar cada evento exigiria um operador
 com estado em Python (viola a decisão F2) ou em Java.
 
-**Decisão.** O Flink **não grava** `batch_id`. A unidade de progresso do Flink é o
-**arquivo**: todo evento de um arquivo pertence ao mesmo checkpoint, e o
-`reconcile.py` agrupa e mede pelo arquivo (2.2). A seção 6 já declarava que os
-**valores** de `batch_id`/`checkpoint_id` não são invariantes; agora a coluna em si
-é específica do Spark.
+**Decisão.** O Flink **não grava** `batch_id`. Todo evento de um arquivo pertence
+ao mesmo checkpoint, e o `reconcile.py` mede pelo arquivo (2.2). A seção 6 já
+declarava que os **valores** de `batch_id`/`checkpoint_id` não são invariantes;
+agora a coluna em si é específica do Spark.
+
+**Unidade de progresso do Flink — o checkpoint, reconhecido pelos arquivos (versão
+1.7, 10/10/2026).** A unidade de progresso é o que a análise usa para descartar o
+aquecimento (a primeira unidade) e para avançar o watermark (2.1). Na versão 1.6
+ela era o arquivo, o que na prática significava "cada `ctime` distinto". Como os
+arquivos de um checkpoint podem sair em instantes vizinhos (2.2), isso contava
+unidades a mais — 15 para 13 checkpoints em 10/10 — e deixava possível descartar
+só parte do primeiro checkpoint.
+
+A regra passa a ser: **arquivos cujo `ctime` dista até 1 s do anterior pertencem ao
+mesmo checkpoint.** O limite precisa ficar bem abaixo do intervalo de checkpoint
+(5 s no protocolo). O agrupamento usa só os próprios arquivos; o log de checkpoints
+do Flink continua sendo conferência independente, e não entra na conta.
+
+O **tamanho** do descarte de aquecimento (hoje, a primeira unidade, nos dois
+motores) não é fixado por esta versão.
 
 ### 2.4 O que `is_late` mede
 
@@ -530,7 +553,7 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Schema do evento | Seção 1.1, sem alteração |
 | Chave da mensagem | `user_id`, representação decimal em UTF-8 (seção 1.3) |
 | Distribuição de `user_id` | Uniforme em [1, 2000], seed fixa (seção 1.4) |
-| Colunas de saída | Seção 2. `processed_ts` idêntica nos dois (2.5); `batch_id` só no Spark — no Flink a unidade de progresso é o arquivo (2.3). `committed_ts` com origem por motor, declarada (2.2) |
+| Colunas de saída | Seção 2. `processed_ts` idêntica nos dois (2.5); `batch_id` só no Spark — no Flink a unidade de progresso é o checkpoint, reconhecido pelo grupo de arquivos que ficam visíveis juntos (2.3). `committed_ts` com origem por motor, declarada (2.2) |
 | Cálculo do watermark | Máximo acumulado de `event_ts` menos 60 s, monotônico — **derivado na análise**, igual para os dois motores (seção 2.1) |
 | Tópico e partições | `ecommerce.events.v1`, 24 partições |
 | Gerador e seed | Mesmo binário, mesma seed, mesmo `config.yaml` |
@@ -593,6 +616,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 1.7 | 10/10/2026 | **§2.3 alterado; §2.2 corrigido.** A unidade de progresso do Flink deixa de ser o arquivo e passa a ser o **checkpoint, reconhecido pelo grupo de arquivos** cujo `ctime` dista até 1 s: em 10/10/2026 os 8 arquivos de 2 dos 13 checkpoints saíram em dois instantes, a 10 ms um do outro, e a regra antiga contava 15 unidades. O `committed_ts` de cada evento continua sendo o `ctime` do próprio arquivo. A exatidão do `ctime` passa de "±8 ms" para a faixa das duas medições (−7..+8 ms e −10..+7 ms). Nenhuma coluna, layout ou parâmetro de execução muda | **Nenhuma.** É regra de análise, sem efeito no que os pipelines gravam. A execução `20261010T213810Z-r100`, reconciliada pelas duas regras, deu latências idênticas (o primeiro checkpoint não estava dividido); só a contagem passou de 15 para 13 |
 | 1.6 | 25/09/2026 | **§2.2 e §2.3 alterados (decisão C2).** O Flink não grava `batch_id`: a unidade de progresso dele é o arquivo. O `committed_ts` passa a ter **origem por motor**: log de progresso no Spark; `ctime` do arquivo no Flink, verificado a ±8 ms do fim do checkpoint. O Spark fica no log porque o `ctime` dele adianta até ~300 ms quando a pasta de destino é nova. Assimetria de instrumento declarada | **Nenhuma.** O Flink ainda não gravava as colunas de medição, e o Spark não muda |
 | 1.5 | 24–25/09/2026 | **§2 alterado:** `processed_ts` passa de `int64` (epoch ms) a **timestamp** nos dois motores: instante em UTC com precisão de ms, gravado como `INT64` em µs **sem a marca de UTC**, idêntico nos dois arquivos (§2.5). Motivo: no Flink não há expressão SQL confiável para o instante em ms como inteiro, e função Python no caminho do dado viola a decisão F2. Sem marca porque o Flink 1.20 não consegue marcar; em µs porque o Spark sem marca só grava em µs. O Flink declara `parquet.utc-timezone=true`, sem o qual o valor depende do fuso da JVM. A conversão para ms passa à análise | **Nenhuma medida.** As execuções de aprendizado do Spark de 24/09/2026 têm a coluna em `int64`; o `reconcile.py` aceita os dois tipos |
 | 1.4 | 23/09/2026 | **§2 reescrito.** `watermark_ts` e `is_late` deixam de ser gravados pelo pipeline e passam a ser **derivados na análise** (§2.1), porque a definição do contrato não tem equivalente no modelo distribuído do Flink. Acrescentado `committed_ts` (§2.2), registrado **fora do Parquet**, num log por unidade de progresso — sem ele a latência de visibilidade da decisão B6 não é mensurável. A persistência do watermark ao lado do checkpoint deixa de existir | **Nenhuma.** Nenhuma execução medida foi feita, e as de aprendizado não produziram as colunas em questão |

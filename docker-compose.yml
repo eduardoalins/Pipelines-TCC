@@ -148,10 +148,10 @@ services:
     # O conteiner esta na rede do Compose e alcanca o broker por
     # kafka:29092, o listener INTERNAL que existe desde a Etapa 1.
     #
-    # ASSIMETRIA DECLARADA: o Spark, que roda no host, alcanca o mesmo broker
-    # por localhost:9092 (listener EXTERNAL, via publicacao de porta) — um
-    # salto de rede a mais. Efeito so na fase local, que nao produz os numeros
-    # comparados. Ver planoRT.md secao 0.5.
+    # O Spark alcanca o broker pelo MESMO caminho desde 10/10/2026, quando
+    # passou para conteiner. Ate la ele rodava no host e usava localhost:9092
+    # (listener EXTERNAL, via publicacao de porta) — um salto de rede a mais,
+    # assimetria que valeu para as execucoes de setembro (planoRT.md secao 0.5).
     environment:
       BOOTSTRAP: kafka:29092
 
@@ -189,8 +189,10 @@ services:
     # pelo host — gravar DENTRO do conteiner repetiria a armadilha do
     # KAFKA_LOG_DIRS, e o dado morreria no primeiro `docker compose down`.
     #
-    # A vazao deste bind mount NAO foi medida, por decisao explicita: a fase
-    # local nao produz os numeros comparados (planoRT.md secao 0.5).
+    # A vazao deste bind mount foi medida em 07/10/2026, quando as metricas
+    # locais passaram a entrar no trabalho: 1216-2080 MB/s em escrita sequencial
+    # e 324-431 arquivos pequenos por segundo, contra 840-1876 MB/s e 302-345 no
+    # host. Sem lado sistematicamente mais lento (DecisaoEtapa6.2.md 6.1).
     volumes:
       - ./:/app:ro
       - ${HOME}/tcc-data:/tcc-data
@@ -200,6 +202,80 @@ services:
     # emergencia, o controle preciso e por servico. 1,5 GB e ponto de partida,
     # a CONFIRMAR na RT-1 com `docker stats`: Kafka 1 GB + Flink 1,5 GB + kernel
     # e daemon ~700 MB = ~3,2 GB dentro dos 4 GB do WSL.
+    #
+    # Este numero tambem escolhe o coletor de lixo da JVM: com 1536m ela usa o
+    # SerialGC, com 2g usaria o G1. Mantido em Serial nos dois motores por
+    # decisao de 10/10/2026 — ver o comentario no servico `spark`, abaixo.
+    mem_limit: 1536m
+
+  # ==========================================================================
+  # Spark — pipeline NRT em conteiner (desde 10/10/2026)
+  # ==========================================================================
+  #
+  # O espelho do servico do Flink, linha por linha. Ate a Etapa 6 o Spark rodava
+  # no host, pelo venv; passou para ca quando as metricas locais entraram no
+  # trabalho. O que fica IGUAL nos dois motores, de proposito:
+  #
+  #   imagem base   a mesma, pelo mesmo digest (mesma JVM, mesmo sistema)
+  #   Kafka         kafka:29092, o listener INTERNAL
+  #   dados         ~/tcc-data do host, pelo mesmo bind mount
+  #   usuario       uid 1000
+  #   memoria       heap de 1 GB e teto de 1,5 GB no conteiner
+  #
+  # Roda em local[*] dentro de UM conteiner — processo unico contra o
+  # MiniCluster do Flink, tambem processo unico.
+  #
+  # Atras do perfil "spark": nao sobe com `docker compose up -d`.
+  #
+  #   docker compose build spark
+  #   docker compose run --rm spark python scripts/check_chain.py
+  #   bash pipeline-nrt/run_local.sh
+  #
+  # A mudanca foi verificada em 10/10/2026 em seis degraus, ate a reconciliacao
+  # com 0 perdas e a regressao do Flink (DecisaoEtapa6.2.md 6.2). O caminho do
+  # host, pelo venv, foi removido depois disso.
+  spark:
+    build: ./pipeline-nrt
+    image: tcc-spark:4.0.4
+    profiles: ["spark"]
+
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+    environment:
+      BOOTSTRAP: kafka:29092
+
+      # No host estes tres caminhos saiam de ~ (o HOME do usuario). Aqui o HOME
+      # e /tmp, entao sao declarados: sem isto o job gravaria em /tmp/tcc-data,
+      # DENTRO do conteiner, e tudo morreria com ele — a armadilha do
+      # KAFKA_LOG_DIRS de novo.
+      BASE: /tcc-data/out/spark
+      CHECKPOINT: /tcc-data/checkpoints/nrt
+      DATA_DIR: /tcc-data
+
+      # O usuario 1000 nao tem pasta pessoal dentro da imagem.
+      HOME: /tmp
+
+    user: "1000:1000"
+
+    volumes:
+      - ./:/app:ro
+      - ${HOME}/tcc-data:/tcc-data
+
+    # O mesmo teto do Flink (decisao D2, tuning simetrico). O driver tem heap de
+    # 1 GB, e a JVM e o processo Python usam memoria alem do heap. Medido com
+    # `docker stats` em 10/10/2026, a 100 evt/s por 60 s: sobe ao longo da
+    # execucao e estabiliza em ~940 MiB. Sob carga alta ainda nao foi medido. Se
+    # o conteiner morrer com codigo 137, o teto esta baixo — e o ajuste vale
+    # para os dois.
+    #
+    # ESTE NUMERO TAMBEM ESCOLHE O COLETOR DE LIXO DA JVM (verificado em
+    # 10/10/2026). Abaixo de ~1,8 GB a JVM nao se considera "maquina de
+    # servidor" e usa o SerialGC; com 2 GB, ou sem teto, usa o G1. Decisao de
+    # 10/10/2026: manter o Serial nos DOIS motores. Subir este teto para 2g, em
+    # um so ou nos dois, troca o coletor em silencio — e as execucoes anteriores
+    # deixam de ser comparaveis.
     mem_limit: 1536m
 
 volumes:

@@ -34,9 +34,10 @@ tenderiam a divergir.
 
 | Passos | O que reconstroem | Até onde chegou |
 |---|---|---|
-| 1 a 8 | ambiente, Kafka, tópico e gerador — **compartilhados** | Etapas 0 a 3 |
-| 9 a 11 | pipeline NRT (Spark) | Etapa 5 — Parquet com checkpoint |
-| 12 a 16 | pipeline Streaming (Flink) | Etapa RT-3 — Parquet com checkpoint |
+| 1 a 8 | ambiente, Kafka, tópico e gerador — **compartilhados** (o passo 5 constrói a imagem do Spark) | Etapas 0 a 3 |
+| 9 a 11 | pipeline NRT (Spark), em contêiner | Etapa 5 — Parquet com checkpoint |
+| 12 a 16 | pipeline Streaming (Flink), em contêiner | Etapa RT-3 — Parquet com checkpoint |
+| antes do 17 | **conferir o relógio** — obrigatório antes de qualquer medição | Etapa 6.2 |
 | 17 a 20 | instrumento de medição, nos dois motores | Etapa 6 / RT-4 — lag, reconciliação e latências |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
@@ -106,53 +107,36 @@ Na aba do Ubuntu, dentro do repositório:
 bash scripts/setup_env.sh
 ```
 
-O script cria o venv em `~/.venvs/tcc`, cria as pastas de dados em `~/tcc-data/`
-e diz o que falta caso algum pacote do sistema esteja ausente. É idempotente:
-rodar de novo não quebra nada.
+O script cria o venv em `~/.venvs/tcc`, cria as pastas de dados em `~/tcc-data/`,
+instala as dependências e diz o que falta caso algum pacote do sistema esteja
+ausente. É idempotente: rodar de novo não quebra nada.
 
 **Se ele reclamar de pacotes do sistema**, instale como root direto do Windows —
 o `sudo` pede senha em execução não interativa e trava:
 
 ```powershell
 wsl -d Ubuntu -u root -- apt-get update
-wsl -d Ubuntu -u root -- apt-get install -y python3.12-venv openjdk-17-jdk-headless
+wsl -d Ubuntu -u root -- apt-get install -y python3.12-venv
 ```
 
-**Travar o Java — obrigatório, não opcional.** O Ubuntu atualiza pacotes sozinho
-(`unattended-upgrades`), e o OpenJDK é pacote do sistema, fora do controle do
-`requirements.txt`. Em 24/09/2026 ele passou de 17.0.20 para 17.0.20.1 **com o
-Spark rodando**, e o job morreu no primeiro micro-batch com dados:
+**O que este venv é.** As ferramentas que ficam **fora** dos motores: o gerador, o
+coletor de lag e o reconciliador. É o que o `requirements.txt` da raiz instala
+(`confluent-kafka`, `PyYAML`, `duckdb`). O Spark e o Flink **não** estão nele:
+cada um roda no próprio contêiner, com o próprio `requirements.txt` (passos 5 e
+12).
 
-```
-Incorrect Java version: 17.0.20+8-1-24.04-Ubuntu
-jspawnhelper version 17.0.20.1+1-1-24.04-Ubuntu
-java.io.IOException: Cannot run program "chmod": error=0, Failed to exec spawn helper
-```
-
-A JVM carregada na memória era a antiga; o auxiliar que ela usa para lançar
-processos (`chmod`, `rm`) já era o novo, e recusou. Pior que a queda seria a
-troca silenciosa no meio de uma bateria: parte das execuções numa versão, parte
-na outra. Depois de instalar:
-
-```bash
-sudo apt-mark hold $(dpkg -l | awk '/openjdk-17/ {print $2}')
-apt-mark showhold            # deve listar os pacotes openjdk-17-*
-java -version                # registrar a versão exata
-```
-
-Para atualizar de propósito no futuro: `apt-mark unhold`, atualizar, refazer o
-passo 5 e registrar a nova versão.
-
-**Instalar as dependências Python:**
-
-```bash
-~/.venvs/tcc/bin/pip install -r requirements.txt
-```
+**O host não precisa de Java.** A JVM dos dois motores vem dentro das imagens,
+travada pelo digest. Não foi sempre assim: até 10/10/2026 o Spark rodava no host,
+pelo venv, com o OpenJDK do Ubuntu — e em 24/09/2026 o `unattended-upgrades`
+trocou esse Java de 17.0.20 para 17.0.20.1 **com o Spark rodando**, o que derrubou
+o job (`Incorrect Java version … jspawnhelper`). Um Java que o sistema atualiza
+sozinho não pode fazer parte de uma medição; é um dos motivos de a JVM estar hoje
+na imagem.
 
 > **Atenção ao caminho.** No PowerShell, `~` é `C:\Users\<usuário>`, e o venv vive
-> em `/home/<usuário>/.venvs/tcc`, dentro do WSL. `~/.venvs/tcc/bin/pip` no
+> em `/home/<usuário>/.venvs/tcc`, dentro do WSL. `~/.venvs/tcc/bin/python` no
 > PowerShell falha com `CommandNotFoundException`. **Regra prática:** aba do
-> Ubuntu para Python, Kafka e Spark; PowerShell para o `git`.
+> Ubuntu para Python, Docker e os pipelines; PowerShell para o `git`.
 
 ---
 
@@ -212,18 +196,26 @@ reportado está errado sem nenhum erro na tela.
 
 ---
 
-## Passo 5 — Verificar a cadeia até o Spark
+## Passo 5 — Construir a imagem do Spark e verificar a cadeia
+
+O Spark roda num contêiner, como o Flink (passo 12).
 
 ```bash
-~/.venvs/tcc/bin/python scripts/check_chain.py
+docker compose build spark
+docker images tcc-spark        # ~937 MB
+docker compose run --rm spark python scripts/check_chain.py
 ```
 
-Sobe um Spark, resolve o conector do Kafka a partir do Maven, lê o tópico e
+O `docker compose up -d` do passo 3 **não** sobe o Spark — ele está atrás de um
+perfil no `docker-compose.yml` e roda só quando chamado. O `run --rm` cria o
+contêiner, executa e o apaga ao terminar.
+
+O `check_chain.py` sobe um Spark, carrega o conector do Kafka, lê o tópico e
 confirma que enxerga as 24 partições. Ele verifica a cadeia inteira:
 
 ```
-Python 3.12.3 → PySpark 4.0.4 → JVM 17.0.20.1 → conector Scala 2.13
-              → broker Kafka 4.0.2 → tópico com 24 partições
+Python 3.10.12 → PySpark 4.0.4 → JVM Temurin 17.0.20+8 → conector Scala 2.13
+               → broker Kafka 4.0.2 (kafka:29092) → tópico com 24 partições
 ```
 
 **Rode este passo antes de qualquer outra coisa envolvendo Spark.** O plano
@@ -231,11 +223,42 @@ aponta a incompatibilidade Spark ↔ conector como o motivo pelo qual projetos
 deste tipo travam, e o erro típico — `ClassNotFoundException` — não indica a
 causa real. Aqui ele aparece cedo e barato.
 
-O conector **não** vem por `pip`: o Spark o resolve do Maven em tempo de execução
-e guarda em cache no `~/.ivy2.5.2` — o diretório leva a versão do Ivy embutido no
-Spark, e **não** é o `~/.ivy2` da convenção antiga. O sufixo `_2.13` precisa casar com a versão do
-Spark (a linha 4.x usa Scala 2.13; a 3.x usava 2.12). A primeira execução baixa
-os jars e demora; as seguintes usam o cache.
+**Por que um contêiner.** Até 10/10/2026 o Spark rodava no host, pelo venv, e só o
+Flink em contêiner. Quando as métricas medidas localmente passaram a entrar no
+trabalho, essa assimetria deixou de ser aceitável: eram JVMs de fornecedores
+diferentes, Pythons diferentes e caminhos de rede diferentes até o Kafka. A
+vazão de disco e a leitura do Kafka foram medidas pelos dois caminhos antes da
+mudança, sem lado sistematicamente mais lento.
+
+**Por que Spark 4.0.x.** O 4.0 está em campo desde meados de 2025 e tem comunidade
+grande o bastante para que um erro colado no Google encontre resposta; o 4.2 é
+recente demais para isso. A linha 3.5 tem mais tutoriais, mas o suporte dela a
+Python 3.12 — o do host, onde o Spark rodava quando a versão foi travada — era
+incerto.
+
+**O que a imagem contém**, e por que nessa forma:
+
+- **A mesma imagem base do Flink**, travada pelo mesmo digest: Java Temurin
+  17.0.20+8 sobre Ubuntu 22.04. A JVM é a mesma nos dois motores.
+- **O conector do Kafka já está dentro dela.** Ele **não** vem por `pip`: são
+  jars do Maven, `org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.4`. O build os
+  resolve uma vez; em execução eles entram por `--jars`, e nenhuma execução toca
+  na internet. O sufixo `_2.13` precisa casar com a versão do Spark (a linha 4.x
+  usa Scala 2.13; a 3.x usava 2.12).
+- **São 11 jars**, e o build grava o sha256 de cada um em
+  `/opt/spark-ivy/jars.sha256`. O conector arrasta 10 dependências, entre elas o
+  `kafka-clients` 3.9.1 — o cliente que o Spark usa **não** é da mesma versão do
+  broker (4.0.2). É normal, o protocolo do Kafka é compatível entre versões, mas
+  essas versões participam da medição e são fixadas indiretamente, pela versão do
+  conector.
+- **As dependências estão travadas.** O `pipeline-nrt/requirements.txt` fixa o
+  PySpark e o cliente Kafka; o `requirements.lock` fixa também as dependências
+  indiretas.
+
+> **Editar um arquivo copiado para a imagem reconstrói as camadas seguintes** —
+> mesmo que a mudança seja um comentário no `requirements.txt`. O resultado deve
+> sair igual, porque as versões estão travadas, mas é outra imagem: depois de
+> reconstruir, repita este passo antes de medir.
 
 O aviso `NativeCodeLoader: Unable to load native-hadoop library` aparece em toda
 instalação de Spark e não afeta medição.
@@ -329,8 +352,11 @@ Duas abas.
 bash pipeline-nrt/run_local.sh
 ```
 
+O lançador chama o contêiner do Spark; o código é montado do repositório, então
+**editar o código não exige reconstruir a imagem**.
+
 Imprime a configuração usada, avisa se o checkpoint é novo ou está sendo
-retomado, resolve o conector e começa a consumir. Com `startingOffsets=earliest`,
+retomado, e começa a consumir. Com `startingOffsets=earliest`,
 o `[batch 0]` engole de uma vez os eventos que já estão no tópico — devem ser os
 6000 do passo 6. Depois fica quieto, porque não há dado novo chegando.
 
@@ -363,20 +389,38 @@ onde aparecem o número de linhas por batch e a duração de cada um.
 ```bash
 TRIGGER="30 seconds" bash pipeline-nrt/run_local.sh
 STARTING_OFFSETS=latest bash pipeline-nrt/run_local.sh
-DRIVER_MEMORY=2g bash pipeline-nrt/run_local.sh
 ```
 
-Para parar: `Ctrl+C`. O código de saída será **130** — a convenção do shell para
-"terminado por SIGINT". Isso é o esperado, não erro: o sinal vai para o grupo de
-processos e a JVM em primeiro plano encerra por ele. O job só terá um código de
-saída com significado quando ganhar uma condição de parada própria, na Etapa 8.
+> **`DRIVER_MEMORY` não é só uma variável.** O contêiner tem teto de 1536 MB
+> (`mem_limit`, no `docker-compose.yml`), dimensionado para o heap de 1 GB. Um
+> heap maior exige subir o teto — e o teto também escolhe o coletor de lixo da
+> JVM: com 1536 MB ela usa o Serial, com 2 GB usaria o G1. Os dois motores rodam
+> com o Serial, por decisão de 10/10/2026; mudar o teto de um só troca o coletor
+> em silêncio.
 
-> **Por que existe um lançador em vez de `python main.py`.** Duas configurações
-> precisam existir **antes** de a JVM do driver subir, e o código Python roda
-> depois disso: `--driver-memory` (configurar `spark.driver.memory` no
-> `SparkSession.builder` é aceito sem erro e **silenciosamente ignorado**) e
-> `--packages`, que resolve o conector na inicialização. O `spark-submit` é quem
-> lança a JVM, então é por ele que os dois passam.
+Para parar: `Ctrl+C`. O código de saída será **130** — a convenção do shell para
+"terminado por SIGINT". Isso é o esperado, não erro: o sinal chega à JVM e ao
+Python, e a JVM encerra por ele. O job só terá um código de saída com significado
+quando ganhar uma condição de parada própria, na Etapa 8.
+
+> **Às vezes o `Ctrl+C` suja a tela.** O sinal chega aos dois processos, e quem
+> reage primeiro varia. Pode sair uma pilha de erro do Python
+> (`Cannot call methods on a stopped SparkContext`) ou várias linhas
+> `ERROR Inbox: Ignoring error … RejectedExecutionException`, do Java. Nos dois
+> casos nada se perde: o checkpoint e os arquivos já gravados ficam íntegros.
+
+Dois avisos aparecem em execução normal e são inofensivos nesta carga:
+`Total allocation exceeds 95.00% of heap memory… Scaling row group sizes`, do
+escritor de Parquet (8 escritores simultâneos reservando memória), e o
+`Current batch is falling behind` do primeiro lote, já comentado acima.
+
+> **Por que existe um lançador em vez de `python main.py`.** Duas coisas precisam
+> existir **antes** de a JVM do driver subir, e o código Python roda depois
+> disso: `--driver-memory` (configurar `spark.driver.memory` no
+> `SparkSession.builder` é aceito sem erro e **silenciosamente ignorado**) e os
+> jars do conector, que entram por `--jars`. O `spark-submit` é quem lança a JVM,
+> então é por ele que os dois passam. O `run_local.sh` sobe o contêiner; lá
+> dentro, quem chama o `spark-submit` é o `pipeline-nrt/submit.sh`.
 
 ---
 
@@ -450,13 +494,15 @@ eventos: os lotes devem voltar a aparecer.
 
 ## Passo 12 — Construir a imagem do Flink
 
-Daqui em diante, o pipeline Streaming. Ele **não** usa o venv: roda num contêiner.
+Daqui em diante, o pipeline Streaming. Como o Spark, ele roda num contêiner.
 
 **Por que um contêiner.** O Flink escolhido é o **1.20.5**, a versão LTS — e a
 linha com mais material de consulta, já que o Flink 2.0 removeu APIs e boa parte
 dos tutoriais existentes mira a 1.x. Mas o 1.20 não suporta Python 3.12, e o venv
 do projeto é 3.12.3. O contêiner traz o próprio Python (3.10), e o venv do host
-fica intocado: nada de PPA de terceiros, nada de segundo ambiente.
+fica intocado: nada de PPA de terceiros, nada de segundo ambiente. Foi o Flink
+que foi para contêiner primeiro, por esse motivo; o Spark o seguiu em
+10/10/2026, por outro (passo 5).
 
 ```bash
 docker compose build flink
@@ -470,17 +516,16 @@ A primeira construção leva cerca de dois minutos, quase todos no `pip install`
 - **Só Java como base, não a imagem oficial do Flink.** A oficial já traz uma
   instalação do Flink, e o `pip install apache-flink` traz outra, embutida no
   pacote Python. Duas instalações do mesmo motor na mesma imagem é armadilha.
-  Aqui existe uma só — e ela chega do mesmo jeito que o Spark chega no host,
-  dentro do pacote Python.
+  Aqui existe uma só — e ela chega do mesmo jeito que o Spark chega na imagem
+  dele, dentro do pacote Python.
 - **A JVM é a Temurin 17.0.20+8**, e a imagem base está travada pelo **digest**,
   não só pela tag — a tag `17.0.20_8-jre-jammy` foi republicada em 18/09/2026, e
-  tag nenhuma é imutável. O Spark no host usa o OpenJDK do Ubuntu, 17.0.20.1: a
-  mesma versão de feature e o mesmo nível de atualização, de fornecedores
-  diferentes, com um patch pontual a mais no host. Não existe Temurin 17.0.20.1
-  publicada para alinhar.
-- **O conector Kafka é baixado e verificado no build.** Diferente do Spark, que
-  resolve o conector sozinho do Maven, o Flink precisa que o jar seja obtido e o
-  caminho declarado. O `Dockerfile` baixa o `flink-sql-connector-kafka-3.4.0-1.20`
+  tag nenhuma é imutável. A imagem do Spark parte da mesma base, pelo mesmo
+  digest: a JVM é a mesma nos dois motores. (Até 10/10/2026 o Spark rodava no
+  host com o OpenJDK 17.0.20.1 do Ubuntu — a mesma linha, de outro fornecedor.)
+- **O conector Kafka é baixado e verificado no build.** Diferente do Spark, cujo
+  build resolve o conector e as dependências dele pelo Maven, o Flink precisa
+  que o jar seja obtido e o caminho declarado. O `Dockerfile` baixa o `flink-sql-connector-kafka-3.4.0-1.20`
   e confere o SHA-1 publicado no Maven Central; se não bater, o build **falha**.
 - **As dependências estão travadas.** O `requirements.txt` fixa o PyFlink; o
   `requirements.lock` fixa **todas** as dependências dele, que de outro modo o
@@ -531,9 +576,9 @@ que o Flink leu de cada uma das 24. Por isso exige o tópico povoado: com ele
 vazio, falha avisando para rodar o gerador.
 
 **O broker é `kafka:29092`, não `localhost:9092`.** O contêiner está na rede do
-Docker e usa o listener interno. É uma assimetria em relação ao Spark, que roda
-no host — declarada, e sem efeito sobre os resultados, porque a fase local não
-produz os números comparados.
+Docker e usa o listener interno. O Spark usa o mesmo caminho desde que passou
+para contêiner; quem continua em `localhost:9092` são as ferramentas do host — o
+gerador e o coletor.
 
 O aviso de `pkg_resources` depreciado que aparece no topo vem de dentro do
 `apache-beam`, uma dependência do PyFlink. É inofensivo: o `setuptools` vem do
@@ -711,11 +756,67 @@ para retê-los, senão o `Ctrl+C` destruiria justamente o que a retomada precisa
 
 ---
 
+## Antes de medir — conferir o relógio
+
+**Obrigatório antes de qualquer execução cujos tempos vão ser usados** (passos 17 a
+20 e tudo que vier depois). Toda latência do trabalho é uma subtração entre dois
+carimbos do relógio da máquina. Um relógio com defeito falsifica todas elas **sem
+erro nenhum**.
+
+**O que aconteceu.** Em 10/10/2026, no WSL2, um teste mostrou um lote com
+`processamento=-1123 ms`. Dois sincronizadores de hora acertavam o mesmo relógio:
+o WSL, seguindo a hora do Windows, e o `systemd-timesyncd` do Ubuntu, seguindo a
+internet — com 3,76 s de diferença entre as duas. A cada ~30 s o relógio recuava
+1 s e avançava 3,8 s, e entre os saltos andava a **91,7%** da velocidade. Só foi
+notado porque um número saiu negativo. Host e contêineres viram os mesmos saltos:
+o kernel é um só.
+
+**O ritual**, em toda sessão de medição:
+
+```bash
+sudo systemctl stop systemd-timesyncd          # uma autoridade só: o Windows
+# esperar ~2 minutos: o relógio leva esse tempo para assentar
+~/.venvs/tcc/bin/python scripts/check_clock.py
+```
+
+**Esperado**, em 40 segundos:
+
+```
+  systemd-timesyncd ........ inactive                                     OK
+  tick do kernel ........... 10001  (normal 10000)                        OK
+  saltos acima de 10 ms .... 0                                            OK
+  ritmo .................... 100.003 %  (deriva de +1.2 ms na janela)     OK
+OK: relogio sao. Pode medir.
+```
+
+Se sair `NAO MEDIR`, não meça: espere mais um pouco e rode de novo. O script só
+lê; não altera nada. Sai com **0** ou **1**, para o arnês da Etapa 8 chamá-lo
+antes de cada execução.
+
+**Ao terminar a sessão**, religue o serviço:
+
+```bash
+sudo systemctl start systemd-timesyncd
+```
+
+> **O serviço volta sozinho a cada vez que o WSL liga** (`wsl --shutdown`,
+> reinício do Windows). O ritual vale em **toda** sessão, não uma vez só.
+
+> **Não importa a hora estar alguns segundos errada.** Importa o relógio andar no
+> ritmo certo e sem saltos, igual para todos os processos. Sobra um ajuste do
+> próprio WSL de 2 a 4 ms a cada 30 s, que é normal e está declarado.
+
+> **Fora do WSL** — num Linux comum, como as máquinas da AWS — há um sincronizador
+> só, e ele ligado é o estado correto. O script não exige o serviço parado nesse
+> caso; as outras conferências valem igual.
+
+---
+
 ## Passo 17 — Medir o pipeline NRT (Spark)
 
 Daqui em diante, o **instrumento de medição** (Etapa 6 do NRT = RT-4 do Flink).
 Os pipelines já gravam o que é preciso para medir; os passos 17 a 20 mostram como
-coletar e conferir.
+coletar e conferir. **Com o relógio conferido** (seção anterior).
 
 **O que o Spark passou a registrar**, a cada micro-batch:
 
@@ -736,6 +837,12 @@ rm -rf ~/tcc-data/checkpoints/nrt
 STARTING_OFFSETS=latest bash pipeline-nrt/run_local.sh
 ```
 
+> **O `rm -rf` não é enfeite.** Os dois motores leem o **mesmo** tópico: tudo que
+> o gerador produziu para medir o Flink fica pendente para o Spark, e vice-versa.
+> Com checkpoint existente, `STARTING_OFFSETS=latest` não vale — o Spark retoma de
+> onde parou e processa essa pendência logo no primeiro lote, com minutos de
+> latência, sob o `run_id` da outra medição.
+
 Espere o `[batch 0] vazio`. Aba 2, o gerador:
 
 ```bash
@@ -751,8 +858,12 @@ GROUP_ID=tcc-nrt-spark DURATION=75 ~/.venvs/tcc/bin/python shared/monitoring/col
 **Esperado na aba 1**, a cada ~5 s:
 
 ```
-[batch 3] 500 eventos gravados  processamento=1268 ms  escrita=353 ms  particoes=24
+[batch 3] 500 eventos gravados  processamento=1381 ms  escrita=431 ms  particoes=24
 ```
+
+Todo `processamento=` tem de ser **positivo**, e os lotes do meio, de ~500 eventos.
+Tempo negativo ou lotes irregulares (350, 420, 300…) são o sintoma do relógio com
+defeito: pare e volte à seção anterior.
 
 **Esperado na aba 3**, de segundo em segundo, o **serrilhado** do lag: sobe ~100 por
 segundo e cai a cada batch.
@@ -796,17 +907,21 @@ RUN=$(ls -1 ~/tcc-data/out/spark/events | tail -1 | sed 's/run_id=//'); echo "$R
 RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
 ```
 
-**Esperado** (referência medida na máquina original, 100 evt/s, trigger de 5 s):
+**Esperado** (referência medida na máquina original em 10/10/2026, com o Spark em
+contêiner, 100 evt/s, trigger de 5 s):
 
 ```
     PERDAS (confirmados - distintos) 0
     DUPLICATAS (gravados - distintos) 0
-  espera no trigger          P50   2612 ...
-  LAT. PROCESSAMENTO         P50   3903 ...
-  LAT. VISIBILIDADE          P50   4298 ...
+  espera no trigger          P50   2643 ...
+  LAT. PROCESSAMENTO         P50   3909 ...
+  LAT. VISIBILIDADE          P50   4382 ...
   is_late ................ 0 de 6000
 OK: perdas=0  duplicatas=0  invalidas=0
 ```
+
+Uma segunda execução, logo em seguida, deu 3914 e 4386 ms. Em setembro, com o
+Spark ainda no host, eram 3903 e 4298 ms.
 
 A **espera no trigger** com mediana perto de **metade do trigger** (2,6 s de 5 s) é a
 aritmética do micro-batch aparecendo no dado. O programa sai com **0** se não há
@@ -861,22 +976,33 @@ RUN=$(ls -1 ~/tcc-data/out/flink/events | tail -1 | sed 's/run_id=//'); echo "$R
 MOTOR=flink RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
 ```
 
-**Esperado** (referência medida na máquina original, 100 evt/s, checkpoint de 5 s):
+**Esperado** (referência medida na máquina original em 10/10/2026, 100 evt/s,
+checkpoint de 5 s):
 
 ```
     PERDAS (confirmados - distintos) 0
     DUPLICATAS (gravados - distintos) 0
+  checkpoints com dados .. 13   (o 1o e descartado como aquecimento)
+  instantes de ctime ..... 15   (arquivos a ate 1000 ms um do outro = mesmo checkpoint)
   committed_ts ........... ctime de cada arquivo (CONTRATO.md 1.6, 2.2)
-  espera pelo checkpoint     P50   2618 ...
-  LAT. PROCESSAMENTO         P50      8 ...
-  LAT. VISIBILIDADE          P50   2626 ...
-  conferencia ctime x log de checkpoints: -6..4 ms em 7 checkpoints
+  espera pelo checkpoint     P50   2599 ...
+  LAT. PROCESSAMENTO         P50      7 ...
+  LAT. VISIBILIDADE          P50   2606 ...
+  conferencia ctime x log de checkpoints: -10..7 ms em 15 instantes de ctime
 OK: perdas=0  duplicatas=0  invalidas=0
 ```
 
+Em setembro eram 8 ms e 2626 ms.
+
+**Checkpoints e instantes.** Os 8 arquivos de um checkpoint ficam visíveis quase
+juntos, mas nem sempre no mesmo milissegundo. O reconciliador agrupa os arquivos
+cujo `ctime` dista até 1 s e trata o grupo como um checkpoint — é o grupo inteiro
+que a regra de aquecimento descarta. A latência de cada evento continua calculada
+com o `ctime` do próprio arquivo.
+
 **É o achado central do trabalho, visível numa tela só.** Latência de
-**processamento**: 8 ms no Flink contra 3,9 s no Spark. Latência de
-**visibilidade**: 2,6 s contra 4,3 s. O Flink processa cada evento em milissegundos,
+**processamento**: 7 ms no Flink contra 3,9 s no Spark. Latência de
+**visibilidade**: 2,6 s contra 4,4 s. O Flink processa cada evento em milissegundos,
 mas o dado espera o checkpoint para ficar visível — o intervalo de checkpoint tem
 na visibilidade o papel do trigger no Spark. Por isso o trabalho reporta as duas.
 
@@ -900,7 +1026,7 @@ Se os vinte passos acima funcionaram, o ambiente está reproduzido:
 - [x] `docker compose ps` mostra o broker `healthy`
 - [x] `docker exec kafka ls /var/lib/kafka/data` lista `meta.properties`
 - [x] O tópico existe com 24 partições
-- [x] `check_chain.py` fecha a cadeia até o Spark
+- [x] A imagem `tcc-spark:4.0.4` constrói, e o `check_chain.py` fecha a cadeia até o Spark dentro dela
 - [x] O gerador reporta tentados = confirmados, 0 erros
 - [x] As 24 partições recebem ~250 eventos cada
 - [x] Os eventos sobrevivem a `down` → `up`
@@ -912,6 +1038,7 @@ Se os vinte passos acima funcionaram, o ambiente está reproduzido:
 - [x] O Flink grava Parquet em `~/tcc-data/out/flink` e encerra com cancelamento limpo
 - [x] Os arquivos do Flink ficam visíveis em degraus, um por checkpoint
 - [x] O job do Flink reiniciado retoma do último checkpoint sem reprocessar
+- [x] Com o `systemd-timesyncd` parado, o `check_clock.py` diz `OK: relogio sao`
 - [x] O Spark registra o log de progresso e commita offsets sob `tcc-nrt-spark`
 - [x] O coletor mostra o serrilhado do lag, com vales estáveis
 - [x] O `reconcile.py` do Spark: 0 perdas, 0 duplicatas, espera no trigger ~metade do trigger
@@ -929,10 +1056,11 @@ Decisão E6: **código no Windows, dados em ext4 nativo do WSL.**
 | | Caminho |
 |---|---|
 | Código (este repo) | `/mnt/c/.../Pipelines-TCC` |
-| Ambiente Python | `~/.venvs/tcc` |
+| Ambiente Python do host | `~/.venvs/tcc` — gerador, coletor e reconciliador |
 | Parquet de saída | `~/tcc-data/out/spark` e `~/tcc-data/out/flink` — um `<base>` por motor |
 | Checkpoints | `~/tcc-data/checkpoints/nrt` (Spark) e `~/tcc-data/checkpoints/rt` (Flink) |
 | Métricas coletadas | `~/tcc-data/metrics` — manifestos do gerador, logs de progresso dos dois motores, CSVs do coletor e relatórios do `reconcile.py` |
+| Ambiente do Spark | imagem Docker `tcc-spark:4.0.4` — fora do venv |
 | Ambiente do Flink | imagem Docker `tcc-flink:1.20.5` — fora do venv |
 
 O motivo é medido, não estético: escrita sequencial em `/mnt/c` roda a
@@ -949,6 +1077,13 @@ Antes de **qualquer execução medida**, fechar Discord, Steam e navegadores. N�
 só memória: esses processos disputam CPU de forma imprevisível, e essa disputa
 entra na variância que seria reportada como efeito do parâmetro em teste.
 
+E **conferir o relógio** — parar o `systemd-timesyncd`, esperar, rodar o
+`scripts/check_clock.py` —, como descrito antes do passo 17. Ao terminar, religar
+o serviço.
+
+Antes de medir um motor, **zerar o checkpoint dele**: os dois leem o mesmo tópico,
+e a medição de um deixa pendência para o outro.
+
 ### Versões travadas (decisão E7)
 
 Estes números fazem parte do método experimental. Trocar qualquer um deles no
@@ -957,31 +1092,35 @@ meio dos experimentos invalida as execuções já feitas.
 | | Versão | Verificado em |
 |---|---|---|
 | Kafka | 4.0.2 (KRaft) | 03/09/2026 |
-| Spark / PySpark | 4.0.4 (Scala 2.13) | 03/09/2026 |
-| Python | 3.12.3 | 03/09/2026 |
-| JVM | OpenJDK 17.0.20.1 (Ubuntu), travado com `apt-mark hold` — era 17.0.20 até o `unattended-upgrades` de 24/09/2026 | 24/09/2026 |
-| confluent-kafka | 2.15.0 (librdkafka 2.15.0) | 04/09/2026 |
-| DuckDB (leitor do `reconcile.py`) | 1.5.5 | 24/09/2026 |
+| Spark / PySpark | 4.0.4 (Scala 2.13), em contêiner | 03/09/2026 no host; 10/10/2026 no contêiner |
+| Conector Kafka do Spark | `spark-sql-kafka-0-10_2.13` 4.0.4 e 10 dependências (`kafka-clients` 3.9.1), 11 jars com sha256 igual ao do host | 10/10/2026 |
+| Python do Spark | 3.10.12 (Ubuntu 22.04 da imagem) — era 3.12.3 no host | 10/10/2026 |
 | Flink / PyFlink | 1.20.5 (LTS), em contêiner | 21/09/2026 |
 | Conector Kafka do Flink | `flink-sql-connector-kafka` 3.4.0-1.20 | 21/09/2026 |
 | Python do Flink | 3.10.12 (Ubuntu 22.04 da imagem) | 21/09/2026 |
-| JVM do Flink | Temurin 17.0.20+8; base travada pelo digest `sha256:e85989f3…` | 24/09/2026 |
+| JVM dos dois motores | Temurin 17.0.20+8; base travada pelo digest `sha256:e85989f3…`. O Spark usou o OpenJDK 17.0.20.1 do host até 10/10/2026 | 24/09/2026 (Flink); 10/10/2026 (Spark) |
+| Coletor de lixo da JVM | Serial nos dois — escolhido pela JVM por causa do teto de 1536 MB do contêiner | 10/10/2026 |
+| Python do host (gerador, coletor, reconciliador) | 3.12.3 | 03/09/2026 |
+| confluent-kafka | 2.15.0 (librdkafka 2.15.0) — no host e na imagem do Spark | 04/09/2026 |
+| DuckDB (leitor do `reconcile.py`) | 1.5.5 | 24/09/2026 |
 
-As versões do Spark estão no `requirements.txt` da raiz. As do Flink estão em
-`pipeline-streaming/requirements.txt` e, travadas até as dependências
-transitivas, em `pipeline-streaming/requirements.lock`.
+Cada ambiente tem o seu arquivo de versões. As das ferramentas do host estão no
+`requirements.txt` da raiz. As do Spark, em `pipeline-nrt/requirements.txt`; as do
+Flink, em `pipeline-streaming/requirements.txt`. Nas duas imagens, o
+`requirements.lock` da mesma pasta trava também as dependências indiretas.
 
 ### Estrutura
 
 ```
 CONTRATO.md               schema e invariantes de comparabilidade   (Etapa 2)
-docker-compose.yml        Kafka 4.0.2 (KRaft) e o contêiner do Flink (perfil)
-requirements.txt          versões travadas do lado Spark (decisão E7)
+docker-compose.yml        Kafka 4.0.2 (KRaft) e os contêineres do Spark e do Flink (perfis)
+requirements.txt          versões travadas das ferramentas do host (decisão E7)
 env/wslconfig             configuração da VM, versionada e comentada
-scripts/setup_env.sh      recria o ambiente do zero
+scripts/setup_env.sh      recria o ambiente do host do zero
 scripts/create_topic.sh   cria o tópico com 24 partições
-scripts/check_chain.py    verifica Python → Spark → JVM → Kafka
+scripts/check_chain.py    verifica Python → Spark → JVM → Kafka, no contêiner
 scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1)
+scripts/check_clock.py    confere o relógio antes de medir         (Etapa 6.2)
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
   data-generator/         gerador de eventos                       (Etapa 3)
@@ -989,7 +1128,11 @@ shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   monitoring/collector.py consumer lag a cada 1 s, os dois motores (Etapa 6)
   reference-data/         products.parquet e seu gerador           (Etapa 7)
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
-  run_local.sh            lançador via spark-submit
+  Dockerfile              runtime: Java 17.0.20, Python, PySpark, conector (Etapa 6.2)
+  requirements.txt        as versões do PySpark e do cliente Kafka
+  requirements.lock       todas as dependências, travadas
+  run_local.sh            lançador, via docker compose run
+  submit.sh               roda no contêiner: chama o spark-submit
   src/config.py           trigger, endereços, destino, codec e checkpoint
   src/esquema.py          traduz o evento.json para StructType
   src/main.py             o job
@@ -1040,6 +1183,11 @@ A Etapa 6 do NRT e a RT-4 do Flink foram a **mesma etapa**, concluída em
 25/09/2026: o instrumento de medição foi construído uma vez, para os dois motores.
 Os dois pipelines estão agora no mesmo ponto.
 
+Em 10/10/2026, com as métricas locais passando a entrar no trabalho, o Spark foi
+para contêiner, sobre a mesma imagem base do Flink (Etapa 6.2). Os números de
+setembro — Spark no host, relógio não conferido — ficam como histórico; os de
+referência serão medidos de novo nas condições atuais.
+
 ### Pipeline Streaming (Flink) — `planoRT.md`
 
 - [x] **RT-1** — Versões travadas e cadeia verificada: Flink 1.20.5 LTS em
@@ -1072,6 +1220,9 @@ Os dois pipelines estão agora no mesmo ponto.
 - [x] **Etapa 6** — Instrumento de medição: log de progresso, lag a cada 1 s,
       `reconcile.py` que detecta perdas injetadas; 0 perdas, processamento P50
       3,9 s e visibilidade P50 4,3 s a 100 evt/s
+- [x] **Etapa 6.2** — Spark em contêiner, relógio conferido antes de medir:
+      retomada e regressão do Flink verificadas, 0 perdas; processamento P50
+      3,9 s (Spark) e 7 ms (Flink), visibilidade P50 4,4 s e 2,6 s a 100 evt/s
 - [ ] **Etapa 7** — Enriquecimento
 - [ ] **Etapa 8** — Arnês de benchmark
 - [ ] **Etapa 9** — Validação local e caos

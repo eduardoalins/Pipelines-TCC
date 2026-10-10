@@ -4,9 +4,9 @@
 #
 #     bash pipeline-streaming/run_local.sh
 #
-# Espelho do pipeline-nrt/run_local.sh, com uma diferenca de natureza: o do
-# Spark chama o spark-submit no host; este chama o conteiner do Flink. O job
-# roda DENTRO dele (decisao F3, planoRT.md secao 0.5).
+# Espelho do pipeline-nrt/run_local.sh: os dois chamam um conteiner, e o job
+# roda DENTRO dele (decisao F3, planoRT.md secao 0.5). Ate 10/10/2026 o do Spark
+# chamava o spark-submit no host.
 #
 # Overrides sem editar arquivo, no mesmo idioma do lado do Spark:
 #

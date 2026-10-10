@@ -1,0 +1,25 @@
+# O que a IMAGEM do pipeline NRT (Spark) instala — pipeline-nrt/Dockerfile.
+#
+# Espelho do pipeline-streaming/requirements.txt. Desde 10/10/2026 o Spark roda
+# em conteiner, sobre a mesma imagem base do Flink: as metricas locais passaram a
+# entrar no trabalho, e Spark no host contra Flink em conteiner deixou de ser uma
+# assimetria aceitavel.
+#
+# As versoes sao as MESMAS que rodavam no venv do host (requirements.txt da
+# raiz), verificadas la desde a Etapa 1. O que muda e o que esta por baixo:
+#
+#     Python   3.12.3 (WSL)            ->  3.10 (Ubuntu 22.04 da imagem)
+#     JVM      OpenJDK 17.0.20.1       ->  Temurin 17.0.20+8, a mesma do Flink
+#
+# O PySpark 4.0.4 declara suporte a Python >= 3.9 (conferido no PyPI em
+# 10/10/2026). A cadeia e reverificada dentro do conteiner pelo
+# scripts/check_chain.py antes de qualquer medicao.
+
+pyspark==4.0.4
+
+# O job commita no Kafka os offsets ja gravados, depois de cada micro-batch
+# (decisao F7) — e para isso que o cliente do Kafka entra na imagem.
+confluent-kafka==2.15.0
+
+# O conector do Kafka para o Spark NAO vem por pip: sao jars, resolvidos do
+# Maven na construcao da imagem — ver o Dockerfile.
