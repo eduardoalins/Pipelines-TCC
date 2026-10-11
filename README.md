@@ -12,9 +12,14 @@ dados e mede a diferença entre eles:
 | NRT | Apache Spark Structured Streaming | micro-batch |
 | Streaming | Apache Flink | evento a evento |
 
-Ambos consomem o mesmo tópico Kafka, aplicam as mesmas transformações e escrevem
-Parquet no mesmo layout. O que varia é o motor — é isso que torna a comparação
-válida. As invariantes que garantem essa equivalência estão no `CONTRATO.md`.
+Ambos consomem o mesmo tópico Kafka e escrevem os mesmos eventos em Parquet, no
+mesmo layout. O que varia é o motor — é isso que torna a comparação válida. As
+invariantes que garantem essa equivalência estão no `CONTRATO.md`.
+
+Os pipelines são **ELT estrito**: extraem e carregam, sem transformar. Não há
+join nem limpeza dentro deles; a transformação acontece depois, no destino, é a
+mesma para os dois motores e fica fora da comparação. O que o trabalho compara é
+o **E** e o **L**.
 
 ---
 
@@ -39,6 +44,7 @@ tenderiam a divergir.
 | 12 a 16 | pipeline Streaming (Flink), em contêiner | Etapa RT-3 — Parquet com checkpoint |
 | antes do 17 | **conferir o relógio** — obrigatório antes de qualquer medição | Etapa 6.2 |
 | 17 a 20 | instrumento de medição, nos dois motores | Etapa 6 / RT-4 — lag, reconciliação e latências |
+| 21 | eventos malformados: o que cada motor faz, e como isso é contado | Etapa 7 / RT-5 |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -903,9 +909,12 @@ O `reconcile.py` confere o que foi gravado contra o manifesto do gerador. Sem
 Para reconciliar a mais recente sem copiar nada à mão:
 
 ```bash
-RUN=$(ls -1 ~/tcc-data/out/spark/events | tail -1 | sed 's/run_id=//'); echo "$RUN"
+RUN=$(ls -1 ~/tcc-data/out/spark/events | grep 'run_id=[0-9]' | tail -1 | sed 's/run_id=//'); echo "$RUN"
 RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
 ```
+
+O `grep` deixa só as execuções do gerador, cujo `run_id` começa pela data. Sem ele,
+"a mais recente" poderia ser uma pasta do passo 21.
 
 **Esperado** (referência medida na máquina original em 10/10/2026, com o Spark em
 contêiner, 100 evt/s, trigger de 5 s):
@@ -917,7 +926,7 @@ contêiner, 100 evt/s, trigger de 5 s):
   LAT. PROCESSAMENTO         P50   3909 ...
   LAT. VISIBILIDADE          P50   4382 ...
   is_late ................ 0 de 6000
-OK: perdas=0  duplicatas=0  invalidas=0
+OK: perdas=0  duplicatas=0  invalidas=0  nulas=0  descartadas=?
 ```
 
 Uma segunda execução, logo em seguida, deu 3914 e 4386 ms. Em setembro, com o
@@ -925,7 +934,9 @@ Spark ainda no host, eram 3903 e 4298 ms.
 
 A **espera no trigger** com mediana perto de **metade do trigger** (2,6 s de 5 s) é a
 aritmética do micro-batch aparecendo no dado. O programa sai com **0** se não há
-perda nem duplicata, e com **1** se há — o arnês da Etapa 8 usa isso.
+perda, duplicata, linha inválida, linha nula nem descarte, e com **1** se há — o
+arnês da Etapa 8 usa isso. O `descartadas=?` é o esperado por enquanto: essa
+contagem depende de uma anotação que o arnês passará a gravar (passo 21).
 
 **Ele lê com o DuckDB**, instalado no passo 2 pelo `requirements.txt`: o mesmo leitor
 para os dois motores, que não pertence a nenhum deles. Os arquivos são descobertos
@@ -972,7 +983,7 @@ saem 3 h deslocados, sem erro**.
 ## Passo 20 — Reconciliar a execução do Flink
 
 ```bash
-RUN=$(ls -1 ~/tcc-data/out/flink/events | tail -1 | sed 's/run_id=//'); echo "$RUN"
+RUN=$(ls -1 ~/tcc-data/out/flink/events | grep 'run_id=[0-9]' | tail -1 | sed 's/run_id=//'); echo "$RUN"
 MOTOR=flink RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
 ```
 
@@ -989,7 +1000,7 @@ checkpoint de 5 s):
   LAT. PROCESSAMENTO         P50      7 ...
   LAT. VISIBILIDADE          P50   2606 ...
   conferencia ctime x log de checkpoints: -10..7 ms em 15 instantes de ctime
-OK: perdas=0  duplicatas=0  invalidas=0
+OK: perdas=0  duplicatas=0  invalidas=0  nulas=0  descartadas=?
 ```
 
 Em setembro eram 8 ms e 2626 ms.
@@ -1018,9 +1029,100 @@ declarada no `CONTRATO.md` §2.2, com o motivo e o tamanho do erro de cada um.
 
 ---
 
+## Passo 21 — Eventos malformados: a diferença declarada
+
+Os pipelines são **ELT estrito**: carregam o que chega, não limpam. Limpeza é
+transformação, e fica para o destino. Este passo mostra o que cada motor faz,
+sozinho, com um evento que não consegue ler — e que os dois **não** fazem a mesma
+coisa. A diferença não foi igualada; é declarada (`CONTRATO.md`) e **contada** pelo
+`reconcile.py` em toda execução.
+
+> **Este passo suja o tópico.** As 42 mensagens quebradas de cada rodada ficam lá
+> até a retenção apagá-las ou o tópico ser recriado (`docker compose down -v`).
+> Nunca rode no meio de uma bateria medida.
+
+**Com o Spark.** Aba 1:
+
+```bash
+rm -rf ~/tcc-data/checkpoints/nrt
+STARTING_OFFSETS=latest bash pipeline-nrt/run_local.sh
+```
+
+Espere o `[batch 0] vazio`. Aba 2, o injetor — 420 eventos válidos e 42 quebrados,
+de 14 tipos:
+
+```bash
+~/.venvs/tcc/bin/python shared/data-generator/inject_malformed.py
+```
+
+Quando a aba 1 mostrar os 462 eventos gravados (num lote ou em dois), `Ctrl+C` e:
+
+```bash
+RUN=$(ls -1 ~/tcc-data/out/spark/events | grep 'run_id=malformados' | tail -1 | sed 's/run_id=//'); echo "$RUN"
+RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
+```
+
+**Com o Flink.** Aba 1:
+
+```bash
+rm -rf ~/tcc-data/checkpoints/rt
+STARTUP_MODE=latest-offset bash pipeline-streaming/run_local.sh
+```
+
+Espere o `>> job no ar` e **mais uns 10 segundos**. Aba 2, o mesmo injetor. Espere
+três linhas de `[checkpoint N]` depois da que tiver o `estado=` maior, `Ctrl+C` e:
+
+```bash
+RUN=$(ls -1 ~/tcc-data/out/flink/events | grep 'run_id=malformados' | tail -1 | sed 's/run_id=//'); echo "$RUN"
+MOTOR=flink RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
+```
+
+**Esperado** (referência medida na máquina original em 11/10/2026):
+
+| | Spark | Flink |
+|---|---|---|
+| Válidos gravados | 420 de 420 | 420 de 420 |
+| Linhas no destino | 462 | 447 |
+| **INVÁLIDAS** — algum campo obrigatório nulo | 21 | 15 |
+| **NULAS** — todos os campos nulos | 15 | 0 |
+| **DESCARTADAS** — a mensagem sumiu | 0 | 15 |
+| Erro ou aviso do motor | nenhum | nenhum |
+
+Nos dois o programa termina com `DIVERGENCIA` e código **1** — é o correto: uma
+execução com evento quebrado não pode sair como `OK`. O bloco do `gen_id 99`, com
+`PERDAS ?` e muitas lacunas, são os próprios eventos quebrados: eles não têm
+manifesto.
+
+**De onde vem a diferença:**
+
+| Evento | Spark | Flink |
+|---|---|---|
+| Não é JSON, JSON cortado, lista, mensagem vazia ou nula | **grava** uma linha toda nula | **descarta**, sem aviso |
+| Número entre aspas (`"17"`) | campo nulo | **converte** para 17 |
+| Fração em campo inteiro (`1.5`) | campo nulo | **trunca** para 1 |
+| Texto em campo numérico, número grande demais, campo ausente | campo nulo | campo nulo |
+| Campo a mais | passa | passa |
+
+**Onde vão as linhas sem `run_id`.** Para uma pasta à parte, com nome diferente em
+cada motor: `run_id=__HIVE_DEFAULT_PARTITION__` no Spark e
+`run_id=__DEFAULT_PARTITION__` no Flink. O `reconcile.py` lê essas pastas e
+atribui as linhas à execução pelo instante em que foram processadas.
+
+**As DESCARTADAS dependem de uma anotação.** Uma mensagem que sumiu não aparece no
+destino: a conta é *mensagens que o tópico recebeu − linhas gravadas*. O injetor
+grava esse número em `~/tcc-data/metrics/<run_id>.topico.json`. Nas execuções
+normais essa anotação ainda não existe — será gravada pelo arnês da Etapa 8 —, e
+o `reconcile.py` mostra `descartadas=?`, sem estimar.
+
+> **Num benchmark, as três contagens têm de dar zero.** O gerador só emite eventos
+> válidos. Um número diferente de zero numa execução medida é sinal de defeito, e
+> o código de saída 1 existe para o arnês perceber.
+
+---
+
 ## Verificação final
 
-Se os vinte passos acima funcionaram, o ambiente está reproduzido:
+Se os vinte e um passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -1044,6 +1146,7 @@ Se os vinte passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `reconcile.py` do Spark: 0 perdas, 0 duplicatas, espera no trigger ~metade do trigger
 - [x] O Flink imprime uma linha por checkpoint e commita offsets sob `tcc-rt-flink`
 - [x] O `reconcile.py` do Flink: 0 perdas, 0 duplicatas, processamento em ms, conferência do `ctime` em poucos ms
+- [x] Com eventos malformados, o `reconcile.py` acusa 21 inválidas e 15 nulas no Spark, 15 inválidas e 15 descartadas no Flink, e sai com código 1
 
 ---
 
@@ -1124,9 +1227,9 @@ scripts/check_clock.py    confere o relógio antes de medir         (Etapa 6.2)
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
   data-generator/         gerador de eventos                       (Etapa 3)
+    inject_malformed.py   injetor de eventos quebrados, para o passo 21 (Etapa 7)
   analysis/reconcile.py   perdas, duplicatas, latências e is_late, via DuckDB (Etapa 6)
   monitoring/collector.py consumer lag a cada 1 s, os dois motores (Etapa 6)
-  reference-data/         products.parquet e seu gerador           (Etapa 7)
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
   Dockerfile              runtime: Java 17.0.20, Python, PySpark, conector (Etapa 6.2)
   requirements.txt        as versões do PySpark e do cliente Kafka
@@ -1199,7 +1302,8 @@ referência serão medidos de novo nas condições atuais.
 - [x] **RT-4** — Instrumento de medição, para os dois motores: `processed_ts` por
       evento, visibilidade pelo `ctime` do arquivo, offsets no Kafka; 0 perdas,
       processamento P50 8 ms e visibilidade P50 2,6 s a 100 evt/s
-- [ ] **RT-5** — Enriquecimento
+- [x] **RT-5** — Redefinida: ELT estrito, sem join. Eventos ilegíveis medidos e
+      contados; o Flink descarta 15 de 42 e converte tipos que o Spark anula
 - [ ] **RT-6** — Arnês unificado
 - [ ] **RT-7** — Validação local e caos
 
@@ -1223,7 +1327,9 @@ referência serão medidos de novo nas condições atuais.
 - [x] **Etapa 6.2** — Spark em contêiner, relógio conferido antes de medir:
       retomada e regressão do Flink verificadas, 0 perdas; processamento P50
       3,9 s (Spark) e 7 ms (Flink), visibilidade P50 4,4 s e 2,6 s a 100 evt/s
-- [ ] **Etapa 7** — Enriquecimento
+- [x] **Etapa 7** — Redefinida: ELT estrito, sem join nem limpeza no pipeline. O
+      que cada motor faz com eventos ilegíveis foi medido, declarado no contrato
+      1.8 e passou a ser contado em toda execução (inválidas, nulas, descartadas)
 - [ ] **Etapa 8** — Arnês de benchmark
 - [ ] **Etapa 9** — Validação local e caos
 - [ ] **Etapa 10** — Terraform e AWS

@@ -28,11 +28,17 @@ nenhum deles.
   `.parquet`. Ignora o que comeca com "." ou "_": arquivos em andamento do Flink,
   `.crc` e `_SUCCESS` do Spark, pastas `_temporary` — a mesma convencao de
   "arquivo oculto" que o Hadoop usa.
+- O pipeline NAO limpa eventos (ELT estrito, Etapa 7). Um evento que o motor nao
+  consegue ler tem destino diferente em cada um — o Spark grava linha nula, o
+  Flink descarta —, e isso e diferenca declarada. Aqui ela vira tres contagens,
+  pelo mesmo metodo nos dois: INVALIDAS, NULAS e DESCARTADAS. Para isso este
+  arquivo le tambem a particao nula do destino, onde vao as linhas sem run_id.
 
 --- Saida ------------------------------------------------------------------
 Relatorio na tela e um JSON em ~/tcc-data/metrics/reconcile.<motor>.<run_id>.json,
-para o arnes da Etapa 8. Sai com 0 se nao houver perda, duplicata nem linha
-invalida; 1 caso contrario — para o arnes perceber sem ler a tela.
+para o arnes da Etapa 8. Sai com 0 se nao houver perda, duplicata, linha
+invalida, linha nula nem descarte; 1 caso contrario — para o arnes perceber sem
+ler a tela.
 """
 
 import json
@@ -51,6 +57,28 @@ METRICS = DATA_DIR / "metrics"
 
 # CONTRATO.md 2.1: watermark = maximo ACUMULADO de event_ts menos 60 s.
 ATRASO_WATERMARK_MS = 60_000
+
+# --- Eventos que o motor nao conseguiu ler (Etapa 7) ------------------------
+# O pipeline NAO limpa nada (ELT estrito, decisao de 11/10/2026): o que cada
+# motor faz com um evento quebrado e diferenca declarada, e aqui ela e CONTADA.
+#
+# Campos do evento como chegam ao Parquet (CONTRATO.md 1.1). As colunas de
+# particao (run_id, dt, hh) ficam no caminho, nao no arquivo.
+CAMPOS_EVENTO = ("event_id", "seq", "gen_id", "event_type", "user_id", "product_id",
+                 "amount", "session_id", "event_ts")
+
+# Campos que um evento valido NUNCA traz nulos: todos, menos o amount, que o
+# contrato permite nulo (pageview e add_to_cart). O run_id tambem e obrigatorio,
+# mas e conferido pela pasta: quem esta na particao nula nao o tem.
+OBRIGATORIOS = tuple(c for c in CAMPOS_EVENTO if c != "amount")
+
+# Onde cada motor grava a linha SEM run_id. O nome difere: o primeiro e o do
+# Spark, o segundo o do Flink (verificado em 11/10/2026).
+PARTICAO_NULA = ("__HIVE_DEFAULT_PARTITION__", "__DEFAULT_PARTITION__")
+
+# Uma linha sem run_id nao diz a que execucao pertence. E atribuida a esta pelo
+# instante em que foi processada, com esta folga nas duas pontas.
+MARGEM_PARTICAO_NULA_MS = 5_000
 
 # Flink: os arquivos de um mesmo checkpoint ficam visiveis quase juntos, mas nem
 # sempre no mesmo milissegundo (visto em 10/10/2026: 8 arquivos divididos em
@@ -118,6 +146,80 @@ def linha_ms(nome: str, s: dict | None) -> str:
         return f"  {nome:<26} indisponivel"
     return (f"  {nome:<26} P50 {s['p50']:>6}  P95 {s['p95']:>6}  P99 {s['p99']:>6}  "
             f"media {s['media']:>6}  min {s['min']:>6}  max {s['max']:>6}   (ms, n={s['n']})")
+
+
+# --- Eventos ilegiveis: invalidas, nulas e descartadas ----------------------
+
+def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int) -> dict:
+    """As tres contagens da Etapa 7, pelo mesmo metodo nos dois motores.
+
+        INVALIDAS    linha gravada com ALGUM campo obrigatorio nulo (qualquer
+                     campo do evento menos o amount; e o run_id, quando a
+                     linha esta na particao nula) — decisao de 11/10/2026
+        NULAS        linha gravada com TODOS os campos do evento nulos
+        DESCARTADAS  mensagem que estava no topico e nao virou linha nenhuma
+
+    Limite da INVALIDAS: um amount trocado por texto vira nulo, e nulo e valor
+    legitimo para o amount — esse caso nao e contado.
+
+    As duas primeiras se veem no destino. A terceira e uma ausencia: exige saber
+    quantas mensagens o topico recebeu na execucao, o que vem de uma anotacao
+    <run_id>.topico.json (gravada pelo arnes da Etapa 8). Sem ela, fica
+    indisponivel — nunca e estimada.
+    """
+    campos = [c for c in CAMPOS_EVENTO if c in colunas]
+    tudo_nulo = " AND ".join(f"{c} IS NULL" for c in campos)
+    obrigatorios = [c for c in OBRIGATORIOS if c in colunas]
+    obrigatorio_nulo = " OR ".join(f"{c} IS NULL" for c in obrigatorios)
+
+    na_pasta, nulas, invalidas = con.execute(f"""
+        SELECT count(*), count(*) FILTER (WHERE {tudo_nulo}),
+               count(*) FILTER (WHERE NOT ({tudo_nulo}) AND ({obrigatorio_nulo}))
+        FROM ev
+    """).fetchone()
+    por_campo = {c: con.execute(
+        f"SELECT count(*) FROM ev WHERE NOT ({tudo_nulo}) AND {c} IS NULL").fetchone()[0]
+        for c in obrigatorios}
+
+    fora = 0
+    if tem_particao_nula:
+        fora, nulas_fora = con.execute(
+            f"SELECT count(*), count(*) FILTER (WHERE {tudo_nulo}) FROM sem_run_id").fetchone()
+        nulas += nulas_fora
+        invalidas += fora - nulas_fora          # tem dado, mas nao tem run_id
+        por_campo["run_id"] = fora - nulas_fora
+        for c in obrigatorios:
+            por_campo[c] += con.execute(
+                f"SELECT count(*) FROM sem_run_id WHERE NOT ({tudo_nulo}) AND {c} IS NULL"
+            ).fetchone()[0]
+    por_campo = {c: n for c, n in por_campo.items() if n}
+    linhas = na_pasta + fora
+
+    print("\n  Eventos que o motor nao conseguiu ler:")
+    print(f"    linhas no destino ............ {linhas}   ({na_pasta} na pasta do run_id"
+          f" + {fora} em particao nula)")
+    print(f"    INVALIDAS (campo obrigatorio nulo) {invalidas}")
+    if por_campo:
+        print("        nulos por campo: " + ", ".join(f"{c} {n}" for c, n in por_campo.items()))
+    print(f"    NULAS (todos os campos nulos) .. {nulas}")
+
+    mensagens = descartadas = None
+    anotacao = METRICS / f"{RUN_ID}.topico.json"
+    if anotacao.is_file():
+        mensagens = int(json.loads(anotacao.read_text(encoding="utf-8"))["mensagens"])
+        # Uma duplicata e uma linha a mais para a MESMA mensagem: nao pode
+        # esconder um descarte.
+        descartadas = mensagens - (linhas - duplicatas)
+        print(f"    mensagens no topico .......... {mensagens}   ({anotacao.name})")
+        print(f"    DESCARTADAS (mensagens - linhas) {descartadas}")
+        if descartadas < 0:
+            print("    !! mais linhas que mensagens: ha linhas de outra execucao na janela?")
+    else:
+        print(f"    DESCARTADAS .................. indisponivel (sem {anotacao.name})")
+
+    return {"invalidas": invalidas, "nulas": nulas, "descartadas": descartadas,
+            "linhas_no_destino": linhas, "linhas_em_particao_nula": fora,
+            "mensagens_no_topico": mensagens, "nulos_por_campo": por_campo}
 
 
 # --- Latencia no Flink (committed_ts = ctime do arquivo) ---------------------
@@ -290,6 +392,25 @@ def main() -> int:
         con.execute(f"CREATE VIEW ev AS {selecao}, {pts_ms} AS unidade FROM ev_bruto")
     relatorio: dict = {"motor": MOTOR, "run_id": RUN_ID, "unidade_de_progresso": modo}
 
+    # LINHAS SEM run_id — ficam fora da pasta desta execucao, na particao nula
+    # do motor. Entram na conta se foram processadas na janela desta execucao.
+    arqs_nulos = [a for nome in PARTICAO_NULA if (EVENTOS / f"run_id={nome}").is_dir()
+                  for a in arquivos_de_dados(EVENTOS / f"run_id={nome}")]
+    tem_particao_nula = False
+    if arqs_nulos and "processed_ts" in colunas:
+        t0, t1 = con.execute("SELECT min(processed_ts), max(processed_ts) FROM ev").fetchone()
+        if t0 is not None:
+            con.execute(f"""
+                CREATE VIEW sem_run_id AS
+                SELECT * FROM (
+                    {selecao}
+                    FROM read_parquet({lista_sql(arqs_nulos)}, hive_partitioning = true,
+                                      hive_types_autocast = false, union_by_name = true)
+                ) WHERE processed_ts BETWEEN {int(t0) - MARGEM_PARTICAO_NULA_MS}
+                                         AND {int(t1) + MARGEM_PARTICAO_NULA_MS}
+            """)
+            tem_particao_nula = True
+
     print(f"=== reconcile — motor {MOTOR}, run_id {RUN_ID} ===\n")
 
     # --- 0. O que ha na prateleira -----------------------------------------
@@ -305,11 +426,6 @@ def main() -> int:
     if not nota:
         print(f"!! ATENCAO: sem manifesto do gerador em {METRICS}/{RUN_ID}.gen*.json — "
               "sem a nota fiscal, perda nao e mensuravel")
-
-    # Linhas sem gen_id ou seq: JSON malformado vira nulos no from_json do
-    # Spark. Nao entram na conta de seq, mas sao contadas e reportadas.
-    invalidas = con.execute(
-        "SELECT count(*) FROM ev WHERE gen_id IS NULL OR seq IS NULL").fetchone()[0]
 
     print("\n--- 1. Integridade (por gen_id, contra os CONFIRMADOS pelo broker) ---")
     total_perdas = total_dup = 0
@@ -370,9 +486,12 @@ def main() -> int:
                             "distintos": distintos, "perdas": perdas, "duplicatas": dup,
                             "lacunas": lacunas, "fora_do_intervalo": fora})
 
-    print(f"  linhas invalidas (gen_id ou seq nulos) ... {invalidas}")
+    # Linhas sem gen_id ou seq nao entram na conta de seq acima; sao contadas aqui.
+    ilegiveis = contar_ilegiveis(con, colunas, tem_particao_nula, total_dup)
+    invalidas, nulas, descartadas = (ilegiveis["invalidas"], ilegiveis["nulas"],
+                                     ilegiveis["descartadas"])
     relatorio["integridade"] = {"por_gen": integridade, "perdas": total_perdas,
-                                "duplicatas": total_dup, "invalidas": invalidas}
+                                "duplicatas": total_dup, **ilegiveis}
 
     # --- 2. Latencia ---------------------------------------------------------
     print("\n--- 2. Latencia ---")
@@ -469,7 +588,9 @@ def main() -> int:
         relatorio["is_late"] = atrasados
 
     # --- Veredito ---------------------------------------------------------------
-    ok = total_perdas == 0 and total_dup == 0 and invalidas == 0 and bool(nota)
+    # Descartadas "indisponivel" nao reprova: so um numero diferente de zero.
+    ok = (total_perdas == 0 and total_dup == 0 and invalidas == 0 and nulas == 0
+          and not descartadas and bool(nota))
     relatorio["ok"] = ok
     METRICS.mkdir(parents=True, exist_ok=True)
     saida = METRICS / f"reconcile.{MOTOR}.{RUN_ID}.json"
@@ -477,7 +598,9 @@ def main() -> int:
 
     print("\n" + "=" * 68)
     print(f"{'OK' if ok else 'DIVERGENCIA'}: perdas={total_perdas}  duplicatas={total_dup}  "
-          f"invalidas={invalidas}" + ("" if nota else "  (sem manifesto)"))
+          f"invalidas={invalidas}  nulas={nulas}  "
+          f"descartadas={'?' if descartadas is None else descartadas}"
+          + ("" if nota else "  (sem manifesto)"))
     print(f"relatorio: {saida}")
     return 0 if ok else 1
 

@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 1.7 — 10/10/2026**
+**Versão 1.8 — 11/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -332,6 +332,62 @@ arquivos fora do arnês precisa tratá-los como UTC.
 - **O log de progresso continua em inteiro** (epoch ms), por ser JSON. A análise
   converte o Parquet para inteiro antes de cruzar os dois.
 
+### 2.6 O pipeline não transforma: ELT estrito (versão 1.8, 11/10/2026)
+
+**Decisão.** Os dois pipelines **carregam** os dez campos do evento como chegam, e
+acrescentam apenas as colunas de medição desta seção. Não há enriquecimento (o
+join com uma tabela de produtos, previsto até a versão 1.7) nem limpeza dentro do
+pipeline.
+
+**Por quê.** O trabalho compara pipelines **ELT**: extrair, carregar e só então
+transformar, no destino. Um join ou um filtro antes da escrita é transformação em
+trânsito, que é a marca do ETL. A transformação ocorre no destino, é a mesma para
+os dois motores e está **fora da comparação**. O que se compara é o **E** e o
+**L**, onde os motores diferem.
+
+**Consequência: um evento que o motor não consegue ler não é tratado de forma
+igual.** Cada motor faz o que faz por padrão, e os dois não foram igualados —
+igualar exigiria limpeza dentro do pipeline. Medido em 11/10/2026, com 14 tipos de
+evento quebrado (`shared/data-generator/inject_malformed.py`):
+
+| Evento | Spark | Flink |
+|---|---|---|
+| Não é JSON, JSON cortado, lista, mensagem vazia ou nula | grava uma linha com **todos os campos nulos** | **descarta**, sem erro nem aviso |
+| Número entre aspas (`"17"`) num campo numérico | campo nulo | **converte** para 17 |
+| Fração num campo inteiro (`1.5`) | campo nulo | **trunca** para 1 |
+| Texto num campo numérico; número acima do `int32`; campo ausente | campo nulo, resto da linha intacto | campo nulo, resto da linha intacto |
+| Campo a mais | ignorado, a linha passa | ignorado, a linha passa |
+
+Nenhum dos dois derruba o job. Uma linha sem `run_id` vai para a **partição
+nula** do destino, cujo nome difere por motor: `run_id=__HIVE_DEFAULT_PARTITION__`
+no Spark e `run_id=__DEFAULT_PARTITION__` no Flink. O mesmo vale para `dt` e `hh`
+quando o `event_ts` é nulo.
+
+**A diferença é declarada e contada.** O `reconcile.py` reporta, em toda execução e
+pelo mesmo método nos dois motores:
+
+| Contagem | Definição |
+|---|---|
+| **Inválidas** | linhas gravadas com **algum campo obrigatório nulo** — qualquer campo do evento menos o `amount`, que a seção 1.1 permite nulo; e o `run_id`, quando a linha está na partição nula |
+| **Nulas** | linhas gravadas com **todos** os campos do evento nulos |
+| **Descartadas** | mensagens que estavam no tópico e não viraram linha: *mensagens recebidas pelo tópico na execução − linhas no destino*, descontadas as duplicatas |
+
+As linhas da partição nula não trazem `run_id`; são atribuídas à execução pelo
+`processed_ts`, com 5 s de folga em cada ponta. As **descartadas** dependem de uma
+anotação por execução com o número de mensagens que o tópico recebeu
+(`<run_id>.topico.json`); sem ela a contagem é reportada como indisponível, nunca
+estimada.
+
+**Numa execução medida as três contagens têm de ser zero.** O gerador só emite
+eventos válidos. Um valor diferente de zero reprova a execução (o `reconcile.py`
+sai com código 1).
+
+**Dois limites, declarados:**
+- Um `amount` trocado por texto vira nulo, e nulo é valor legítimo para o
+  `amount`: esse caso não é contado.
+- A identidade de um evento é (`gen_id`, `seq`). Um `seq` quebrado que o Flink
+  converte pode coincidir com o de outro evento e aparecer como duplicata.
+
 ---
 
 ## 3. Parâmetros do tópico Kafka
@@ -558,8 +614,7 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Tópico e partições | `ecommerce.events.v1`, 24 partições |
 | Gerador e seed | Mesmo binário, mesma seed, mesmo `config.yaml` |
 | Carga | Mesmos níveis, mesma duração, mesmas repetições |
-| Transformações | Mesma limpeza, mesmo broadcast join, mesmo cálculo de `watermark_ts` |
-| Tabela de referência | O mesmo `products.parquet` versionado |
+| Transformações | **Nenhuma dentro do pipeline** (ELT estrito, seção 2.6): os dois carregam os dez campos como chegam, sem limpeza e sem join. O watermark é derivado na análise (2.1). Até a versão 1.7 esta linha previa "mesma limpeza, mesmo broadcast join", e havia uma linha para a tabela de produtos; nenhum dos dois chegou a ser implementado |
 | Particionamento do destino | Derivado de `event_ts`, em UTC (seção 4.1) |
 | Codec do Parquet | `snappy`, declarado explicitamente nos dois (seção 4.4) |
 | Destino | Mesmo formato, mesmo particionamento, mesma política de escrita (sem `repartition`) |
@@ -592,6 +647,7 @@ a igualar o que não deve ser igualado.
 | Nomes dos arquivos `part-*` | Convenção de cada motor. O que precisa casar é a estrutura de diretórios |
 | **Número de arquivos por execução** | É **resultado medido**, não parâmetro a igualar |
 | Retenção do tópico entre fase de aprendizado e medição | Precisa ser igual entre os motores dentro da mesma fase, não entre fases |
+| **Destino de um evento que o motor não consegue ler** | Cada motor faz o que faz por padrão (seção 2.6). Igualar exigiria limpeza dentro do pipeline, que o ELT estrito exclui. É diferença **declarada e contada**, não parâmetro a igualar |
 
 **Sobre o número de arquivos.** É tentador tratá-lo como invariante. Forçá-lo a
 ser igual nos dois motores exigiria um `repartition`, o que violaria a decisão
@@ -616,6 +672,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 1.8 | 11/10/2026 | **§2.6 novo; §5 e §6 alterados.** O pipeline passa a ser declarado **ELT estrito**: carrega, não transforma. Saem das invariantes a "mesma limpeza", o "mesmo broadcast join" e a tabela de produtos, que nunca foram implementados. O tratamento de eventos que o motor não consegue ler **não é igualado**: o Spark grava linha nula, o Flink descarta, e os dois divergem na conversão de tipos (medido em 11/10/2026). A diferença é declarada e passa a ser contada em toda execução — inválidas, nulas e descartadas | **Nenhuma.** Os pipelines não mudam: gravam exatamente o que gravavam. As execuções de 10/10/2026, reconciliadas de novo, dão as mesmas latências, com 0 inválidas e 0 nulas |
 | 1.7 | 10/10/2026 | **§2.3 alterado; §2.2 corrigido.** A unidade de progresso do Flink deixa de ser o arquivo e passa a ser o **checkpoint, reconhecido pelo grupo de arquivos** cujo `ctime` dista até 1 s: em 10/10/2026 os 8 arquivos de 2 dos 13 checkpoints saíram em dois instantes, a 10 ms um do outro, e a regra antiga contava 15 unidades. O `committed_ts` de cada evento continua sendo o `ctime` do próprio arquivo. A exatidão do `ctime` passa de "±8 ms" para a faixa das duas medições (−7..+8 ms e −10..+7 ms). Nenhuma coluna, layout ou parâmetro de execução muda | **Nenhuma.** É regra de análise, sem efeito no que os pipelines gravam. A execução `20261010T213810Z-r100`, reconciliada pelas duas regras, deu latências idênticas (o primeiro checkpoint não estava dividido); só a contagem passou de 15 para 13 |
 | 1.6 | 25/09/2026 | **§2.2 e §2.3 alterados (decisão C2).** O Flink não grava `batch_id`: a unidade de progresso dele é o arquivo. O `committed_ts` passa a ter **origem por motor**: log de progresso no Spark; `ctime` do arquivo no Flink, verificado a ±8 ms do fim do checkpoint. O Spark fica no log porque o `ctime` dele adianta até ~300 ms quando a pasta de destino é nova. Assimetria de instrumento declarada | **Nenhuma.** O Flink ainda não gravava as colunas de medição, e o Spark não muda |
 | 1.5 | 24–25/09/2026 | **§2 alterado:** `processed_ts` passa de `int64` (epoch ms) a **timestamp** nos dois motores: instante em UTC com precisão de ms, gravado como `INT64` em µs **sem a marca de UTC**, idêntico nos dois arquivos (§2.5). Motivo: no Flink não há expressão SQL confiável para o instante em ms como inteiro, e função Python no caminho do dado viola a decisão F2. Sem marca porque o Flink 1.20 não consegue marcar; em µs porque o Spark sem marca só grava em µs. O Flink declara `parquet.utc-timezone=true`, sem o qual o valor depende do fuso da JVM. A conversão para ms passa à análise | **Nenhuma medida.** As execuções de aprendizado do Spark de 24/09/2026 têm a coluna em `int64`; o `reconcile.py` aceita os dois tipos |
