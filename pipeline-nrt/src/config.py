@@ -145,6 +145,27 @@ LOG_PROGRESSO = f"{METRICS_DIR}/spark.progresso.{INICIO_MS}.jsonl"
 GROUP_ID = os.getenv("GROUP_ID", "tcc-nrt-spark")
 
 
+# --- Encerramento (Etapa 8) ----------------------------------------------
+# O pipeline encerra sozinho em duas ocasioes (decisao de 11/10/2026):
+#
+#   1. A FILA ESVAZIOU. Quem decide isso e o arnes, nao o pipeline: so ele sabe
+#      que o gerador terminou, e a fila tambem esta vazia antes de o gerador
+#      comecar. Quando o gerador acabou E o lag zerou, o arnes cria o arquivo
+#      STOP_FILE; o main.py o procura uma vez por segundo e encerra em ordem.
+#      Arquivo, e nao sinal: um sinal chega a JVM e ao Python ao mesmo tempo, e o
+#      encerramento sai sujo e sem codigo de saida util (DecisaoEtapa4.md 5.1).
+#
+#   2. INATIVIDADE. Sem nenhum evento gravado por INACTIVITY_TIMEOUT segundos, o
+#      pipeline encerra por conta propria. E a rede de seguranca: um arnes que
+#      morreu, ou um gerador que nunca subiu, nao deixa o job rodando para sempre.
+#      0 desliga.
+#
+# Sem STOP_FILE configurado, o item 1 nao existe e o pipeline se comporta como
+# antes — para com Ctrl+C. O caminho e o de DENTRO do conteiner (/tcc-data/...).
+STOP_FILE = os.getenv("STOP_FILE", "")
+INACTIVITY_TIMEOUT_S = int(os.getenv("INACTIVITY_TIMEOUT", "3600"))
+
+
 # --- Conector do Kafka ---------------------------------------------------
 # O conector NAO e instalado por pip: o Spark o resolve do Maven em tempo de
 # execucao e guarda em cache no ~/.ivy2.5.2 — o diretorio leva a versao do Ivy
@@ -183,6 +204,8 @@ def resumo() -> str:
         ("checkpoint", CHECKPOINT_DIR),
         ("log progresso", LOG_PROGRESSO),
         ("group.id", GROUP_ID),
+        ("arquivo de parada", STOP_FILE or "(nao configurado)"),
+        ("inatividade", f"{INACTIVITY_TIMEOUT_S} s" if INACTIVITY_TIMEOUT_S else "(desligada)"),
         ("spark", SPARK_VERSION),
         ("conector", KAFKA_CONNECTOR),
     ]

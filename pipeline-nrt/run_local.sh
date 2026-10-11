@@ -50,8 +50,12 @@ cd "$RAIZ"
 # conteiner eles tem valores proprios (/tcc-data/..., kafka:29092), definidos no
 # docker-compose.yml. Repassar os do host apontaria o job para caminhos que nao
 # existem la dentro.
+#
+# STOP_FILE e o caminho de DENTRO do conteiner (/tcc-data/...): a pasta
+# ~/tcc-data do host e montada la com esse nome.
 ARGS=()
-for var in TOPIC STARTING_OFFSETS TRIGGER DRIVER_MEMORY MASTER PARQUET_CODEC GROUP_ID; do
+for var in TOPIC STARTING_OFFSETS TRIGGER DRIVER_MEMORY MASTER PARQUET_CODEC GROUP_ID \
+           STOP_FILE INACTIVITY_TIMEOUT; do
   if [ -n "${!var:-}" ]; then
     ARGS+=(-e "$var=${!var}")
   fi

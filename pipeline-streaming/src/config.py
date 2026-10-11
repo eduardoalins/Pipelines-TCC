@@ -89,6 +89,27 @@ INICIO_MS = int(time.time() * 1000)
 LOG_PROGRESSO = f"{METRICS_DIR}/flink.progresso.{INICIO_MS}.jsonl"
 
 
+# --- Encerramento (RT-6) -----------------------------------------------------
+# As mesmas duas ocasioes do lado do Spark (decisao de 11/10/2026), com as
+# mesmas variaveis e os mesmos codigos de saida:
+#
+#   1. A FILA ESVAZIOU. Quem decide e o arnes: gerador terminado E lag zerado.
+#      Ele cria o arquivo STOP_FILE; o laco do main.py o procura uma vez por
+#      segundo e cancela o job em ordem. Como o Flink commita os offsets no
+#      checkpoint — o mesmo instante em que os arquivos ficam visiveis —, lag
+#      zerado quer dizer que nao ha arquivo em andamento para perder.
+#
+#   2. INATIVIDADE. Sem nenhum evento lido por INACTIVITY_TIMEOUT segundos, o
+#      job e cancelado. 0 desliga. O Flink nao tem lote que diga "gravei N
+#      eventos"; a atividade e lida do contador de registros da fonte, pela REST
+#      API (ver eventos_lidos() no main.py).
+#
+# Sem STOP_FILE configurado, o item 1 nao existe e o job para so com Ctrl+C,
+# como antes. O caminho e o de DENTRO do conteiner (/tcc-data/...).
+STOP_FILE = os.getenv("STOP_FILE", "")
+INACTIVITY_TIMEOUT_S = int(os.getenv("INACTIVITY_TIMEOUT", "3600"))
+
+
 # --- Jars ----------------------------------------------------------------
 # Todos definidos no Dockerfile, que e onde sao baixados e tem o SHA-1
 # conferido. Lidos daqui para que cada versao exista em UM lugar so.
@@ -124,6 +145,8 @@ def resumo() -> str:
         ("intervalo", CHECKPOINT_INTERVAL),
         ("group.id", GROUP_ID),
         ("log progresso", LOG_PROGRESSO),
+        ("arquivo de parada", STOP_FILE or "(nao configurado)"),
+        ("inatividade", f"{INACTIVITY_TIMEOUT_S} s" if INACTIVITY_TIMEOUT_S else "(desligada)"),
         ("jars", ", ".join(os.path.basename(j) for j in JARS)),
     ]
     largura = max(len(k) for k, _ in itens)

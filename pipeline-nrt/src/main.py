@@ -87,6 +87,19 @@ KAFKA_COLS = ["_kafka_partition", "_kafka_offset"]
 # se inscreve em topico nem consome nada. Criado uma vez, no driver.
 _commitador = None
 
+# Instante (relogio monotonico) do ultimo micro-batch que gravou eventos. E o
+# que a regra de inatividade observa (config.INACTIVITY_TIMEOUT_S). Monotonico,
+# e nao de parede: um ajuste do relogio nao pode parecer uma hora de silencio.
+_ultima_atividade = time.monotonic()
+
+# Codigos de saida, para o arnes saber COMO a execucao terminou sem ler a tela:
+#   0    parou a pedido (arquivo de parada)
+#   2    recusou-se a subir (arquivo de parada ja existia)
+#   3    parou por inatividade
+#   130  Ctrl+C — a JVM morre pelo sinal (DecisaoEtapa4.md 5.1)
+SAIDA_RECUSOU = 2
+SAIDA_INATIVIDADE = 3
+
 
 def commitar_offsets(proximos: dict[int, int]) -> bool:
     """Commita no Kafka, sob config.GROUP_ID, o progresso de um micro-batch.
@@ -163,6 +176,8 @@ def escrever_lote(lote_df, batch_id: int) -> None:
     batch_id e gravado de novo. O reconcile.py reporta essas duplicatas; nao as
     remove.
     """
+    global _ultima_atividade
+
     # inicio_ts: o primeiro dos tres instantes do batch, tomado ao entrar aqui.
     # Com ele a latencia se decompoe nas tres parcelas do planoNRT3 §3.1:
     #   espera no trigger = inicio_ts    - event_ts
@@ -240,16 +255,27 @@ def escrever_lote(lote_df, batch_id: int) -> None:
               f"processamento={processed_ts - inicio_ts} ms  "
               f"escrita={committed_ts - processed_ts} ms  "
               f"particoes={len(proximos)}")
+        _ultima_atividade = time.monotonic()
     finally:
         lote_df.unpersist()
 
 
 def main() -> int:
+    global _ultima_atividade
+
     print("\n=== Etapa 6 — Spark gravando Parquet com medicao ===")
     print(config.resumo())
     print()
     inspecionar_checkpoint(config.CHECKPOINT_DIR)
     print()
+
+    # Um arquivo de parada esquecido de uma execucao anterior faria o job
+    # encerrar no primeiro segundo, sem erro e sem ter processado nada. Recusar
+    # a subida torna isso impossivel de nao ver.
+    if config.STOP_FILE and Path(config.STOP_FILE).exists():
+        print(f"ERRO: o arquivo de parada ja existe: {config.STOP_FILE}", file=sys.stderr)
+        print("      Apague-o antes de subir o pipeline.", file=sys.stderr)
+        return SAIDA_RECUSOU
 
     spark = (
         SparkSession.builder.appName("nrt-etapa6-medicao")
@@ -321,6 +347,10 @@ def main() -> int:
     print(f">> consulta no ar. Um micro-batch a cada {config.TRIGGER}.")
     print(f">> destino: {config.DIR_EVENTOS}")
     print(">> Spark UI: http://localhost:4040  (aba Structured Streaming)")
+    if config.STOP_FILE:
+        print(f">> para sozinho quando existir o arquivo {config.STOP_FILE}")
+    if config.INACTIVITY_TIMEOUT_S:
+        print(f">> para sozinho apos {config.INACTIVITY_TIMEOUT_S} s sem gravar eventos")
     print(">> Ctrl+C para parar (sai com 130, ver DecisaoEtapa4.md 5.1).\n")
 
     # --- Encerramento ----------------------------------------------------
@@ -330,20 +360,39 @@ def main() -> int:
     #
     # Nao resolve o codigo de saida: o Ctrl+C vai para o grupo de processos e a
     # JVM em primeiro plano encerra por ele, entao o processo sai com 130. Um
-    # codigo com significado exige o job ter condicao de parada propria —
-    # pendencia da Etapa 8.
+    # codigo com significado exige o job ter condicao de parada propria — as
+    # duas da Etapa 8, abaixo (ver config.py, "Encerramento").
     encerrar = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: encerrar.set())
 
+    # A contagem da inatividade comeca com a consulta no ar, nao na subida da JVM.
+    _ultima_atividade = time.monotonic()
+
+    motivo = None
     while consulta.isActive and not encerrar.is_set():
         consulta.awaitTermination(1)
+        if config.STOP_FILE and Path(config.STOP_FILE).exists():
+            motivo = "pedido"
+            break
+        parado_ha = time.monotonic() - _ultima_atividade
+        if config.INACTIVITY_TIMEOUT_S and parado_ha > config.INACTIVITY_TIMEOUT_S:
+            motivo = "inatividade"
+            break
 
+    if motivo == "pedido":
+        print(f"\n>> arquivo de parada encontrado: {config.STOP_FILE}")
+    elif motivo == "inatividade":
+        print(f"\n>> {int(parado_ha)} s sem gravar eventos: encerrando por inatividade")
+
+    # Aqui e o PYTHON que pede a parada, com a JVM inteira — por isso o
+    # encerramento e limpo. O arnes so cria o arquivo com a fila vazia, entao nao
+    # ha micro-batch em andamento para interromper.
     print("\n>> parando a consulta...")
     consulta.stop()
     spark.stop()
     print(">> encerrado.")
 
-    return 0
+    return SAIDA_INATIVIDADE if motivo == "inatividade" else 0
 
 
 if __name__ == "__main__":

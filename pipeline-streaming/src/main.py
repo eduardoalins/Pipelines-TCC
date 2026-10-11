@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -36,6 +37,19 @@ import config  # noqa: E402
 import esquema  # noqa: E402
 
 ESTADOS_FINAIS = ("FINISHED", "FAILED", "CANCELED")
+
+# Codigos de saida, os mesmos do pipeline do Spark, para o arnes saber COMO a
+# execucao terminou sem ler a tela:
+#   0    parou a pedido (arquivo de parada)
+#   2    recusou-se a subir (arquivo de parada ja existia)
+#   3    parou por inatividade
+#   130  Ctrl+C ou docker stop
+SAIDA_RECUSOU = 2
+SAIDA_INATIVIDADE = 3
+
+# De quantos em quantos segundos o contador de eventos e consultado. A REST API
+# so atualiza as metricas a cada ~10 s; perguntar mais vezes nao adianta.
+INTERVALO_ATIVIDADE_S = 5
 
 
 def ultimo_checkpoint(raiz: str) -> Path | None:
@@ -72,6 +86,51 @@ def checkpoints_novos(job_id: str, vistos: set[int]) -> list[dict]:
     return sorted(novos, key=lambda h: h["id"])
 
 
+def eventos_lidos(job_id: str, onde: dict) -> int | None:
+    """Quantos registros a fonte ja leu do Kafka — ou None, se nao der para saber.
+
+    E o que a regra de inatividade observa. O Flink nao tem lote: nao existe um
+    ponto do codigo que diga "gravei N eventos". O que existe e o contador
+    numRecordsIn do operador de fonte, somado entre as subtarefas.
+
+    Verificado em 11/10/2026, com 1000 eventos: o contador chegou a exatamente
+    1000. Duas particularidades, as duas vistas na sonda:
+      - nos primeiros ~10 s do job a lista de metricas vem vazia;
+      - o valor chega com ate ~10 s de atraso (a REST API atualiza em lotes).
+    Para uma regra de uma hora, nenhuma das duas importa.
+
+    Os contadores do VERTICE (read-records / write-records) NAO servem: fonte,
+    projecao e escritor sao encadeados num vertice so, e o que sai dele sao as
+    mensagens de commit dos arquivos, nao os eventos.
+
+    `onde` guarda o endereco do contador depois de descoberto. O nome contem o
+    da tabela ("Source__eventos[1].numRecordsIn"), entao e procurado pelo
+    formato, nao escrito a mao.
+    """
+    base = f"http://localhost:{config.REST_PORT}/jobs/{job_id}"
+    try:
+        if "url" not in onde:
+            with urllib.request.urlopen(base, timeout=2) as r:
+                vertices = json.loads(r.read())["vertices"]
+            for v in vertices:
+                metricas = f"{base}/vertices/{v['id']}/subtasks/metrics"
+                with urllib.request.urlopen(metricas, timeout=2) as r:
+                    nomes = [m["id"] for m in json.loads(r.read())]
+                fonte = [n for n in nomes
+                         if n.startswith("Source") and n.endswith(".numRecordsIn")]
+                if fonte:
+                    nome = urllib.parse.quote(fonte[0], safe="")
+                    onde["url"] = f"{metricas}?get={nome}&agg=sum"
+                    break
+            else:
+                return None
+        with urllib.request.urlopen(onde["url"], timeout=2) as r:
+            dados = json.loads(r.read())
+        return int(dados[0]["sum"]) if dados else None
+    except Exception:
+        return None
+
+
 def registrar_progresso(linha: dict) -> None:
     Path(config.METRICS_DIR).mkdir(parents=True, exist_ok=True)
     with open(config.LOG_PROGRESSO, "a", encoding="utf-8") as f:
@@ -82,6 +141,14 @@ def main() -> int:
     print("\n=== Etapa RT-4 — Flink gravando Parquet com medicao ===")
     print(config.resumo())
     print()
+
+    # Um arquivo de parada esquecido de uma execucao anterior faria o job
+    # encerrar no primeiro segundo, sem erro e sem ter processado nada. Recusar
+    # a subida torna isso impossivel de nao ver.
+    if config.STOP_FILE and Path(config.STOP_FILE).exists():
+        print(f"ERRO: o arquivo de parada ja existe: {config.STOP_FILE}", file=sys.stderr)
+        print("      Apague-o antes de subir o pipeline.", file=sys.stderr)
+        return SAIDA_RECUSOU
 
     # A configuracao e passada NA CRIACAO do ambiente, e nao depois: a porta da
     # REST API e do cluster, nao do job, e so vale se existir antes de o
@@ -217,6 +284,10 @@ def main() -> int:
 
     print(f">> job no ar ({job_id}). Checkpoint a cada {config.CHECKPOINT_INTERVAL}.")
     print(f">> destino: {config.DIR_EVENTOS}")
+    if config.STOP_FILE:
+        print(f">> para sozinho quando existir o arquivo {config.STOP_FILE}")
+    if config.INACTIVITY_TIMEOUT_S:
+        print(f">> para sozinho apos {config.INACTIVITY_TIMEOUT_S} s sem ler eventos")
     print(">> Ctrl+C para parar.\n")
 
     # --- Encerramento e sinal de vida -----------------------------------
@@ -231,12 +302,39 @@ def main() -> int:
     signal.signal(signal.SIGINT, lambda *_: encerrar.set())
     signal.signal(signal.SIGTERM, lambda *_: encerrar.set())
 
+    # As duas paradas da RT-6 (ver config.py, "Encerramento"). O relogio e o
+    # monotonico: um ajuste da hora nao pode parecer uma hora de silencio.
+    onde_contador: dict = {}
+    lidos_antes = 0
+    ultima_atividade = time.monotonic()
+    proxima_consulta = 0.0
+    motivo = None
+
     vistos: set[int] = set()
     estado = ""
     while not encerrar.is_set():
         estado = str(job.get_job_status().result()).upper()
         if any(final in estado for final in ESTADOS_FINAIS):
             break
+
+        if config.STOP_FILE and Path(config.STOP_FILE).exists():
+            motivo = "pedido"
+            break
+        if config.INACTIVITY_TIMEOUT_S:
+            agora = time.monotonic()
+            if agora >= proxima_consulta:
+                proxima_consulta = agora + INTERVALO_ATIVIDADE_S
+                lidos = eventos_lidos(job_id, onde_contador)
+                # Sem leitura nao ha como AFIRMAR inatividade: o contador
+                # ilegivel conta como atividade, para o job nunca ser cancelado
+                # por um defeito da consulta.
+                if lidos is None or lidos > lidos_antes:
+                    ultima_atividade = agora
+                    lidos_antes = lidos if lidos is not None else lidos_antes
+            if agora - ultima_atividade > config.INACTIVITY_TIMEOUT_S:
+                motivo = "inatividade"
+                break
+
         for ck in checkpoints_novos(job_id, vistos):
             vistos.add(ck["id"])
             registrar_progresso({
@@ -249,6 +347,21 @@ def main() -> int:
                   f"duracao={ck['latest_ack_timestamp'] - ck['trigger_timestamp']} ms  "
                   f"estado={ck.get('state_size', 0)} bytes")
         time.sleep(1)
+
+    if motivo == "pedido":
+        print(f"\n>> arquivo de parada encontrado: {config.STOP_FILE}")
+        print(">> cancelando o job...")
+        job.cancel().result()
+        print(">> encerrado.")
+        return 0
+
+    if motivo == "inatividade":
+        print(f"\n>> {int(time.monotonic() - ultima_atividade)} s sem ler eventos: "
+              "encerrando por inatividade")
+        print(">> cancelando o job...")
+        job.cancel().result()
+        print(">> encerrado.")
+        return SAIDA_INATIVIDADE
 
     if encerrar.is_set():
         print("\n>> cancelando o job...")
