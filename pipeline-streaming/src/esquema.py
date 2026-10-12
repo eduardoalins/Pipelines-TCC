@@ -2,9 +2,20 @@
 O schema do evento, na forma que a Table API do Flink entende.
 
 Os campos NAO estao escritos aqui: vem de shared/schema/evento.json, a mesma
-fonte unica que o pipeline-nrt/src/esquema.py le (decisao da Etapa RT-3). Este
-arquivo so traduz os tipos logicos de la para os tipos SQL do Flink. Assim o
-schema do Flink e o do Spark nao tem como divergir.
+fonte unica que o pipeline-nrt/src/esquema.py le (decisao da Etapa RT-3). Assim
+o schema do Flink e o do Spark nao tem como divergir.
+
+OS DEZ CAMPOS SAO CARREGADOS COMO TEXTO (CONTRATO.md 2.0). O pipeline nao
+interpreta tipo: `"user_id": 17` e `"user_id": "17"` chegam ao destino como o
+texto 17; `"seq": "abc"` chega como abc. Quem converte para o tipo do contrato —
+e decide o que fazer com o que nao converte — e o Transform, DEPOIS do Load. Os
+tipos do evento.json continuam sendo o contrato do evento; este arquivo so os
+confere, nao os aplica.
+
+Por que: carregando tipado, o leitor de JSON do Flink convertia `"17"` em 17 e
+truncava 1.5 para 1, e o Spark anulava os dois (medido em 11/10/2026). Como
+texto, os dois gravam o MESMO para tudo o que o gerador produz (verificado por
+sonda, 3000 eventos e os 8 tipos de malformado).
 
 Onde o Spark monta um StructType, o Flink recebe as colunas como texto, dentro
 do CREATE TABLE — dai colunas_ddl() devolver uma string.
@@ -21,22 +32,21 @@ from pathlib import Path
 # conteiner, entao o caminho funciona dentro e fora dele)
 ARQUIVO_SCHEMA = Path(__file__).resolve().parents[2] / "shared" / "schema" / "evento.json"
 
-# Tipos logicos do evento.json -> tipos SQL do Flink. Equivalencia com o Spark:
-#
-#   string  -> STRING   (Spark: StringType)
-#   int32   -> INT      (Spark: IntegerType)
-#   int64   -> BIGINT   (Spark: LongType)
-#   float64 -> DOUBLE   (Spark: DoubleType)
-TIPOS = {
-    "string": "STRING",
-    "int32": "INT",
-    "int64": "BIGINT",
-    "float64": "DOUBLE",
-}
+# Os tipos logicos que o contrato conhece. Nenhum e aplicado aqui — toda coluna
+# e STRING —, mas um tipo desconhecido no evento.json FALHA, como no lado do
+# Spark: quem converte depois do Load nao pode encontrar surpresa.
+TIPOS_CONHECIDOS = ("string", "int32", "int64", "float64")
+
+_schema = json.loads(ARQUIVO_SCHEMA.read_text(encoding="utf-8"))
+
+# De qual campo saem as pastas dt= e hh=, e que texto e aceito como instante. A
+# mesma expressao regular vale no Spark — ver o evento.json.
+CAMPO_DE_PARTICAO = _schema["particionamento"]["campo"]
+PARTICAO_VALIDA = _schema["particionamento"]["valido"]
 
 
 def _campos() -> list[dict]:
-    return json.loads(ARQUIVO_SCHEMA.read_text(encoding="utf-8"))["campos"]
+    return _schema["campos"]
 
 
 def nomes() -> list[str]:
@@ -47,18 +57,15 @@ def nomes() -> list[str]:
 def colunas_ddl() -> str:
     """As colunas para dentro de um CREATE TABLE, uma por linha.
 
-    Sem NOT NULL: todas anulaveis, como no Spark. Um campo malformado vira NULL
-    em vez de derrubar o job.
+    Todas STRING e sem NOT NULL: anulaveis, como no Spark. Um campo ausente vira
+    NULL.
     """
     linhas = []
     for campo in _campos():
-        tipo = campo["tipo"]
-        # Tipo desconhecido FALHA em vez de virar um padrao qualquer: um palpite
-        # aqui produziria um schema diferente do Spark, em silencio.
-        if tipo not in TIPOS:
+        if campo["tipo"] not in TIPOS_CONHECIDOS:
             raise ValueError(
-                f"tipo '{tipo}' do campo '{campo['nome']}' em {ARQUIVO_SCHEMA} "
-                f"nao tem traducao para o Flink. Tipos conhecidos: {sorted(TIPOS)}"
+                f"tipo '{campo['tipo']}' do campo '{campo['nome']}' em {ARQUIVO_SCHEMA} "
+                f"nao e conhecido. Tipos conhecidos: {sorted(TIPOS_CONHECIDOS)}"
             )
-        linhas.append(f"`{campo['nome']}` {TIPOS[tipo]}")
+        linhas.append(f"`{campo['nome']}` STRING")
     return ",\n".join(linhas)

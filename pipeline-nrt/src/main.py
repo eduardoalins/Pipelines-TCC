@@ -36,6 +36,7 @@ from pyspark.sql.functions import (
     from_json,
     lit,
     timestamp_millis,
+    when,
 )
 from pyspark.sql.functions import max as max_
 
@@ -309,11 +310,24 @@ def main() -> int:
     )
 
     # --- Interpretacao ---------------------------------------------------
-    # Primeiro from_json do projeto. Ate a Etapa 4 o value era texto.
+    # O from_json SEPARA os dez campos, e so isso: todos saem como TEXTO
+    # (CONTRATO.md 2.0; ver esquema.py). Nenhum tipo e interpretado aqui — a
+    # conversao e o tratamento do que nao converte ficam para depois do Load.
     #
     # partition e offset do Kafka seguem junto ate o foreachBatch (Etapa 6): e
     # deles que sai o progresso commitado para medir o lag. Saem antes da
     # escrita.
+    #
+    # dt e hh (CONTRATO.md 4.1) sao a UNICA leitura de valor que o pipeline faz:
+    # o layout do destino sai de event_ts. So vira data o texto que e um
+    # inteiro de 1 a 13 digitos — a mesma expressao regular do Flink, vinda do
+    # evento.json. O `when` nao e enfeite: o Spark 4 roda em modo ANSI, e
+    # converter "ontem" para numero sem ele DERRUBARIA a consulta. O que nao
+    # casa fica sem data e vai para a particao nula, como um event_ts ausente.
+    instante_ms = when(
+        col(esquema.CAMPO_DE_PARTICAO).rlike(esquema.PARTICAO_VALIDA),
+        col(esquema.CAMPO_DE_PARTICAO).cast("long"),
+    )
     eventos = (
         bruto.select(
             col("partition").alias("_kafka_partition"),
@@ -321,9 +335,9 @@ def main() -> int:
             from_json(col("value").cast("string"), esquema.EVENTO).alias("e"),
         )
         .select(*KAFKA_COLS, "e.*")
-        # event_ts e epoch em milissegundos; timestamp_millis converte sem
-        # passar por divisao em ponto flutuante.
-        .withColumn("_ts", timestamp_millis(col("event_ts")))
+        # epoch em milissegundos; timestamp_millis converte sem passar por
+        # divisao em ponto flutuante.
+        .withColumn("_ts", timestamp_millis(instante_ms))
         .withColumn("dt", date_format(col("_ts"), "yyyy-MM-dd"))
         .withColumn("hh", date_format(col("_ts"), "HH"))
         .drop("_ts")

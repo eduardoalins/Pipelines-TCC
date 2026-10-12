@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 1.9 — 12/10/2026**
+**Versão 2.0 — 12/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -42,9 +42,14 @@ alteração é registrada na seção 8, com data, motivo e execuções invalidad
 }
 ```
 
+**Estes são os tipos do evento, não os do destino.** Desde a versão 2.0 os
+pipelines carregam os dez campos como **texto**, e a conversão para os tipos acima
+acontece depois do Load (seção 2.7).
+
 **Forma executável: `shared/schema/evento.json`.** É a fonte única deste schema
-desde 21/09/2026. Spark e Flink leem o arquivo e montam a forma nativa de cada um,
-de modo que as duas definições **não têm como divergir**. Mudar um nome, um tipo
+desde 21/09/2026. Spark e Flink leem o arquivo — os nomes, a ordem e a regra de
+particionamento —, de modo que as duas definições **não têm como divergir**. A
+conversão de tipos, depois do Load, lê os tipos do mesmo arquivo. Mudar um nome, um tipo
 ou a ordem dos campos exige mudar o arquivo **e** esta seção, com as consequências
 da regra de alteração deste contrato.
 
@@ -347,30 +352,38 @@ trânsito, que é a marca do ETL. A transformação ocorre no destino, é a mesm
 os dois motores e está **fora da comparação**. O que se compara é o **E** e o
 **L**, onde os motores diferem.
 
-**Consequência: um evento que o motor não consegue ler não é tratado de forma
-igual.** Cada motor faz o que faz por padrão, e os dois não foram igualados —
-igualar exigiria limpeza dentro do pipeline. Medido em 11/10/2026, com 14 tipos de
-evento quebrado (`shared/data-generator/inject_malformed.py`):
+**O pipeline também não decide o que é válido (versão 2.0).** Os dez campos são
+carregados como texto, do jeito que vieram (seção 2.7). Um campo com o tipo errado
+— texto onde se esperava número, fração num inteiro, número entre aspas — chega ao
+destino **como veio**, nos dois motores. Converter para o tipo do contrato e
+decidir o que fazer com o que não converte é trabalho do **Transform**, depois do
+Load.
 
-| Evento | Spark | Flink |
-|---|---|---|
-| Não é JSON, JSON cortado, lista, mensagem vazia ou nula | grava uma linha com **todos os campos nulos** | **descarta**, sem erro nem aviso |
-| Número entre aspas (`"17"`) num campo numérico | campo nulo | **converte** para 17 |
-| Fração num campo inteiro (`1.5`) | campo nulo | **trunca** para 1 |
-| Texto num campo numérico; número acima do `int32`; campo ausente | campo nulo, resto da linha intacto | campo nulo, resto da linha intacto |
-| Campo a mais | ignorado, a linha passa | ignorado, a linha passa |
+**O que isso substitui.** Até a versão 1.9 os campos eram carregados já tipados,
+e cada motor decidia sozinho o que fazer com um valor de tipo errado — e os dois
+decidiam diferente (medido em 11/10/2026): o Spark anulava `"17"` num campo
+numérico e o Flink convertia para 17; o Spark anulava `1.5` num campo inteiro e o
+Flink truncava para 1. A diferença era declarada e contada. Com a carga em texto
+ela deixou de existir.
 
-Nenhum dos dois derruba o job. Uma linha sem `run_id` vai para a **partição
-nula** do destino, cujo nome difere por motor: `run_id=__HIVE_DEFAULT_PARTITION__`
-no Spark e `run_id=__DEFAULT_PARTITION__` no Flink. O mesmo vale para `dt` e `hh`
-quando o `event_ts` é nulo.
+**A diferença que sobra: a mensagem que não é JSON.** Texto solto, JSON cortado,
+lista, mensagem vazia ou nula: o Spark grava uma linha com **todos os campos
+nulos**, e o Flink **descarta** a mensagem, sem erro nem aviso (medido em
+11/10/2026 e de novo em 12/10/2026). Nenhum dos dois derruba o job. **O gerador
+não envia mensagens assim** (decisão de 12/10/2026), e por isso a diferença não
+aparece nas rodadas. Ela não foi igualada: fica declarada aqui.
 
-**A diferença é declarada e contada.** O `reconcile.py` reporta, em toda execução e
-pelo mesmo método nos dois motores:
+Uma linha sem `run_id` vai para a **partição nula** do destino, cujo nome difere
+por motor: `run_id=__HIVE_DEFAULT_PARTITION__` no Spark e
+`run_id=__DEFAULT_PARTITION__` no Flink. O mesmo vale para `dt` e `hh` quando o
+`event_ts` não é um instante (seção 4.1).
+
+**O que é contado.** O `reconcile.py` reporta, em toda execução e pelo mesmo
+método nos dois motores, **depois de converter** os campos (seção 2.7):
 
 | Contagem | Definição |
 |---|---|
-| **Inválidas** | linhas gravadas com **algum campo obrigatório nulo** — qualquer campo do evento menos o `amount`, que a seção 1.1 permite nulo; e o `run_id`, quando a linha está na partição nula |
+| **Inválidas** | linhas gravadas com **algum campo obrigatório nulo depois da conversão** — porque não veio, ou porque veio um texto que não converte para o tipo do contrato. Obrigatório é qualquer campo do evento menos o `amount`, que a seção 1.1 permite nulo; e o `run_id`, quando a linha está na partição nula |
 | **Nulas** | linhas gravadas com **todos** os campos do evento nulos |
 | **Descartadas** | mensagens que estavam no tópico e não viraram linha: *mensagens recebidas pelo tópico na execução − linhas no destino*, descontadas as duplicatas |
 
@@ -380,29 +393,107 @@ anotação por execução com o número de mensagens que o tópico recebeu
 (`<run_id>.topico.json`); sem ela a contagem é reportada como indisponível, nunca
 estimada.
 
+Com a carga em texto, **nulas e descartadas só aparecem com mensagens que não são
+JSON**: numa rodada do benchmark as duas têm de dar zero nos dois motores, e as
+**inválidas têm de dar o mesmo número** nos dois.
+
 **As três contagens são informação, e nunca reprovam a execução (versão 1.9,
 decisão de 11/10/2026).** O que reprova é **perda ou duplicata entre os eventos
-válidos** — é o que faz o `reconcile.py` sair com código 1. Até a versão 1.8 um
-valor diferente de zero nas três contagens também reprovava, porque o gerador só
-emitia eventos válidos. Isso mudou:
+válidos** — é o que faz o `reconcile.py` sair com código 1.
 
 **No benchmark, 4 das 10 rodadas de cada combinação levam eventos malformados de
 propósito** — as rodadas 2, 5, 7 e 10, as mesmas para os dois motores e para todas
 as combinações. Nelas, **1% das mensagens** é malformada: o próprio gerador as
 emite (`MALFORMED_RATE`), **no lugar** de eventos válidos, a intervalos fixos, com
-os 13 tipos de `shared/data-generator/malformed.py` em rodízio. Os malformados que
-ainda são JSON levam `gen_id` 99, para se distinguirem dos eventos válidos
-(`gen_id` 0), que são os que têm manifesto e sobre os quais se contam as perdas.
+os **8 tipos** de `shared/data-generator/malformed.py` em rodízio. Todos são JSON
+válido: um objeto com um campo de tipo errado, ou sem um campo.
 
-As três contagens passam a ser **resultado**: são o registro do que cada motor fez
-com os malformados. As médias e os desvios padrão de uma combinação são
-calculados sobre as 10 rodadas, sem separar as que levaram malformados.
+| Tipo | O que vai no evento | O que os dois motores gravam |
+|---|---|---|
+| `texto_em_seq` | `"seq": "abc"` | `abc` |
+| `numero_como_texto` | `"user_id": "17"` | `17` |
+| `fracao_em_inteiro` | `"seq": 900000.5` | `900000.5` |
+| `estouro_int32` | `"user_id": 9999999999` | `9999999999` |
+| `texto_em_amount` | `"amount": "caro"` | `caro` |
+| `texto_em_event_ts` | `"event_ts": "ontem"` | `ontem`, na pasta sem data |
+| `sem_seq` | o campo `seq` não vem | nulo |
+| `sem_run_id` | o campo `run_id` não vem | nulo, na partição nula |
+
+Até a versão 1.9 eram 13 tipos; saíram os cinco que não são JSON. Os malformados
+levam `gen_id` 99, para se distinguirem dos eventos válidos (`gen_id` 0), que são
+os que têm manifesto e sobre os quais se contam as perdas.
+
+As médias e os desvios padrão de uma combinação são calculados sobre as 10
+rodadas, sem separar as que levaram malformados.
 
 **Dois limites, declarados:**
-- Um `amount` trocado por texto vira nulo, e nulo é valor legítimo para o
-  `amount`: esse caso não é contado.
-- A identidade de um evento é (`gen_id`, `seq`). Um `seq` quebrado que o Flink
-  converte pode coincidir com o de outro evento e aparecer como duplicata.
+- Um `amount` que não converte **não** entra nas inválidas: nulo é valor legítimo
+  para o `amount`. O `reconcile.py` o mostra à parte, na linha "texto que não
+  converte".
+- `"user_id": "17"` **não** é inválido: o texto `17` converte. É o caso que o
+  Transform conserta sozinho.
+
+### 2.7 Os dez campos são carregados como texto (versão 2.0, 12/10/2026)
+
+**Decisão**, do autor com a orientação. Os dois pipelines carregam os dez campos
+do evento como **texto**. Nenhum tipo é interpretado antes do Load. O tratamento
+dos eventos malformados — a conversão para o tipo do contrato e o que fazer com o
+que não converte — fica para o **Transform**, depois do Load, igual para os dois
+motores e fora da comparação.
+
+**Por quê.** Carregando tipado, quem decidia o que era um valor válido era o
+leitor de JSON de cada motor, e os dois decidiam diferente (seção 2.6). Igualar
+isso dentro do pipeline era possível — verificado por sonda em 12/10/2026 —, mas
+obrigava o Flink a consultar o JSON uma vez por campo, a cada evento, onde hoje
+ele lê a mensagem uma vez. Carregando texto, nenhum motor decide: os dois gravam
+o que veio, e a regra de conversão passa a ser uma só, aplicada depois.
+
+**Como cada motor faz.**
+
+| | Spark | Flink |
+|---|---|---|
+| Leitura | `from_json` com os dez campos declarados `StringType` | `'format' = 'json'` com as dez colunas declaradas `STRING` |
+| No Parquet | dez colunas de texto | dez colunas de texto |
+| Campo ausente ou `null` | nulo | nulo |
+
+**O que foi verificado (12/10/2026).**
+- Por sonda, com 3.000 eventos válidos do gerador: o texto gravado é **idêntico
+  nos dois motores e idêntico ao enviado**, nos dez campos — inclusive o `amount`,
+  de uma e de duas casas decimais.
+- Pelas rodadas 1 e 2 do script de rodada, nos dois motores, com o destino
+  comparado campo a campo: 6.000 linhas de cada lado, **nenhuma diferença**; na
+  rodada 2, as mesmas 45 inválidas, 0 nulas e 0 descartadas.
+
+**Limites, medidos em casos que o gerador não produz:**
+- **Número decimal escrito de forma não canônica.** O Flink grava o texto como
+  veio (`49.90`, `1.5e3`); o Spark reescreve o número (`49.9`, `1500.0`), e passa
+  para notação científica a partir de 10 milhões (`1.23456789E7`). O **valor** é o
+  mesmo depois de convertido; o texto difere. O gerador escreve o `amount` com no
+  máximo duas casas, sem zero à direita, entre 5 e 500.
+- **Chave repetida no JSON.** O Flink fica com a primeira ocorrência, o Spark com
+  a última.
+- Inteiros saem iguais, até com 20 dígitos. Um objeto ou uma lista num campo vira
+  o próprio JSON em texto, nos dois.
+
+**A conversão, depois do Load.** Hoje é feita pelo `reconcile.py`, ao ler o
+destino, com uma regra provisória e sem conserto:
+
+| Tipo do contrato | Converte quando o texto é | Senão |
+|---|---|---|
+| inteiro (`int32`, `int64`) | só dígitos, com sinal opcional, e cabe no tipo | nulo |
+| decimal (`float64`) | um número, por extenso ou em notação científica | nulo |
+| texto | — fica como veio | — |
+
+Nada é arredondado, truncado ou adivinhado. O lugar definitivo dessa regra é um
+**módulo de Transform** separado, a escrever depois da Etapa 9, onde também se
+decide o que fazer com cada tipo que não converte.
+
+**Consequência declarada: o tamanho do destino muda.** Número guardado como texto
+ocupa diferente. Numa rodada de 6.000 eventos: 287,9 bytes por evento no Spark
+(eram ~282) e 147,9 no Flink (eram ~144).
+
+**Uma exceção, e só uma: o `event_ts` é lido para montar as pastas** `dt=` e
+`hh=` (seção 4.1).
 
 ---
 
@@ -519,6 +610,15 @@ diretórios diferentes na máquina local (`America/Recife`) e na nuvem
 **Preço da escolha:** um micro-batch que cruze a virada de hora escreve em dois
 diretórios em vez de um.
 
+**Que texto vale como instante (versão 2.0).** O `event_ts` chega como texto
+(seção 2.7), e montar as pastas é a única leitura de valor que o pipeline faz. Só
+vira data o texto que é um **inteiro de 1 a 13 dígitos**, e nada mais — 13 dígitos
+de milissegundos vão até o ano 2286. Qualquer outro (`ontem`, um número com
+fração, com sinal, com espaço ou com mais dígitos) deixa a linha **sem data**, na
+partição nula de `dt` e `hh`. A regra é uma expressão regular escrita **uma vez**,
+no `shared/schema/evento.json`, e aplicada igual pelos dois motores. Sem ela, um
+`event_ts` que não é número derrubaria o Spark, que roda em modo ANSI.
+
 ### 4.2 `<base>`
 
 | Ambiente | Spark (NRT) | Flink (Streaming) |
@@ -631,6 +731,7 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Invariante | Valor fixado |
 |---|---|
 | Schema do evento | Seção 1.1, sem alteração |
+| Carga dos campos | Os dez campos como **texto**, sem interpretar tipo (seção 2.7) |
 | Chave da mensagem | `user_id`, representação decimal em UTF-8 (seção 1.3) |
 | Distribuição de `user_id` | Uniforme em [1, 2000], pela seed da rodada (seções 1.4 e 5.1) |
 | Colunas de saída | Seção 2. `processed_ts` idêntica nos dois (2.5); `batch_id` só no Spark — no Flink a unidade de progresso é o checkpoint, reconhecido pelo grupo de arquivos que ficam visíveis juntos (2.3). `committed_ts` com origem por motor, declarada (2.2) |
@@ -639,8 +740,8 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Gerador e seed | Mesmo binário, mesmo `config.yaml`, e **a mesma seed na mesma rodada**: a rodada N do Spark e a do Flink recebem os mesmos eventos (seção 5.1) |
 | Carga | Mesmos níveis, mesma duração, mesmas 10 rodadas por combinação, com malformados nas mesmas quatro (seções 2.6 e 5.1) |
 | Estado inicial de cada rodada | Tópico recriado e vazio, checkpoint do motor apagado, leitura desde o início do tópico (seção 5.2) |
-| Transformações | **Nenhuma dentro do pipeline** (ELT estrito, seção 2.6): os dois carregam os dez campos como chegam, sem limpeza e sem join. O watermark é derivado na análise (2.1). Até a versão 1.7 esta linha previa "mesma limpeza, mesmo broadcast join", e havia uma linha para a tabela de produtos; nenhum dos dois chegou a ser implementado |
-| Particionamento do destino | Derivado de `event_ts`, em UTC (seção 4.1) |
+| Transformações | **Nenhuma dentro do pipeline** (ELT estrito, seção 2.6): os dois carregam os dez campos como chegam, **em texto** (seção 2.7), sem limpeza e sem join. A conversão para os tipos do contrato é depois do Load, pela mesma regra para os dois. O watermark é derivado na análise (2.1). Até a versão 1.7 esta linha previa "mesma limpeza, mesmo broadcast join", e havia uma linha para a tabela de produtos; nenhum dos dois chegou a ser implementado |
+| Particionamento do destino | Derivado de `event_ts`, em UTC, pela mesma regra do que vale como instante (seção 4.1) |
 | Codec do Parquet | `snappy`, declarado explicitamente nos dois (seção 4.4) |
 | Destino | Mesmo formato, mesmo particionamento, mesma política de escrita (sem `repartition`) |
 | Definições de métrica | planoNRT3 seção 3, sem alteração |
@@ -713,7 +814,8 @@ a igualar o que não deve ser igualado.
 | Nomes dos arquivos `part-*` | Convenção de cada motor. O que precisa casar é a estrutura de diretórios |
 | **Número de arquivos por execução** | É **resultado medido**, não parâmetro a igualar |
 | Retenção do tópico | É a mesma para os dois motores (168 h) e não age numa rodada: o tópico é recriado no começo de cada uma (seção 3.1) |
-| **Destino de um evento que o motor não consegue ler** | Cada motor faz o que faz por padrão (seção 2.6). Igualar exigiria limpeza dentro do pipeline, que o ELT estrito exclui. É diferença **declarada e contada**, não parâmetro a igualar |
+| **Destino de uma mensagem que não é JSON** | O Spark grava uma linha nula e o Flink descarta (seção 2.6). O gerador não envia mensagens assim; a diferença fica **declarada**, não foi igualada. Até a versão 1.9 esta linha cobria também os campos de tipo errado — que, com a carga em texto, os dois motores passaram a gravar igual |
+| O **texto** de um número decimal escrito de forma incomum | O Spark reescreve o número, o Flink guarda como veio (seção 2.7). O valor convertido é o mesmo, e o gerador não produz esses casos |
 
 **Sobre o número de arquivos.** É tentador tratá-lo como invariante. Forçá-lo a
 ser igual nos dois motores exigiria um `repartition`, o que violaria a decisão
@@ -738,6 +840,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 2.0 | 12/10/2026 | **§2.7 novo; §2.6, §4.1, §5 e §6 alterados; §1.1 ajustado.** Os dois pipelines passam a **carregar os dez campos como texto**, sem interpretar tipo: decisão do autor com a orientação. O tratamento dos eventos malformados sai do pipeline e vai para o Transform, depois do Load; a conversão é feita, por ora, pelo `reconcile.py`, com uma regra só para os dois motores. **O gerador deixa de enviar mensagens que não são JSON:** os tipos de malformado passam de 13 para 8. A diferença entre os motores nos campos de tipo errado deixa de existir; sobra, declarada, a da mensagem que não é JSON. As pastas `dt=`/`hh=` passam a sair só de um `event_ts` que seja um inteiro de 1 a 13 dígitos, por uma regra única. Versão maior porque o **formato do destino** muda | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita. Os números de teste anteriores (carga tipada) deixam de servir de referência: o tamanho do destino mudou, e as contagens de inválidas, nulas e descartadas têm outra definição |
 | 1.9 | 12/10/2026 | **§2.6, §3.1, §5 e §5.1 alterados; §5.2 novo; §1.4 e §2.2 ajustados.** A seed deixa de ser fixa: **uma por rodada (41 + N), a mesma para os dois motores**. **Quatro das dez rodadas de cada combinação (2, 5, 7 e 10) levam 1% de eventos malformados**, emitidos pelo gerador no lugar de eventos válidos. As contagens de inválidas, nulas e descartadas **deixam de reprovar** a execução e passam a ser resultado; perdas e duplicatas entre os eventos válidos continuam reprovando. Fica registrado como uma rodada é feita (tópico recriado, leitura desde o início, motores alternados, relógio conferido) e que o material bruto é apagado quando a combinação fecha. A exatidão medida do `ctime` do Flink passa de "±10 ms" para −13 a +16 ms. **Retenção (§3.1):** saem o valor de 2 h para a medição e a guarda que abortaria, que nunca foram implementados; fica um valor só, 168 h, e o controle passa a ser a recriação do tópico | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita. As execuções de aprendizado anteriores usaram a seed 42 e só eventos válidos, e não entram nos resultados |
 | 1.8 | 11/10/2026 | **§2.6 novo; §5 e §6 alterados.** O pipeline passa a ser declarado **ELT estrito**: carrega, não transforma. Saem das invariantes a "mesma limpeza", o "mesmo broadcast join" e a tabela de produtos, que nunca foram implementados. O tratamento de eventos que o motor não consegue ler **não é igualado**: o Spark grava linha nula, o Flink descarta, e os dois divergem na conversão de tipos (medido em 11/10/2026). A diferença é declarada e passa a ser contada em toda execução — inválidas, nulas e descartadas | **Nenhuma.** Os pipelines não mudam: gravam exatamente o que gravavam. As execuções de 10/10/2026, reconciliadas de novo, dão as mesmas latências, com 0 inválidas e 0 nulas |
 | 1.7 | 10/10/2026 | **§2.3 alterado; §2.2 corrigido.** A unidade de progresso do Flink deixa de ser o arquivo e passa a ser o **checkpoint, reconhecido pelo grupo de arquivos** cujo `ctime` dista até 1 s: em 10/10/2026 os 8 arquivos de 2 dos 13 checkpoints saíram em dois instantes, a 10 ms um do outro, e a regra antiga contava 15 unidades. O `committed_ts` de cada evento continua sendo o `ctime` do próprio arquivo. A exatidão do `ctime` passa de "±8 ms" para a faixa das duas medições (−7..+8 ms e −10..+7 ms). Nenhuma coluna, layout ou parâmetro de execução muda | **Nenhuma.** É regra de análise, sem efeito no que os pipelines gravam. A execução `20261010T213810Z-r100`, reconciliada pelas duas regras, deu latências idênticas (o primeiro checkpoint não estava dividido); só a contagem passou de 15 para 13 |

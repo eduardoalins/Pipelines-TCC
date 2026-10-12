@@ -1,50 +1,60 @@
 """
-Injetor de eventos malformados — Etapa 7 (= RT-5).
+Injetor de eventos malformados — Etapa 7 (= RT-5), revisto no contrato 2.0.
 
     ~/.venvs/tcc/bin/python shared/data-generator/inject_malformed.py
 
-O que cada motor faz com um evento que nao consegue ler? Ninguem configurou isso
-de proposito, e o gerador nunca emite um evento quebrado — entao a resposta so
-aparece provocando. Este arquivo provoca.
+O que cada motor faz com um evento com defeito? Este arquivo provoca, para a
+resposta ser vista, e nao suposta.
 
 Emite 420 eventos VALIDOS (gen_id 0, seq 0..419, pela mesma FabricaDeEventos do
-gerador) e, a cada 10 deles, um evento quebrado: 14 tipos, 3 de cada, 42 no
-total. Os quebrados que ainda sao JSON levam gen_id 99 e um event_id
+gerador) e, a cada 10 deles, um evento com defeito: 9 tipos, 3 de cada, 27 no
+total — os 8 tipos de malformado do malformed.py e o controle, um evento valido
+com um campo a mais. Todos sao JSON valido. Os 27 levam gen_id 99 e um event_id
 "malf-<tipo>-<n>", para serem achados no destino.
 
---- O que foi medido com ele (11/10/2026, 462 mensagens por motor) -------------
+--- O que foi medido com ele (12/10/2026, 447 mensagens por motor) -------------
+Os pipelines carregam os dez campos como TEXTO (CONTRATO.md 2.0): gravam o que
+veio, e quem converte e conta e o reconcile.py, depois do Load. Os dois motores
+dao o MESMO resultado:
 
-                                        Spark        Flink
-    linhas gravadas                       462          447
-    INVALIDAS (campo obrigatorio nulo)     21           15
-    NULAS (todos os campos nulos)          15            0
-    DESCARTADAS (sumiram)                   0           15
+                                                    Spark        Flink
+    linhas gravadas                                   447          447
+    INVALIDAS (obrigatorio nulo ou que nao converte)   18           18
+    NULAS (todos os campos nulos)                       0            0
+    DESCARTADAS (sumiram)                               0            0
 
-    nao e JSON, JSON cortado, lista,    grava linha   descarta,
-      mensagem vazia, mensagem nula     toda nula     sem aviso
-    numero entre aspas ("17")           campo nulo    converte para 17
-    fracao em campo inteiro (1.5)       campo nulo    trunca para 1
-    texto em campo numerico             campo nulo    campo nulo
-    numero grande demais (int32)        campo nulo    campo nulo
-    campo ausente                       campo nulo    campo nulo
-    campo a mais                        passa         passa
+    "seq": "abc"                 chega como  abc           nao converte: invalida
+    "user_id": "17"              chega como  17            converte: valida
+    "seq": 900000.5              chega como  900000.5      nao converte: invalida
+    "user_id": 9999999999        chega como  9999999999    nao cabe: invalida
+    "amount": "caro"             chega como  caro          amount nao e obrigatorio
+    "event_ts": "ontem"          chega como  ontem         invalida; pasta sem data
+    sem seq, sem run_id          chega nulo                invalida
+    campo a mais                 passa
 
-Nenhum dos dois derruba o job nem emite erro ou aviso. Uma linha sem run_id vai
-para a particao nula do destino, cujo nome difere por motor:
-run_id=__HIVE_DEFAULT_PARTITION__ (Spark) e run_id=__DEFAULT_PARTITION__ (Flink).
+Uma linha sem run_id vai para a particao nula do destino, cujo nome difere por
+motor: run_id=__HIVE_DEFAULT_PARTITION__ (Spark) e run_id=__DEFAULT_PARTITION__
+(Flink).
 
---- Por que os dois NAO foram igualados ----------------------------------------
-O pipeline e ELT estrito (decisao de 11/10/2026): carrega, nao limpa. Limpeza e
-transformacao, e fica para o destino. A diferenca acima e declarada no
-CONTRATO.md e CONTADA pelo reconcile.py em toda execucao. As tres contagens sao
-informacao e nunca reprovam (decisao de 11/10/2026): no benchmark, 4 das 10
-rodadas de cada combinacao levam 1% de malformados de proposito, emitidos pelo
-proprio gerador (MALFORMED_RATE).
+--- O que este arquivo fazia antes, e por que mudou ------------------------------
+Ate 11/10/2026 os pipelines carregavam os campos ja tipados, e este injetor
+mostrava os dois motores divergindo: 462 mensagens, com 21 invalidas e 15 nulas
+no Spark contra 15 invalidas e 15 DESCARTADAS no Flink. O Flink convertia "17" e
+truncava 1.5, que o Spark anulava. Havia tambem cinco tipos que nao eram JSON
+(texto solto, JSON cortado, lista, mensagem vazia e nula), que o Spark gravava
+como linha nula e o Flink descartava. Com a carga em texto os campos de tipo
+errado sairam iguais; e os cinco tipos que nao sao JSON deixaram de ser enviados
+(decisao de 12/10/2026) — neles a diferenca entre os motores continua existindo,
+declarada no CONTRATO.md 2.6.
+
+As tres contagens sao informacao e nunca reprovam: no benchmark, 4 das 10 rodadas
+de cada combinacao levam 1% de malformados de proposito, emitidos pelo proprio
+gerador (MALFORMED_RATE).
 
 --- ATENCAO ---------------------------------------------------------------------
-As 42 mensagens quebradas FICAM no topico ate a retencao apaga-las ou o topico
-ser recriado (docker compose down -v). Um pipeline que leia desde o inicio
-(earliest) vai encontra-las. Nunca rodar isto no meio de uma bateria medida.
+As 27 mensagens com defeito FICAM no topico ate a retencao apaga-las ou o topico
+ser recriado. Um pipeline que leia desde o inicio (earliest) vai encontra-las. O
+script de rodada recria o topico, entao uma rodada feita depois nao e afetada.
 
 Grava, em ~/tcc-data/metrics:
     <run_id>.gen0.json           manifesto dos validos, para o reconcile.py
@@ -78,7 +88,7 @@ VALIDOS = 420
 A_CADA = 10      # um quebrado depois de cada 10 validos
 POR_TIPO = 3
 
-# Os 13 tipos malformados (os mesmos que o gerador usa nas rodadas com
+# Os 8 tipos malformados (os mesmos que o gerador usa nas rodadas com
 # malformados) mais o controle, que e valido e tem de passar. A lista vive no
 # malformed.py: um lugar so, para as duas nao divergirem.
 TIPOS = {**MALFORMADOS, **CONTROLE}

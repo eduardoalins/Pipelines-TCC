@@ -28,11 +28,17 @@ nenhum deles.
   `.parquet`. Ignora o que comeca com "." ou "_": arquivos em andamento do Flink,
   `.crc` e `_SUCCESS` do Spark, pastas `_temporary` — a mesma convencao de
   "arquivo oculto" que o Hadoop usa.
-- O pipeline NAO limpa eventos (ELT estrito, Etapa 7). Um evento que o motor nao
-  consegue ler tem destino diferente em cada um — o Spark grava linha nula, o
-  Flink descarta —, e isso e diferenca declarada. Aqui ela vira tres contagens,
-  pelo mesmo metodo nos dois: INVALIDAS, NULAS e DESCARTADAS. Para isso este
-  arquivo le tambem a particao nula do destino, onde vao as linhas sem run_id.
+- O pipeline NAO limpa eventos (ELT estrito, Etapa 7) e NAO interpreta tipos
+  (CONTRATO.md 2.0): os dez campos chegam ao destino como TEXTO. A conversao
+  para o tipo do contrato e feita AQUI, na leitura, com a mesma regra para os
+  dois motores — ver selecao_tipada(). E uma regra provisoria e sem conserto: o
+  que converte e usado, o que nao converte fica nulo. O lugar definitivo dela e
+  o modulo de Transform, a escrever.
+- Tres contagens, pelo mesmo metodo nos dois motores: INVALIDAS, NULAS e
+  DESCARTADAS. Para isso este arquivo le tambem a particao nula do destino, onde
+  vao as linhas sem run_id. As duas ultimas so aparecem com mensagens que nao
+  sao JSON, que o gerador deixou de enviar: o Spark grava linha nula, o Flink
+  descarta.
 
 --- Saida ------------------------------------------------------------------
 Relatorio na tela e um JSON em ~/tcc-data/metrics/reconcile.<motor>.<run_id>.json,
@@ -59,9 +65,26 @@ METRICS = DATA_DIR / "metrics"
 # CONTRATO.md 2.1: watermark = maximo ACUMULADO de event_ts menos 60 s.
 ATRASO_WATERMARK_MS = 60_000
 
-# --- Eventos que o motor nao conseguiu ler (Etapa 7) ------------------------
-# O pipeline NAO limpa nada (ELT estrito, decisao de 11/10/2026): o que cada
-# motor faz com um evento quebrado e diferenca declarada, e aqui ela e CONTADA.
+# --- Do texto ao tipo do contrato (CONTRATO.md 2.0) -------------------------
+# Os pipelines carregam os dez campos como TEXTO. Os tipos estao na fonte unica
+# do schema, a mesma que os dois pipelines leem.
+ARQUIVO_SCHEMA = Path(__file__).resolve().parents[1] / "schema" / "evento.json"
+
+# tipo logico -> (tipo no DuckDB, a forma que o texto precisa ter, INTEIRO).
+# A forma e conferida ANTES do cast porque o cast de texto do DuckDB e
+# complacente: '1.5' viraria o inteiro 2. Aqui '1.5' num campo inteiro nao
+# converte. O TRY_CAST cuida do que tem a forma certa e nao cabe no tipo.
+_INTEIRO = r"-?[0-9]+"
+_NUMERO = r"-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?"
+CONVERSAO = {
+    "int32": ("INTEGER", _INTEIRO),
+    "int64": ("BIGINT", _INTEIRO),
+    "float64": ("DOUBLE", _NUMERO),
+}
+
+# --- Eventos com defeito ------------------------------------------------------
+# O pipeline NAO limpa nada (ELT estrito, decisao de 11/10/2026) e nao decide o
+# que e valido: isso e contado AQUI, depois do Load.
 #
 # Campos do evento como chegam ao Parquet (CONTRATO.md 1.1). As colunas de
 # particao (run_id, dt, hh) ficam no caminho, nao no arquivo.
@@ -108,6 +131,10 @@ def lista_sql(caminhos) -> str:
     return "[" + ", ".join("'" + str(c).replace("'", "''") + "'" for c in caminhos) + "]"
 
 
+def colunas_de(con, fonte: str) -> set:
+    return {c[0] for c in con.execute(f"DESCRIBE SELECT * FROM {fonte}").fetchall()}
+
+
 def listar_runs() -> None:
     print(f"run_id disponiveis em {EVENTOS}:\n")
     for d in sorted(EVENTOS.glob("run_id=*")):
@@ -124,6 +151,52 @@ def manifestos(run_id: str) -> dict[int, dict]:
         dado = json.loads(m.read_text(encoding="utf-8"))
         saida[int(dado["gen_id"])] = dado
     return saida
+
+
+# --- Do texto ao tipo do contrato ---------------------------------------------
+
+def selecao_tipada(con, fonte: str) -> tuple[str, list[str]]:
+    """O comeco de um SELECT que le `fonte` com os campos nos tipos do contrato.
+
+    Devolve ("SELECT * REPLACE (...), <campo> AS <campo>__txt ...", convertidos).
+    Quem chama completa com o FROM. Cada campo numerico que esta em TEXTO no
+    destino e substituido pelo valor convertido, e o texto original fica ao
+    lado, em <campo>__txt — e por ele que se conta o que nao converteu.
+
+    A regra, igual para os dois motores porque e aplicada aqui e nao neles:
+
+        inteiro   so digitos, com sinal opcional, e que caiba no tipo
+        decimal   um numero escrito por extenso ou em notacao cientifica
+        texto     como veio
+
+    O que nao converte fica NULO. Nada e consertado, arredondado ou adivinhado.
+    Um campo que ja esta tipado no arquivo (destino gravado antes do contrato
+    2.0) passa direto.
+
+    processed_ts e timestamp desde o CONTRATO.md 1.5 (2.5); antes era inteiro
+    (epoch ms). Tudo aqui trabalha em epoch ms, que e tambem como os logs de
+    progresso o guardam — entao ele e convertido na entrada.
+    """
+    tipos = {c[0]: c[1].upper() for c in con.execute(f"DESCRIBE SELECT * FROM {fonte}").fetchall()}
+    trocas, originais, convertidos = [], [], []
+    if "TIMESTAMP" in tipos.get("processed_ts", ""):
+        trocas.append("epoch_ms(processed_ts) AS processed_ts")
+    for campo in json.loads(ARQUIVO_SCHEMA.read_text(encoding="utf-8"))["campos"]:
+        nome, tipo = campo["nome"], campo["tipo"]
+        if tipo == "string":
+            continue
+        if tipo not in CONVERSAO:
+            raise ValueError(f"tipo '{tipo}' do campo '{nome}' em {ARQUIVO_SCHEMA} nao tem "
+                             f"conversao. Tipos conhecidos: string, {', '.join(CONVERSAO)}")
+        if tipos.get(nome) != "VARCHAR":
+            continue                    # ausente, ou ja tipado no arquivo
+        destino, forma = CONVERSAO[tipo]
+        trocas.append(f"CASE WHEN regexp_full_match({nome}, '{forma}') "
+                      f"THEN TRY_CAST({nome} AS {destino}) END AS {nome}")
+        originais.append(f"{nome} AS {nome}__txt")
+        convertidos.append(nome)
+    selecao = "SELECT *" + (f" REPLACE ({', '.join(trocas)})" if trocas else "")
+    return selecao + "".join(f", {o}" for o in originais), convertidos
 
 
 # --- Estatistica ------------------------------------------------------------
@@ -149,23 +222,29 @@ def linha_ms(nome: str, s: dict | None) -> str:
             f"media {s['media']:>6}  min {s['min']:>6}  max {s['max']:>6}   (ms, n={s['n']})")
 
 
-# --- Eventos ilegiveis: invalidas, nulas e descartadas ----------------------
+# --- Eventos com defeito: invalidas, nulas e descartadas --------------------
 
-def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int) -> dict:
+def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int,
+                     convertidos: list[str]) -> dict:
     """As tres contagens da Etapa 7, pelo mesmo metodo nos dois motores.
 
-        INVALIDAS    linha gravada com ALGUM campo obrigatorio nulo (qualquer
-                     campo do evento menos o amount; e o run_id, quando a
-                     linha esta na particao nula) — decisao de 11/10/2026
+        INVALIDAS    linha gravada com ALGUM campo obrigatorio nulo DEPOIS da
+                     conversao — porque nao veio, ou porque veio um texto que
+                     nao converte para o tipo do contrato. Obrigatorio e
+                     qualquer campo do evento menos o amount; e o run_id,
+                     quando a linha esta na particao nula
         NULAS        linha gravada com TODOS os campos do evento nulos
         DESCARTADAS  mensagem que estava no topico e nao virou linha nenhuma
 
-    Limite da INVALIDAS: um amount trocado por texto vira nulo, e nulo e valor
-    legitimo para o amount — esse caso nao e contado.
+    Limite da INVALIDAS: o amount pode ser nulo num evento valido (pageview e
+    add_to_cart), entao um amount que nao converte NAO entra nela. Ele aparece
+    na linha "texto que nao converte", que e so informacao.
+
+    `"user_id": "17"` NAO e invalida: o texto 17 converte.
 
     As duas primeiras se veem no destino. A terceira e uma ausencia: exige saber
     quantas mensagens o topico recebeu na execucao, o que vem de uma anotacao
-    <run_id>.topico.json (gravada pelo arnes da Etapa 8). Sem ela, fica
+    <run_id>.topico.json (gravada pelo run_round.py). Sem ela, fica
     indisponivel — nunca e estimada.
     """
     campos = [c for c in CAMPOS_EVENTO if c in colunas]
@@ -196,12 +275,27 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
     por_campo = {c: n for c, n in por_campo.items() if n}
     linhas = na_pasta + fora
 
-    print("\n  Eventos que o motor nao conseguiu ler:")
+    # Texto que chegou ao destino e nao converte para o tipo do contrato. Ja
+    # esta dentro dos "nulos por campo" acima; aqui e separado do campo ausente.
+    nao_convertem = {}
+    for c in convertidos:
+        n = con.execute(
+            f"SELECT count(*) FROM ev WHERE {c}__txt IS NOT NULL AND {c} IS NULL").fetchone()[0]
+        if tem_particao_nula and f"{c}__txt" in colunas_de(con, "sem_run_id"):
+            n += con.execute(f"SELECT count(*) FROM sem_run_id "
+                             f"WHERE {c}__txt IS NOT NULL AND {c} IS NULL").fetchone()[0]
+        if n:
+            nao_convertem[c] = n
+
+    print("\n  Eventos com defeito:")
     print(f"    linhas no destino ............ {linhas}   ({na_pasta} na pasta do run_id"
           f" + {fora} em particao nula)")
-    print(f"    INVALIDAS (campo obrigatorio nulo) {invalidas}")
+    print(f"    INVALIDAS (obrigatorio nulo ou que nao converte) {invalidas}")
     if por_campo:
         print("        nulos por campo: " + ", ".join(f"{c} {n}" for c, n in por_campo.items()))
+    if nao_convertem:
+        print("        texto que nao converte: "
+              + ", ".join(f"{c} {n}" for c, n in nao_convertem.items()))
     print(f"    NULAS (todos os campos nulos) .. {nulas}")
 
     mensagens = descartadas = None
@@ -220,7 +314,8 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
 
     return {"invalidas": invalidas, "nulas": nulas, "descartadas": descartadas,
             "linhas_no_destino": linhas, "linhas_em_particao_nula": fora,
-            "mensagens_no_topico": mensagens, "nulos_por_campo": por_campo}
+            "mensagens_no_topico": mensagens, "nulos_por_campo": por_campo,
+            "nao_convertem": nao_convertem}
 
 
 # --- Throughput medio -------------------------------------------------------
@@ -400,13 +495,10 @@ def main() -> int:
     tipos = {c[0]: c[1] for c in con.execute("DESCRIBE ev_bruto").fetchall()}
     colunas = set(tipos)
 
-    # processed_ts e timestamp desde o CONTRATO.md 1.5 (2.5); antes era inteiro
-    # (epoch ms). Tudo aqui trabalha em epoch ms, que e tambem como os logs de
-    # progresso o guardam — entao o timestamp e convertido na entrada, e as
-    # execucoes gravadas antes da 1.5 continuam legiveis.
+    # Do texto ao tipo do contrato, e o processed_ts em epoch ms: tudo o que vem
+    # depois le as visoes `ev` e `sem_run_id`, ja convertidas.
+    selecao, convertidos = selecao_tipada(con, "ev_bruto")
     em_ms = "TIMESTAMP" in tipos.get("processed_ts", "").upper()
-    selecao = ("SELECT * REPLACE (epoch_ms(processed_ts) AS processed_ts)"
-               if em_ms else "SELECT *")
     pts_ms = "epoch_ms(processed_ts)" if em_ms else "processed_ts"
 
     # UNIDADE DE PROGRESSO — o que agrupa os eventos que ficaram visiveis juntos
@@ -444,14 +536,21 @@ def main() -> int:
     if arqs_nulos and "processed_ts" in colunas:
         t0, t1 = con.execute("SELECT min(processed_ts), max(processed_ts) FROM ev").fetchone()
         if t0 is not None:
+            # So os arquivos gravados desde o comeco desta execucao: um arquivo
+            # mais antigo nao pode ter linha dela. Tira do caminho, tambem, sobra
+            # de execucoes anteriores ao contrato 2.0, cujas colunas tem outro
+            # tipo e nao se misturam com as de agora na mesma leitura.
+            desde = (int(t0) - MARGEM_PARTICAO_NULA_MS) / 1000
+            arqs_nulos = [a for a in arqs_nulos if a.stat().st_mtime >= desde]
+        if t0 is not None and arqs_nulos:
+            leitura = (f"read_parquet({lista_sql(arqs_nulos)}, hive_partitioning = true, "
+                       "hive_types_autocast = false, union_by_name = true)")
+            selecao_nula, _ = selecao_tipada(con, leitura)
             con.execute(f"""
                 CREATE VIEW sem_run_id AS
-                SELECT * FROM (
-                    {selecao}
-                    FROM read_parquet({lista_sql(arqs_nulos)}, hive_partitioning = true,
-                                      hive_types_autocast = false, union_by_name = true)
-                ) WHERE processed_ts BETWEEN {int(t0) - MARGEM_PARTICAO_NULA_MS}
-                                         AND {int(t1) + MARGEM_PARTICAO_NULA_MS}
+                SELECT * FROM ({selecao_nula} FROM {leitura})
+                WHERE processed_ts BETWEEN {int(t0) - MARGEM_PARTICAO_NULA_MS}
+                                       AND {int(t1) + MARGEM_PARTICAO_NULA_MS}
             """)
             tem_particao_nula = True
 
@@ -531,7 +630,7 @@ def main() -> int:
                             "lacunas": lacunas, "fora_do_intervalo": fora})
 
     # Linhas sem gen_id ou seq nao entram na conta de seq acima; sao contadas aqui.
-    ilegiveis = contar_ilegiveis(con, colunas, tem_particao_nula, total_dup)
+    ilegiveis = contar_ilegiveis(con, colunas, tem_particao_nula, total_dup, convertidos)
     invalidas, nulas, descartadas = (ilegiveis["invalidas"], ilegiveis["nulas"],
                                      ilegiveis["descartadas"])
     relatorio["integridade"] = {"por_gen": integridade, "perdas": total_perdas,

@@ -202,17 +202,18 @@ def main() -> int:
     )
 
     # --- Fonte -----------------------------------------------------------
-    # O valor e INTERPRETADO: 'format' = 'json', com as colunas vindas da fonte
-    # unica do schema (shared/schema/evento.json).
+    # 'format' = 'json' SEPARA os dez campos, e so isso: as colunas vem da fonte
+    # unica do schema (shared/schema/evento.json) e sao todas STRING
+    # (CONTRATO.md 2.0; ver esquema.py). Nenhum tipo e interpretado aqui — a
+    # conversao e o tratamento do que nao converte ficam para depois do Load.
     #
     # Sem a coluna da chave: o Spark tambem a descartou. O destino tem os dez
     # campos do evento e as colunas de medicao.
     #
-    # 'json.ignore-parse-errors': um evento malformado nao derruba o job. O que
-    # acontece com ele NAO e igual ao from_json do Spark (medido na RT-5, em
-    # 11/10/2026): uma mensagem que nao e JSON e DESCARTADA aqui, sem aviso, e
-    # no Spark vira uma linha toda nula; um campo que nao se le vira nulo nos
-    # dois. A diferenca e declarada (CONTRATO.md 2.6) e contada pelo reconcile.py.
+    # 'json.ignore-parse-errors': uma mensagem que NAO E JSON nao derruba o job
+    # — e DESCARTADA aqui, sem aviso, enquanto o Spark grava uma linha toda nula
+    # (medido na RT-5, em 11/10/2026). E a unica diferenca que sobra entre os
+    # dois, e o gerador nao envia mensagens assim (CONTRATO.md 2.6).
     #
     # group.id + commit no checkpoint (decisao F7): o Flink devolve ao Kafka os
     # offsets do ultimo checkpoint completo — o mesmo papel do commit que o
@@ -266,19 +267,27 @@ def main() -> int:
         )
     """)
 
-    # dt e hh a partir de event_ts (milissegundos). FROM_UNIXTIME recebe
-    # segundos e formata no fuso da SESSAO — que e UTC, fixado acima.
+    # dt e hh (CONTRATO.md 4.1) sao a UNICA leitura de valor que o pipeline faz:
+    # o layout do destino sai de event_ts, que chega como texto. So vira data o
+    # texto que e um inteiro de 1 a 13 digitos — a mesma expressao regular do
+    # Spark, vinda do evento.json. O que nao casa fica sem data e vai para a
+    # particao nula, como um event_ts ausente. TRY_CAST e nao CAST: um CAST que
+    # falha derruba o job. FROM_UNIXTIME recebe segundos e formata no fuso da
+    # SESSAO — que e UTC, fixado acima.
     #
     # processed_ts: CURRENT_ROW_TIMESTAMP() e reavaliado A CADA EVENTO por
     # definicao — o instante em que o evento passa por esta projecao, logo
     # antes de seguir para o escritor. Sem funcao Python (decisao F2).
     colunas = ", ".join(f"`{nome}`" for nome in esquema.nomes())
+    instante = f"`{esquema.CAMPO_DE_PARTICAO}`"
+    valido = f"REGEXP({instante}, '{esquema.PARTICAO_VALIDA}')"
+    segundos = f"TRY_CAST({instante} AS BIGINT) / 1000"
     resultado = t_env.execute_sql(f"""
         INSERT INTO destino
         SELECT {colunas},
-               CURRENT_ROW_TIMESTAMP()                       AS `processed_ts`,
-               FROM_UNIXTIME(`event_ts` / 1000, 'yyyy-MM-dd') AS `dt`,
-               FROM_UNIXTIME(`event_ts` / 1000, 'HH')         AS `hh`
+               CURRENT_ROW_TIMESTAMP() AS `processed_ts`,
+               CASE WHEN {valido} THEN FROM_UNIXTIME({segundos}, 'yyyy-MM-dd') END AS `dt`,
+               CASE WHEN {valido} THEN FROM_UNIXTIME({segundos}, 'HH') END         AS `hh`
         FROM eventos
     """)
     job = resultado.get_job_client()
