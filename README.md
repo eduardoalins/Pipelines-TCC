@@ -45,6 +45,7 @@ tenderiam a divergir.
 | antes do 17 | **conferir o relógio** — obrigatório antes de qualquer medição | Etapa 6.2 |
 | 17 a 20 | instrumento de medição, nos dois motores | Etapa 6 / RT-4 — lag, reconciliação e latências |
 | 21 | eventos malformados: o que cada motor faz, e como isso é contado | Etapa 7 / RT-5 |
+| 22 a 24 | o benchmark: uma rodada, as dez rodadas de uma combinação e os arquivos de resultado | Etapa 8 / RT-6 |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -278,7 +279,7 @@ instalação de Spark e não afeta medição.
 ```
 
 Emite 100 eventos por segundo durante 60 segundos, no schema completo do
-`CONTRATO.md`, com seed fixa.
+`CONTRATO.md`, com a seed do `config.yaml` (42).
 
 **Saída esperada:** 6000 tentados, 6000 confirmados, 0 erros, duração ~60,0 s,
 payload médio ~253,8 bytes.
@@ -291,6 +292,27 @@ antemão**. Qualquer divergência é defeito, não resultado.
 ```bash
 RATE=1000 DURATION=600 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
 ```
+
+**Trocar a seed e misturar eventos malformados**, do mesmo jeito (Etapa 8):
+
+```bash
+SEED=43 MALFORMED_RATE=0.01 RATE=100 DURATION=60 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
+```
+
+A mesma seed produz a mesma sequência de eventos. Com `MALFORMED_RATE=0.01`, uma
+mensagem a cada 100 sai malformada, **no lugar** de um evento válido, com 13 tipos
+em rodízio (`shared/data-generator/malformed.py`). O relatório passa a mostrar:
+
+```
+malformados ..... 1 a cada 100 mensagens, no lugar de um evento valido (13 tipos em rodizio)
+tentados ................ 5940
+confirmados pelo broker . 5940
+malformados ............. 60 confirmados de 60 (erros 0)
+```
+
+`tentados` e `confirmados` contam só os eventos **válidos**: 5940 + 60 = 6000
+mensagens no tópico. No benchmark quem escolhe a seed e a proporção é o script de
+rodada (passo 22), não você.
 
 O relatório separa **carga oferecida** (o que o gerador tentou emitir) de **carga
 atingida** (o que o broker confirmou pelo callback de entrega). É a distinção
@@ -321,8 +343,9 @@ e ~320. A referência medida na máquina original é **186 e 317**.
 
 Esse desequilíbrio é previsto e declarado no `CONTRATO.md` §1.4: com 2000 chaves
 uniformes em 24 partições, o desvio nos extremos é de ±25%. Ele não ameaça a
-comparação porque o sorteio é determinístico com seed fixa — o desequilíbrio é
-idêntico em toda execução e nos dois motores.
+comparação porque o sorteio é determinístico pela seed — com a mesma seed, o
+desequilíbrio é idêntico em toda execução e nos dois motores. No benchmark cada
+rodada tem a sua seed, e ela é a mesma para os dois motores (passo 22).
 
 Se o `max` vier muito acima disso, o partitioner não está espalhando como se
 espera e vale investigar antes de seguir.
@@ -796,8 +819,8 @@ OK: relogio sao. Pode medir.
 ```
 
 Se sair `NAO MEDIR`, não meça: espere mais um pouco e rode de novo. O script só
-lê; não altera nada. Sai com **0** ou **1**, para o arnês da Etapa 8 chamá-lo
-antes de cada execução.
+lê; não altera nada. Sai com **0** ou **1**: o script de rodada (passo 22) o chama
+antes de cada rodada, e não começa se ele reprovar.
 
 **Ao terminar a sessão**, religue o serviço:
 
@@ -890,6 +913,29 @@ não a altura dele.
 > período do trigger, o coletor veria a fila sempre no mesmo ponto do ciclo — o
 > serrilhado sumiria e o lag pareceria constante.
 
+**CPU e memória, pelo mesmo coletor (Etapa 8).** Com `CONTAINERS`, ele lê também
+os contadores de cada contêiner cujo nome contenha um dos trechos dados:
+
+```bash
+CONTAINERS=spark-run,kafka GROUP_ID=tcc-nrt-spark DURATION=75 ~/.venvs/tcc/bin/python shared/monitoring/collector.py
+```
+
+Grava um segundo CSV, `recursos.<grupo>.<inicio>.csv`, e fecha com um resumo
+(rodada de teste de 11/10/2026):
+
+```
+  kafka
+    CPU      media    28.5 %   pico   202.8 %
+    memoria  media   520.4 MiB  pico   619.6 MiB   (69 leituras)
+  pipelines-tcc-spark-run-c7c60108dfdc
+    CPU      media   108.0 %   pico   372.0 %
+    memoria  media   786.3 MiB  pico   912.8 MiB   (69 leituras)
+```
+
+A CPU é em **% de um núcleo**: 100 % é um núcleo inteiro ocupado, e passa de 100 %
+quando o contêiner usa mais de um. A memória desconta o cache de arquivos. Para o
+Flink, `CONTAINERS=flink-run,kafka`.
+
 > **O coletor começa depois do primeiro batch**, de propósito, só neste teste: o
 > primeiro commit de um grupo novo pode receber `NOT_COORDINATOR` (o broker ainda
 > está elegendo o coordenador). O pipeline repete a tentativa; consultar o grupo
@@ -934,9 +980,23 @@ Spark ainda no host, eram 3903 e 4298 ms.
 
 A **espera no trigger** com mediana perto de **metade do trigger** (2,6 s de 5 s) é a
 aritmética do micro-batch aparecendo no dado. O programa sai com **0** se não há
-perda, duplicata, linha inválida, linha nula nem descarte, e com **1** se há — o
-arnês da Etapa 8 usa isso. O `descartadas=?` é o esperado por enquanto: essa
-contagem depende de uma anotação que o arnês passará a gravar (passo 21).
+perda nem duplicata entre os eventos válidos, e com **1** se há — o script de
+rodada usa isso. Inválidas, nulas e descartadas são **informação** e não mudam o
+código de saída (decisão de 11/10/2026). O `descartadas=?` é o esperado neste
+passo: a contagem depende de uma anotação com o número de mensagens do tópico, que
+só o injetor (passo 21) e o script de rodada (passo 22) gravam.
+
+Desde a Etapa 8 o relatório traz também o **throughput médio**: os eventos das
+unidades de progresso depois da primeira, divididos pelo tempo entre a primeira e
+a última. Numa rodada de teste de 11/10/2026:
+
+```
+  THROUGHPUT MEDIO .......... 96.3 evt/s   (5646 eventos em 58.6 s, sem a 1a unidade)
+```
+
+Em 60 s o número fica um pouco abaixo dos 100 evt/s oferecidos, por efeito de
+borda: a primeira e a última unidade pegam pedaços do intervalo. Some em rodadas
+longas.
 
 **Ele lê com o DuckDB**, instalado no passo 2 pelo `requirements.txt`: o mesmo leitor
 para os dois motores, que não pertence a nenhum deles. Os arquivos são descobertos
@@ -1037,7 +1097,7 @@ sozinho, com um evento que não consegue ler — e que os dois **não** fazem a 
 coisa. A diferença não foi igualada; é declarada (`CONTRATO.md`) e **contada** pelo
 `reconcile.py` em toda execução.
 
-> **Este passo suja o tópico.** As 42 mensagens quebradas de cada rodada ficam lá
+> **Este passo suja o tópico.** As 42 mensagens quebradas de cada execução ficam lá
 > até a retenção apagá-las ou o tópico ser recriado (`docker compose down -v`).
 > Nunca rode no meio de uma bateria medida.
 
@@ -1088,10 +1148,11 @@ MOTOR=flink RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
 | **DESCARTADAS** — a mensagem sumiu | 0 | 15 |
 | Erro ou aviso do motor | nenhum | nenhum |
 
-Nos dois o programa termina com `DIVERGENCIA` e código **1** — é o correto: uma
-execução com evento quebrado não pode sair como `OK`. O bloco do `gen_id 99`, com
-`PERDAS ?` e muitas lacunas, são os próprios eventos quebrados: eles não têm
-manifesto.
+Nos dois o programa termina com `OK` e código **0**: os 420 válidos chegaram, sem
+perda nem duplicata. As três contagens aparecem na última linha e são
+**informação**, não reprovação (decisão de 11/10/2026; até então o programa
+terminava com `DIVERGENCIA` e código 1). O bloco do `gen_id 99`, com `PERDAS ?` e
+muitas lacunas, são os próprios eventos quebrados: eles não têm manifesto.
 
 **De onde vem a diferença:**
 
@@ -1110,19 +1171,246 @@ atribui as linhas à execução pelo instante em que foram processadas.
 
 **As DESCARTADAS dependem de uma anotação.** Uma mensagem que sumiu não aparece no
 destino: a conta é *mensagens que o tópico recebeu − linhas gravadas*. O injetor
-grava esse número em `~/tcc-data/metrics/<run_id>.topico.json`. Nas execuções
-normais essa anotação ainda não existe — será gravada pelo arnês da Etapa 8 —, e
-o `reconcile.py` mostra `descartadas=?`, sem estimar.
+grava esse número em `~/tcc-data/metrics/<run_id>.topico.json`, e o script de
+rodada (passo 22) também, em toda rodada. Numa execução feita à mão (passos 17 a
+20) a anotação não existe, e o `reconcile.py` mostra `descartadas=?`, sem estimar.
 
-> **Num benchmark, as três contagens têm de dar zero.** O gerador só emite eventos
-> válidos. Um número diferente de zero numa execução medida é sinal de defeito, e
-> o código de saída 1 existe para o arnês perceber.
+> **No benchmark, quatro das dez rodadas levam malformados de propósito** — as
+> rodadas 2, 5, 7 e 10, com 1% das mensagens. Quem os emite é o próprio gerador
+> (passo 6), e as três contagens viram resultado. Com 60 malformados em 6000
+> mensagens (11/10/2026): 31 inválidas, 25 nulas e 0 descartadas no Spark; 21
+> inválidas, 0 nulas e 25 descartadas no Flink.
+
+---
+
+## Passo 22 — Uma rodada do benchmark
+
+Os passos 17 a 21 fizeram à mão, em três abas, o que uma medição exige. O
+`benchmarks/run_round.py` faz o mesmo com **um comando** — e não esquece de zerar
+o checkpoint nem de conferir o relógio. É o **script de rodada**, que os planos
+chamam de arnês.
+
+**Com o relógio conferido** (seção antes do passo 17), o Kafka no ar e as duas
+imagens construídas:
+
+```bash
+MOTOR=spark INTERVALO=5 CARGA=100 DURACAO=60 RODADA=1 ~/.venvs/tcc/bin/python benchmarks/run_round.py
+```
+
+| Variável | O que é |
+|---|---|
+| `MOTOR` | `spark` ou `flink` |
+| `INTERVALO` | segundos — o trigger no Spark, o intervalo de checkpoint no Flink |
+| `CARGA` | mensagens por segundo |
+| `DURACAO` | segundos de geração |
+| `RODADA` | 1 a 10 |
+
+**O que o número da rodada decide** (`CONTRATO.md` §5.1 e §2.6):
+
+- **a seed**: 41 + rodada — a rodada 1 usa 42, a 10 usa 51 —, a mesma para os dois
+  motores. A rodada N do Spark e a do Flink recebem os mesmos eventos;
+- **os malformados**: as rodadas 2, 5, 7 e 10 levam 1% de mensagens malformadas.
+
+**Esperado** (rodada de teste de 11/10/2026, na máquina original):
+
+```
+=== rodada 01 — spark — intervalo 5 s, carga 100 msg/s, 60 s ===
+    run_id 20261012T015131Z-spark-i5-c100-r01
+    pasta  /mnt/c/.../Pipelines-TCC/results/Intervalo5Carga100/spark/rodada-01
+>> [22:51:31] 1/12 conferencias
+>> [22:52:13] 2/12 zerando o checkpoint
+>> [22:52:13] 3/12 recriando o topico
+>> [22:52:26] 4/12 offsets do topico, antes
+>> [22:52:26] 5/12 subindo o pipeline
+>> [22:52:48] 6/12 ligando o coletor
+>> [22:52:51] 7/12 gerador: 100 msg/s por 60 s, seed 42
+>> [22:53:52] 8/12 esperando a fila zerar (ate 60 s)
+>> [22:53:58] 9/12 offsets do topico, depois
+>> [22:53:58] 10/12 arquivo de parada
+>> [22:53:59] 11/12 reconciliador
+>> [22:54:00] 12/12 manifesto e arquivos da rodada
+
+RODADA VALIDA.
+  latencia de processamento P50 3927 ms   visibilidade P50 4394 ms
+  throughput medio 96.31 evt/s   CPU media 114.9 %   memoria pico 963.0 MiB
+  perdas 0  duplicatas 0  invalidas 0  nulas 0  descartadas 0
+manifesto: /mnt/c/.../Pipelines-TCC/results/Intervalo5Carga100/spark/rodada-01/manifesto.json
+```
+
+São cerca de 2,5 minutos para uma rodada de 60 s: ~40 s de conferências (o relógio
+é observado por 40 s), ~35 s para recriar o tópico e subir o pipeline, os 60 s de
+geração e a espera pela fila.
+
+A mesma rodada com `MOTOR=flink` deu processamento P50 de 8 ms, visibilidade P50
+de 2649 ms, 96,05 evt/s, CPU média de 32,9 % e pico de memória de 820,5 MiB. Com
+`RODADA=2`, as contagens foram as do aviso no fim do passo 21, e a rodada **vale**
+do mesmo jeito.
+
+**O que ela confere antes de começar.** Se algo falhar, não começa e sai com
+código **2**:
+
+- 50 GB livres, no menor entre o disco dos dados e o do repositório;
+- a pasta da rodada ainda não existe (`REFAZER=1` refaz, guardando a anterior ao lado);
+- o relógio (`scripts/check_clock.py`);
+- o Kafka `healthy`, e nenhum contêiner de pipeline esquecido no ar;
+- as imagens `tcc-spark:4.0.4` e `tcc-flink:1.20.5`.
+
+> **A rodada apaga e recria o tópico.** Toda rodada começa com as 24 partições
+> vazias: sem sobra da rodada anterior, sem pendência do outro motor. Qualquer
+> mensagem que estivesse no tópico é perdida.
+
+**O que fica**, em `results/Intervalo5Carga100/spark/rodada-01/`:
+
+| Arquivo | O quê |
+|---|---|
+| `manifesto.json` | a rodada inteira: parâmetros, seed, commit do código, imagens, relógio, cada passo com horário, códigos de saída e os números |
+| `metrics/lag.*.csv`, `metrics/recursos.*.csv` | a fila, a CPU e a memória, uma amostra por segundo |
+| `spark.progresso.*.jsonl` | o log de progresso do motor |
+| `reconcile.txt` e `reconcile.spark.*.json` | o relatório do reconciliador |
+| `pipeline.txt`, `gerador.txt`, `coletor.txt`, `relogio.txt` | as telas de cada programa |
+
+O **Parquet não fica**: é apagado assim que o reconciliador dá `OK`, porque a
+10 mil evt/s uma rodada de 10 minutos passa de 1 GB. Se a rodada não valer, ele
+fica, para investigar. `MANTER_PARQUET=1` guarda sempre.
+
+Sai com **0** se a rodada vale; **1** se não vale, e o `manifesto.json` diz por
+quê; **2** se nem começou.
+
+---
+
+## Passo 23 — As dez rodadas de uma combinação
+
+Uma **combinação** é um intervalo e uma carga. Cada combinação tem 10 rodadas de
+cada motor — 20 chamadas ao passo 22, que o `benchmarks/run_combination.py` faz na
+ordem certa:
+
+```bash
+INTERVALO=5 CARGA=100 DURACAO=60 ~/.venvs/tcc/bin/python benchmarks/run_combination.py
+```
+
+Para fazer só algumas rodadas, `RODADAS=1,2` na frente do comando.
+
+**A ordem.** Os motores alternam, e quem começa inverte a cada rodada: Spark e
+Flink na rodada 1, Flink e Spark na 2, e assim por diante. O que muda ao longo da
+sessão — a máquina esquentar, outro programa abrir — pesa igual sobre os dois.
+
+**Quando uma rodada falha:**
+
+| O que houve | O que a sequência faz |
+|---|---|
+| nem começou (código 2: relógio, disco, Kafka) | **para** — a rodada seguinte esbarraria no mesmo defeito |
+| começou e não valeu (código 1) | tenta **uma** vez de novo, guardando a tentativa anterior; se falhar outra vez, registra e segue |
+
+**Retomada.** Rodar o mesmo comando de novo pula as rodadas que já estão válidas
+em `results/` e faz só as que faltam.
+
+Ao fim, um resumo. Com `RODADAS=1,2`, montado com as rodadas de teste de
+11/10/2026:
+
+```
+=== resumo =========================================================
+rodada  motor  vale   proc P50  vis P50     thr   CPU %  mem MiB  inval  nulas  desc
+1       spark  sim        3927     4394   96.31   114.9    963.0      0      0     0
+1       flink  sim           8     2649   96.05    32.9    820.5      0      0     0
+2       flink  sim           7     2589   98.05    34.5    817.4     21      0    25
+2       spark  sim        3954     4444   97.68   112.9    912.8     31     25     0
+
+Todas as rodadas pedidas estao validas.
+```
+
+**O fechamento.** Quando as **20** rodadas da combinação estão válidas, a
+sequência:
+
+1. escreve os arquivos de resultado (passo 24);
+2. confere que os dois saíram agora, e completos;
+3. **apaga a pasta da combinação em `results/`.**
+
+```
+=== fechamento: as 20 rodadas estao validas ========================
+...
+material bruto apagado: /mnt/c/.../Pipelines-TCC/results/Intervalo5Carga100
+A combinacao esta fechada. O que fica dela:
+```
+
+O material bruto não é guardado nem vai para o git; o que fica da combinação são
+os dois arquivos. Se eles não saírem, a pasta **não** é apagada, e rodar o mesmo
+comando refaz só o fechamento. `MANTER_BRUTO=1` escreve os arquivos e não apaga
+nada.
+
+> **Uma combinação fechada não recomeça por engano.** Se a pasta dela não existe
+> em `results/` e o `.txt` dela existe na pasta de saída, a sequência não começa.
+> Para refazê-la, mova ou apague os dois arquivos antes.
+
+> **Onde os arquivos são escritos.** Por padrão, em `../../Informações/Resultados
+> Local`, a pasta de pesquisa do autor. Em outra máquina, aponte uma pasta que
+> exista com `SAIDA=`, como no passo 24 — sem isso o fechamento avisa e não apaga
+> nada.
+
+Sai com **0** se as rodadas pedidas estão todas válidas; **1** se alguma ficou
+faltando, ou se os arquivos do fechamento não saíram; **2** se parou por problema
+do ambiente.
+
+A sequência foi verificada em partes (11 e 12/10/2026): a ordem, o salto das
+rodadas válidas, a parada e a segunda tentativa, com rodadas de verdade; o
+fechamento, com as 20 rodadas já válidas em `results/`.
+
+---
+
+## Passo 24 — Os arquivos de resultado
+
+O `benchmarks/write_results.py` lê `results/` e escreve, para cada combinação, os
+dois arquivos que se **leem**. O passo 23 o chama sozinho no fechamento; rodá-lo à
+mão serve para olhar uma combinação ainda incompleta.
+
+```bash
+mkdir -p ~/tcc-resultados
+SAIDA=~/tcc-resultados ~/.venvs/tcc/bin/python benchmarks/write_results.py
+```
+
+**Esperado**, com as rodadas de teste de 11/10/2026:
+
+```
+ResultadoIntervalo5Carga100  (.txt e .md)
+   rodadas validas: NRT 4 de 10, RT 5 de 10   <- INCOMPLETO
+```
+
+NRT é o Spark; RT é o Flink.
+
+| Arquivo | O quê |
+|---|---|
+| `ResultadoIntervalo5Carga100.txt` | uma linha por rodada e por motor, com as 19 variáveis por extenso; depois a média e o desvio padrão de cada motor |
+| `ResultadoIntervalo5Carga100.md` | as mesmas rodadas em tabelas, e o que o `.txt` não mostra: integridade por rodada, arquivos gravados, de onde vem o tempo de cada latência, ocorrências |
+
+Uma linha do `.txt` começa assim:
+
+```
+Rodada 1 NRT: Latência de processamento P50 - 3927 ms, Latência de processamento P95 - 6186 ms, ...
+```
+
+**As regras** (decisões de 11 e 12/10/2026):
+
+- a **média** é sobre as rodadas válidas do motor, sem separar as que levaram
+  malformados; a linha diz sobre quantas foi calculada;
+- o **desvio padrão** é o amostral (divide por n − 1);
+- uma rodada que **não valeu** aparece no lugar dela, com o motivo, e fica fora da
+  média; o título avisa `INCOMPLETO`;
+- as rodadas com malformados são sinalizadas no título.
+
+Nenhum número é copiado à mão, e rodar de novo com as mesmas rodadas escreve
+exatamente os mesmos arquivos.
+
+> **A última seção do `.md`, "Leitura", é escrita à mão**, e o programa não a
+> reescreve: preserva tudo o que estiver abaixo da linha de marcação, e avisa
+> quando os números mudaram com ela já escrita. Um `.md` de mesmo nome **sem** a
+> linha de marcação não é sobrescrito — o programa para, com código 2.
+
+`INTERVALO=5 CARGA=100` na frente do comando escreve só essa combinação.
 
 ---
 
 ## Verificação final
 
-Se os vinte e um passos acima funcionaram, o ambiente está reproduzido:
+Se os vinte e quatro passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -1146,7 +1434,11 @@ Se os vinte e um passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `reconcile.py` do Spark: 0 perdas, 0 duplicatas, espera no trigger ~metade do trigger
 - [x] O Flink imprime uma linha por checkpoint e commita offsets sob `tcc-rt-flink`
 - [x] O `reconcile.py` do Flink: 0 perdas, 0 duplicatas, processamento em ms, conferência do `ctime` em poucos ms
-- [x] Com eventos malformados, o `reconcile.py` acusa 21 inválidas e 15 nulas no Spark, 15 inválidas e 15 descartadas no Flink, e sai com código 1
+- [x] Com eventos malformados, o `reconcile.py` conta 21 inválidas e 15 nulas no Spark, 15 inválidas e 15 descartadas no Flink, e sai com código 0
+- [x] O `run_round.py` fecha uma rodada válida de cada motor: 0 perdas, 0 duplicatas, fila zerada
+- [x] Na rodada 2, com malformados, a rodada vale e as contagens aparecem: 31 inválidas e 25 nulas no Spark, 21 inválidas e 25 descartadas no Flink
+- [x] O `run_combination.py` alterna os motores, pula as rodadas válidas e, com as 20 válidas, escreve os arquivos e apaga o material bruto
+- [x] O `write_results.py` escreve o `.txt` e o `.md`, e rodar de novo dá arquivos idênticos
 
 ---
 
@@ -1163,6 +1455,8 @@ Decisão E6: **código no Windows, dados em ext4 nativo do WSL.**
 | Parquet de saída | `~/tcc-data/out/spark` e `~/tcc-data/out/flink` — um `<base>` por motor |
 | Checkpoints | `~/tcc-data/checkpoints/nrt` (Spark) e `~/tcc-data/checkpoints/rt` (Flink) |
 | Métricas coletadas | `~/tcc-data/metrics` — manifestos do gerador, logs de progresso dos dois motores, CSVs do coletor e relatórios do `reconcile.py` |
+| Material bruto das rodadas | `results/`, neste repositório e **fora do git** — apagado quando a combinação fecha (passo 23) |
+| Arquivos de resultado | `../../Informações/Resultados Local`, ou a pasta dada em `SAIDA` (passo 24) |
 | Ambiente do Spark | imagem Docker `tcc-spark:4.0.4` — fora do venv |
 | Ambiente do Flink | imagem Docker `tcc-flink:1.20.5` — fora do venv |
 
@@ -1186,6 +1480,10 @@ o serviço.
 
 Antes de medir um motor, **zerar o checkpoint dele**: os dois leem o mesmo tópico,
 e a medição de um deixa pendência para o outro.
+
+O script de rodada (passo 22) confere o relógio, zera o checkpoint e recria o
+tópico sozinho. Fechar os outros programas e parar o `systemd-timesyncd` continua
+sendo com você.
 
 ### Versões travadas (decisão E7)
 
@@ -1226,10 +1524,11 @@ scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1
 scripts/check_clock.py    confere o relógio antes de medir         (Etapa 6.2)
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
-  data-generator/         gerador de eventos                       (Etapa 3)
+  data-generator/         gerador de eventos; aceita SEED e MALFORMED_RATE (Etapas 3 e 8)
+    malformed.py          os 13 tipos de evento malformado, para o gerador e o injetor (Etapa 8)
     inject_malformed.py   injetor de eventos quebrados, para o passo 21 (Etapa 7)
-  analysis/reconcile.py   perdas, duplicatas, latências e is_late, via DuckDB (Etapa 6)
-  monitoring/collector.py consumer lag a cada 1 s, os dois motores (Etapa 6)
+  analysis/reconcile.py   perdas, duplicatas, latências, throughput médio e is_late, via DuckDB (Etapas 6 e 8)
+  monitoring/collector.py consumer lag, CPU e memória a cada 1 s, os dois motores (Etapas 6 e 8)
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
   Dockerfile              runtime: Java 17.0.20, Python, PySpark, conector (Etapa 6.2)
   requirements.txt        as versões do PySpark e do cliente Kafka
@@ -1247,9 +1546,12 @@ pipeline-streaming/       pipeline Flink                           (RT-1+)
   src/config.py           endereços, destino, checkpoint e intervalo
   src/esquema.py          traduz o evento.json para a Table API     (RT-3)
   src/main.py             o job
-benchmarks/               run_experiment.sh                        (Etapa 8)
+benchmarks/               o benchmark                              (Etapa 8)
+  run_round.py            uma rodada de um motor, do começo ao fim
+  run_combination.py      as 10 rodadas de cada motor para um intervalo e uma carga
+  write_results.py        escreve o .txt e o .md de cada combinação
 infra/                    Terraform                                (Etapa 10)
-results/                  CSVs e manifestos por run_id             (Etapa 11)
+results/                  material bruto das rodadas — fora do git, apagado ao fechar a combinação
 ```
 
 A pasta `shared/` é fisicamente separada dos dois pipelines de propósito: é o que
@@ -1267,6 +1569,7 @@ dissertação, em `../../Informações/`:
 | `EtapaNRT/DecisaoEtapaX.md` | registro de cada etapa do NRT: o que foi feito, como, e as decisões com a justificativa |
 | `EtapaRT/DecisaoEtapaRT<N>.md` | o mesmo registro, para as etapas do Flink |
 | `Fala/PontosSensiveis.md` | o que a banca pode cobrar, com a resposta e a evidência de cada ponto |
+| `Resultados Local/` | o `.txt` e o `.md` de cada combinação, escritos pelo `write_results.py` |
 | `perguntas.txt`, `perguntas2.txt` | decisões de projeto do NRT e do Flink, cada uma com a justificativa |
 | `planoNRT.md`, `planoNRT2.md` | versões anteriores, mantidas por rastreabilidade |
 
@@ -1304,7 +1607,8 @@ referência serão medidos de novo nas condições atuais.
       processamento P50 8 ms e visibilidade P50 2,6 s a 100 evt/s
 - [x] **RT-5** — Redefinida: ELT estrito, sem join. Eventos ilegíveis medidos e
       contados; o Flink descarta 15 de 42 e converte tipos que o Spark anula
-- [ ] **RT-6** — Arnês unificado
+- [x] **RT-6** — Arnês unificado: é a Etapa 8 do NRT, a mesma para os dois
+      motores — ver abaixo
 - [ ] **RT-7** — Validação local e caos
 
 ### Pipeline NRT (Spark) — `planoNRT3.md`
@@ -1330,7 +1634,10 @@ referência serão medidos de novo nas condições atuais.
 - [x] **Etapa 7** — Redefinida: ELT estrito, sem join nem limpeza no pipeline. O
       que cada motor faz com eventos ilegíveis foi medido, declarado no contrato
       1.8 e passou a ser contado em toda execução (inválidas, nulas, descartadas)
-- [ ] **Etapa 8** — Arnês de benchmark
+- [x] **Etapa 8** — Arnês de benchmark: os pipelines encerram por pedido ou por
+      inatividade; seed por rodada e 1% de malformados em 4 das 10; CPU e memória
+      no coletor; uma rodada, uma combinação e os arquivos de resultado por
+      comando. Contrato 1.9
 - [ ] **Etapa 9** — Validação local e caos
 - [ ] **Etapa 10** — Terraform e AWS
 - [ ] **Etapa 11** — Benchmarks oficiais

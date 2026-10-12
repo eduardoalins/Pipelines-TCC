@@ -36,9 +36,10 @@ nenhum deles.
 
 --- Saida ------------------------------------------------------------------
 Relatorio na tela e um JSON em ~/tcc-data/metrics/reconcile.<motor>.<run_id>.json,
-para o arnes da Etapa 8. Sai com 0 se nao houver perda, duplicata, linha
-invalida, linha nula nem descarte; 1 caso contrario — para o arnes perceber sem
-ler a tela.
+para o arnes da Etapa 8. Sai com 0 se nao houver perda nem duplicata entre os
+eventos validos; 1 caso contrario — para o arnes perceber sem ler a tela.
+Invalidas, nulas e descartadas sao reportadas, mas NAO reprovam: no benchmark, 4
+das 10 rodadas de cada combinacao levam eventos malformados de proposito.
 """
 
 import json
@@ -220,6 +221,49 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
     return {"invalidas": invalidas, "nulas": nulas, "descartadas": descartadas,
             "linhas_no_destino": linhas, "linhas_em_particao_nula": fora,
             "mensagens_no_topico": mensagens, "nulos_por_campo": por_campo}
+
+
+# --- Throughput medio -------------------------------------------------------
+
+def throughput_medio(con, modo: str) -> dict | None:
+    """Eventos gravados por segundo na execucao, sem a primeira unidade de progresso.
+
+        eventos  linhas das unidades DEPOIS da primeira (na pasta do run_id)
+        tempo    do commit da primeira unidade ao commit da ultima
+
+    A regra de descarte e a mesma das latencias — so o aquecimento sai (decisao
+    de 11/10/2026). Consequencia declarada: a ultima unidade entra, e ela quase
+    sempre grava menos eventos no mesmo intervalo, porque o gerador ja parou.
+    Por isso, quando o pipeline acompanha a carga, este numero fica um pouco
+    ABAIXO dela: ~7% numa execucao de 60 s com intervalo de 5 s, menos de 1% numa
+    de 10 min. Quando nao acompanha, mostra a capacidade do motor.
+
+    O commit de cada unidade vem do mesmo lugar que na latencia de visibilidade:
+    log de progresso no Spark, ctime dos arquivos no Flink (CONTRATO.md 2.2).
+    """
+    if modo == "arquivo":
+        unidades = con.execute("""
+            SELECT unidade, count(*), max(committed_ts) FROM ev GROUP BY unidade ORDER BY unidade
+        """).fetchall()
+    else:
+        unidades = con.execute("""
+            SELECT u.unidade, u.n, g.committed_ts
+            FROM (SELECT unidade, count(*) AS n FROM ev GROUP BY unidade) u
+            LEFT JOIN prog g ON g.processed_ts = u.unidade
+            ORDER BY u.unidade
+        """).fetchall()
+
+    commits = [c for _, _, c in unidades]
+    if len(unidades) < 2 or any(c is None for c in commits) or commits[-1] <= commits[0]:
+        print("\n  THROUGHPUT MEDIO .......... indisponivel (menos de 2 unidades com commit)")
+        return None
+    eventos = sum(n for _, n, _ in unidades[1:])
+    segundos = (commits[-1] - commits[0]) / 1000
+    evt_s = eventos / segundos
+    print(f"\n  THROUGHPUT MEDIO .......... {evt_s:.1f} evt/s   "
+          f"({eventos} eventos em {segundos:.1f} s, sem a 1a unidade)")
+    return {"evt_s": round(evt_s, 2), "eventos": eventos, "segundos": round(segundos, 3),
+            "unidades": len(unidades) - 1}
 
 
 # --- Latencia no Flink (committed_ts = ctime do arquivo) ---------------------
@@ -560,6 +604,10 @@ def main() -> int:
         relatorio["latencia_ms"] = lat
         relatorio["latencia_eventos_sem_log"] = sem_log
 
+    # --- 2b. Throughput medio (Etapa 8) ---------------------------------------
+    if "processed_ts" in colunas and (modo == "arquivo" or logs):
+        relatorio["throughput_medio"] = throughput_medio(con, modo)
+
     # --- 3. Watermark e is_late (CONTRATO.md 2.1) ---------------------------
     print("\n--- 3. Atraso (watermark = max acumulado de event_ts - 60 s) ---")
     if "processed_ts" not in colunas:
@@ -588,9 +636,12 @@ def main() -> int:
         relatorio["is_late"] = atrasados
 
     # --- Veredito ---------------------------------------------------------------
-    # Descartadas "indisponivel" nao reprova: so um numero diferente de zero.
-    ok = (total_perdas == 0 and total_dup == 0 and invalidas == 0 and nulas == 0
-          and not descartadas and bool(nota))
+    # O que reprova: perda ou duplicata entre os eventos VALIDOS, ou a falta do
+    # manifesto. Invalidas, nulas e descartadas sao INFORMACAO, nunca motivo de
+    # reprovacao (decisao de 11/10/2026): 4 das 10 rodadas de cada combinacao
+    # levam malformados de proposito, e reprovar por eles seria descartar
+    # justamente o que se quer medir.
+    ok = total_perdas == 0 and total_dup == 0 and bool(nota)
     relatorio["ok"] = ok
     METRICS.mkdir(parents=True, exist_ok=True)
     saida = METRICS / f"reconcile.{MOTOR}.{RUN_ID}.json"

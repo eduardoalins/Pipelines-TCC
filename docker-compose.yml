@@ -17,7 +17,8 @@ services:
     hostname: kafka
 
     ports:
-      # 9092 e a porta que o Spark, o Flink e o gerador usam.
+      # 9092 e a porta de quem roda no WSL: o gerador, o coletor e os scripts
+      # de rodada. O Spark e o Flink, na rede do Docker, usam a 29092.
       # O controlador (9093) fica interno ao container de proposito: nenhum
       # cliente deve falar com ele.
       - "9092:9092"
@@ -38,8 +39,9 @@ services:
       # todas as seguintes falham — com um erro que nao diz isso.
       #
       # Por isso dois enderecos distintos:
-      #   INTERNAL (kafka:29092)   quem esta na rede do Docker
-      #   EXTERNAL (localhost:9092) o Spark e o gerador, que rodam no WSL
+      #   INTERNAL (kafka:29092)   quem esta na rede do Docker: o Spark e o Flink
+      #   EXTERNAL (localhost:9092) quem roda no WSL: o gerador, o coletor e os
+      #                             scripts de rodada
       KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT

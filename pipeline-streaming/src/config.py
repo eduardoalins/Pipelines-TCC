@@ -19,8 +19,8 @@ from pyflink.version import __version__ as FLINK_VERSION
 
 # --- Kafka ---------------------------------------------------------------
 # kafka:29092 e o listener INTERNAL: este codigo roda DENTRO do conteiner, na
-# rede do Docker. O Spark, que roda no host, usa localhost:9092 — assimetria
-# declarada no docker-compose.yml e no planoRT.md secao 0.5.
+# rede do Docker. O Spark usa o mesmo endereco desde 10/10/2026, quando passou a
+# rodar em conteiner; ate la rodava no host e usava localhost:9092.
 BOOTSTRAP = os.getenv("BOOTSTRAP", "kafka:29092")
 
 TOPIC = os.getenv("TOPIC", "ecommerce.events.v1")

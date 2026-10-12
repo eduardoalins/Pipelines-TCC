@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 1.8 — 11/10/2026**
+**Versão 1.9 — 12/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -92,7 +92,7 @@ dois motores estariam lendo dados distribuídos de forma diferente.
 ### 1.4 Distribuição de `user_id`
 
 **`user_id` é sorteado com distribuição uniforme sobre o intervalo fechado
-[1, 2000], com seed fixa.**
+[1, 2000], com a seed da rodada (seção 5.1).**
 
 **Por que a cardinalidade entra no contrato.** Ela não tem relação com o volume
 de carga — este é controlado pela taxa do gerador e pela duração da execução. O
@@ -104,9 +104,10 @@ esperada é de ~83 chaves por partição, com desvio padrão de ~9 — na práti
 partições variam entre aproximadamente 60 e 105 chaves, cerca de ±25% nos
 extremos. Com 100.000 chaves o desvio seria de ~1,5%.
 
-**Isso não ameaça a comparação**, por um motivo: o sorteio é determinístico com
-seed fixa, portanto o desequilíbrio é exatamente o mesmo em toda execução e
-idêntico nos dois motores. O efeito é um leve pessimismo na latência absoluta —
+**Isso não ameaça a comparação**, por um motivo: o sorteio é determinístico pela
+seed, e a rodada N usa a mesma seed nos dois motores (seção 5.1). O desequilíbrio
+muda de uma rodada para outra, mas dentro de cada rodada é idêntico para o Spark e
+para o Flink. O efeito é um leve pessimismo na latência absoluta —
 o micro-batch termina quando a partição mais pesada termina. Registrado como
 característica do desenho, não como ameaça à validade.
 
@@ -193,7 +194,7 @@ dentro do arquivo que acabou de ser escrito.
 |---|---|---|
 | De onde vem | **log de progresso**, uma linha por micro-batch, tomada depois que o `write()` retorna | **`ctime` do arquivo**: o instante em que ele é renomeado de oculto (`.part-…inprogress`) para visível |
 | Como se liga ao evento | pelo par (`batch_id`, `processed_ts`), gravado nos dois lugares | pelo arquivo em que o evento foi gravado |
-| Exatidão medida | ~20 ms **depois** do arquivo ficar visível, sempre (batches 2 a 7 em 25/09) | do fim do checkpoint registrado pela REST API do Flink: −7 a +8 ms (6 checkpoints em 25/09) e −10 a +7 ms (13 checkpoints em 10/10) |
+| Exatidão medida | ~20 ms **depois** do arquivo ficar visível, sempre (batches 2 a 7 em 25/09) | do fim do checkpoint registrado pela REST API do Flink: −7 a +8 ms (6 checkpoints em 25/09), −10 a +7 ms (13 checkpoints em 10/10) e **−13 a +16 ms** nas execuções de 11/10 (uma conferência com −13 a +3 ms e cinco rodadas de teste, 59 checkpoints, com −12 a +16 ms) |
 
 **Por que o Flink pelo arquivo.** Cada arquivo do Flink é finalizado por
 **exatamente um** checkpoint: a associação evento → instante de visibilidade é
@@ -221,9 +222,10 @@ provável, não verificada). O log não tem esse erro.
 - **Nada pode tocar nos arquivos do Flink depois de gravados.** `chmod`, `chown` ou
   cópia mudam o `ctime` e falsificam a latência de visibilidade, sem erro.
 - **Os dois instrumentos têm erros pequenos e diferentes:** o log do Spark ~20 ms
-  tarde; o `ctime` do Flink dentro de ±10 ms (as duas medições acima). Numa
-  latência de visibilidade de segundos, a diferença é desprezível, mas existe e
-  está registrada. A causa da faixa do `ctime` não foi verificada.
+  tarde; o `ctime` do Flink entre −13 e +16 ms do fim do checkpoint (as medições
+  acima; até a versão 1.8 esta linha dizia "±10 ms"). Numa latência de
+  visibilidade de segundos, a diferença é desprezível, mas existe e está
+  registrada. A causa da faixa do `ctime` não foi verificada.
 
 ### 2.3 `batch_id` no Flink — não existe (versão 1.6, 25/09/2026)
 
@@ -378,9 +380,23 @@ anotação por execução com o número de mensagens que o tópico recebeu
 (`<run_id>.topico.json`); sem ela a contagem é reportada como indisponível, nunca
 estimada.
 
-**Numa execução medida as três contagens têm de ser zero.** O gerador só emite
-eventos válidos. Um valor diferente de zero reprova a execução (o `reconcile.py`
-sai com código 1).
+**As três contagens são informação, e nunca reprovam a execução (versão 1.9,
+decisão de 11/10/2026).** O que reprova é **perda ou duplicata entre os eventos
+válidos** — é o que faz o `reconcile.py` sair com código 1. Até a versão 1.8 um
+valor diferente de zero nas três contagens também reprovava, porque o gerador só
+emitia eventos válidos. Isso mudou:
+
+**No benchmark, 4 das 10 rodadas de cada combinação levam eventos malformados de
+propósito** — as rodadas 2, 5, 7 e 10, as mesmas para os dois motores e para todas
+as combinações. Nelas, **1% das mensagens** é malformada: o próprio gerador as
+emite (`MALFORMED_RATE`), **no lugar** de eventos válidos, a intervalos fixos, com
+os 13 tipos de `shared/data-generator/malformed.py` em rodízio. Os malformados que
+ainda são JSON levam `gen_id` 99, para se distinguirem dos eventos válidos
+(`gen_id` 0), que são os que têm manifesto e sobre os quais se contam as perdas.
+
+As três contagens passam a ser **resultado**: são o registro do que cada motor fez
+com os malformados. As médias e os desvios padrão de uma combinação são
+calculados sobre as 10 rodadas, sem separar as que levaram malformados.
 
 **Dois limites, declarados:**
 - Um `amount` trocado por texto vira nulo, e nulo é valor legítimo para o
@@ -398,7 +414,7 @@ sai com código 1).
 | Partições | **24** | Teto do paralelismo dos dois frameworks; fixado uma vez e nunca alterado |
 | Fator de replicação | 1 local, **3** na nuvem | RF 3 é necessário para o teste de queda de broker (cenário C2) |
 | `min.insync.replicas` | 1 local, **2** na nuvem | Sem isso, `acks=all` com RF 3 ainda perde dados (decisão E1) |
-| `retention.ms` | ver 3.1 | |
+| `retention.ms` | **168 h** | ver 3.1 |
 | `retention.bytes` | **1 GiB por partição** | ver 3.2 |
 | `compression.type` (tópico) | `producer` | O broker preserva a compressão aplicada pelo produtor |
 | `acks` (produtor) | `all` | Sem isso, "evento perdido" pode ser falha do gerador e não do pipeline |
@@ -407,20 +423,28 @@ sai com código 1).
 | `linger.ms` (produtor) | **5** | ver 3.3 |
 | `auto.create.topics.enable` | `false` | Guarda de validade: com auto-create, um nome errado cria topico de 1 partição e o experimento roda com paralelismo 1 sem erro na tela |
 
-### 3.1 Retenção por tempo — dois valores declarados
+### 3.1 Retenção por tempo — 168 h, e o tópico recriado a cada rodada (versão 1.9)
 
-| Fase | `retention.ms` | Motivo |
-|---|---|---|
-| Aprendizado (Etapas 2 a 7) | **168 h** | As mensagens de teste sobrevivem entre sessões de trabalho |
-| Medição (Etapa 8 em diante) | **2 h** | Cobre a maior execução com folga e controla o consumo de disco |
+**`retention.ms` é de 168 h, um valor só**, declarado no `docker-compose.yml`.
 
-A execução mais longa do protocolo é o Experimento A com trigger de 10 minutos,
-que dura 60 minutos.
+**O que controla o tópico numa medição não é a retenção: é a recriação.** O
+`benchmarks/run_round.py` apaga e recria o tópico no começo de cada rodada (seção
+5.2). O tópico nunca guarda mais que uma rodada, e uma rodada dura minutos — a
+retenção por tempo não chega a agir. O freio de tamanho da seção 3.2 continua
+valendo.
 
-**Guarda obrigatória.** O `benchmarks/run_experiment.sh` (Etapa 8) verifica o
-valor configurado antes de iniciar e **aborta** se estiver no valor de
-aprendizado. Mesmo princípio do `auto.create.topics.enable=false`: um parâmetro
-errado numa execução medida não pode falhar em silêncio.
+**O que esta seção dizia até a versão 1.8, e não foi implementado.** Dois valores
+— 168 h na fase de aprendizado e **2 h** na de medição — e uma "guarda
+obrigatória": o script de benchmark abortaria se encontrasse o valor de
+aprendizado. A retenção nunca saiu das 168 h e a guarda nunca foi escrita. Com o
+tópico recriado a cada rodada (decisão de 11/10/2026) as duas perderam a função: a
+recriação garante mais do que elas garantiriam — nenhuma mensagem de outra rodada,
+nem do outro motor.
+
+**Limite declarado.** Fora do script de rodada — nas execuções feitas à mão — as
+mensagens ficam no tópico por até 168 h, e passado esse prazo o Kafka apaga tudo
+sem aviso (visto em 07/10/2026). Na nuvem o valor é revisto junto com o fator de
+replicação.
 
 ### 3.2 Retenção por tamanho — a unidade importa
 
@@ -438,7 +462,7 @@ partição.
 **Valor adotado: 1 GiB por partição**, teto total de ~24 GB. Próximo da intenção
 original dos 20 GB, com mais de 3× de margem sobre a maior execução. Funciona
 como freio de segurança contra um gerador descontrolado; o controle do dia a dia
-é a retenção por tempo.
+é a recriação do tópico a cada rodada (seção 3.1).
 
 ### 3.3 Partitioner e `linger.ms` do produtor
 
@@ -608,12 +632,13 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 |---|---|
 | Schema do evento | Seção 1.1, sem alteração |
 | Chave da mensagem | `user_id`, representação decimal em UTF-8 (seção 1.3) |
-| Distribuição de `user_id` | Uniforme em [1, 2000], seed fixa (seção 1.4) |
+| Distribuição de `user_id` | Uniforme em [1, 2000], pela seed da rodada (seções 1.4 e 5.1) |
 | Colunas de saída | Seção 2. `processed_ts` idêntica nos dois (2.5); `batch_id` só no Spark — no Flink a unidade de progresso é o checkpoint, reconhecido pelo grupo de arquivos que ficam visíveis juntos (2.3). `committed_ts` com origem por motor, declarada (2.2) |
 | Cálculo do watermark | Máximo acumulado de `event_ts` menos 60 s, monotônico — **derivado na análise**, igual para os dois motores (seção 2.1) |
 | Tópico e partições | `ecommerce.events.v1`, 24 partições |
-| Gerador e seed | Mesmo binário, mesma seed, mesmo `config.yaml` |
-| Carga | Mesmos níveis, mesma duração, mesmas repetições |
+| Gerador e seed | Mesmo binário, mesmo `config.yaml`, e **a mesma seed na mesma rodada**: a rodada N do Spark e a do Flink recebem os mesmos eventos (seção 5.1) |
+| Carga | Mesmos níveis, mesma duração, mesmas 10 rodadas por combinação, com malformados nas mesmas quatro (seções 2.6 e 5.1) |
+| Estado inicial de cada rodada | Tópico recriado e vazio, checkpoint do motor apagado, leitura desde o início do tópico (seção 5.2) |
 | Transformações | **Nenhuma dentro do pipeline** (ELT estrito, seção 2.6): os dois carregam os dez campos como chegam, sem limpeza e sem join. O watermark é derivado na análise (2.1). Até a versão 1.7 esta linha previa "mesma limpeza, mesmo broadcast join", e havia uma linha para a tabela de produtos; nenhum dos dois chegou a ser implementado |
 | Particionamento do destino | Derivado de `event_ts`, em UTC (seção 4.1) |
 | Codec do Parquet | `snappy`, declarado explicitamente nos dois (seção 4.4) |
@@ -622,9 +647,22 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Análise | O mesmo `reconcile.py` |
 | Infraestrutura | Mesmos tipos de instância, mesma AZ, mesma região |
 
-### 5.1 Reprodução da carga: seed fixa, sem replay
+### 5.1 Reprodução da carga: uma seed por rodada, sem replay
 
-O gerador é pseudoaleatório e semeado. Exige duas garantias de implementação:
+O gerador é pseudoaleatório e semeado. **Cada rodada tem a sua seed, e ela é a
+mesma para os dois motores (versão 1.9):** a rodada N usa a seed 41 + N — a
+rodada 1 usa 42, a rodada 10 usa 51. Até a versão 1.8 a seed era uma só, fixa.
+
+**Por quê.** Com uma seed só, as 10 rodadas de uma combinação repetiriam a mesma
+sequência de eventos, e a variação entre elas mediria apenas o ruído da máquina.
+Com uma seed por rodada, a variação inclui a dos dados. E com a mesma seed nos
+dois motores, a rodada N continua sendo uma comparação sobre entrada idêntica.
+
+Nas rodadas 2, 5, 7 e 10 (seção 2.6) os malformados entram em posições fixas e
+com os tipos em rodízio, de modo que os dois motores recebem os mesmos
+malformados, nas mesmas posições.
+
+Exige duas garantias de implementação:
 
 1. **Um único thread produtor por `gen_id`**
 2. **Nenhum uso de relógio ou entropia** no sorteio dos campos
@@ -632,6 +670,34 @@ O gerador é pseudoaleatório e semeado. Exige duas garantias de implementação
 O `event_ts` difere entre as execuções do Spark e do Flink, o que é irrelevante:
 toda latência é calculada em relação ao próprio `event_ts` de cada evento. O que
 precisa ser idêntico é a **sequência de eventos**, não o instante absoluto.
+
+### 5.2 Como uma rodada é feita (versão 1.9)
+
+Uma rodada é executada por `benchmarks/run_round.py`, sempre do mesmo estado
+inicial:
+
+1. o checkpoint do motor é apagado;
+2. **o tópico é apagado e recriado**, e a posição do grupo de consumo é apagada:
+   toda rodada começa com as 24 partições vazias, sem mensagens da rodada anterior
+   nem do outro motor;
+3. o pipeline lê **desde o início do tópico** (`earliest`);
+4. o gerador roda pela duração da rodada;
+5. a rodada termina quando o gerador terminou **e** a fila do grupo de consumo
+   zerou; o pipeline é então encerrado por um arquivo de parada.
+
+**As 10 rodadas de uma combinação alternam os motores**, e quem começa inverte a
+cada rodada: Spark e Flink na rodada 1, Flink e Spark na 2, e assim por diante
+(`benchmarks/run_combination.py`). O que muda ao longo da sessão — a máquina
+esquentar, outro programa abrir — pesa igual sobre os dois.
+
+**O relógio é conferido antes de cada rodada** (`scripts/check_clock.py`); uma
+rodada com o relógio reprovado não começa.
+
+**O que fica de uma combinação.** Quando as 20 rodadas estão válidas, são escritos
+os arquivos de resultado (`benchmarks/write_results.py`) e o material bruto das
+rodadas é apagado. O Parquet de cada rodada é apagado antes, logo depois de
+reconciliado. Consequência declarada: os números publicados não podem ser
+regerados a partir do material bruto; para isso é preciso refazer a combinação.
 
 ---
 
@@ -646,7 +712,7 @@ a igualar o que não deve ser igualado.
 | `processed_ts`, `batch_id` / `checkpoint_id` | A semântica é idêntica; os valores são produzidos pela máquina |
 | Nomes dos arquivos `part-*` | Convenção de cada motor. O que precisa casar é a estrutura de diretórios |
 | **Número de arquivos por execução** | É **resultado medido**, não parâmetro a igualar |
-| Retenção do tópico entre fase de aprendizado e medição | Precisa ser igual entre os motores dentro da mesma fase, não entre fases |
+| Retenção do tópico | É a mesma para os dois motores (168 h) e não age numa rodada: o tópico é recriado no começo de cada uma (seção 3.1) |
 | **Destino de um evento que o motor não consegue ler** | Cada motor faz o que faz por padrão (seção 2.6). Igualar exigiria limpeza dentro do pipeline, que o ELT estrito exclui. É diferença **declarada e contada**, não parâmetro a igualar |
 
 **Sobre o número de arquivos.** É tentador tratá-lo como invariante. Forçá-lo a
@@ -672,6 +738,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 1.9 | 12/10/2026 | **§2.6, §3.1, §5 e §5.1 alterados; §5.2 novo; §1.4 e §2.2 ajustados.** A seed deixa de ser fixa: **uma por rodada (41 + N), a mesma para os dois motores**. **Quatro das dez rodadas de cada combinação (2, 5, 7 e 10) levam 1% de eventos malformados**, emitidos pelo gerador no lugar de eventos válidos. As contagens de inválidas, nulas e descartadas **deixam de reprovar** a execução e passam a ser resultado; perdas e duplicatas entre os eventos válidos continuam reprovando. Fica registrado como uma rodada é feita (tópico recriado, leitura desde o início, motores alternados, relógio conferido) e que o material bruto é apagado quando a combinação fecha. A exatidão medida do `ctime` do Flink passa de "±10 ms" para −13 a +16 ms. **Retenção (§3.1):** saem o valor de 2 h para a medição e a guarda que abortaria, que nunca foram implementados; fica um valor só, 168 h, e o controle passa a ser a recriação do tópico | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita. As execuções de aprendizado anteriores usaram a seed 42 e só eventos válidos, e não entram nos resultados |
 | 1.8 | 11/10/2026 | **§2.6 novo; §5 e §6 alterados.** O pipeline passa a ser declarado **ELT estrito**: carrega, não transforma. Saem das invariantes a "mesma limpeza", o "mesmo broadcast join" e a tabela de produtos, que nunca foram implementados. O tratamento de eventos que o motor não consegue ler **não é igualado**: o Spark grava linha nula, o Flink descarta, e os dois divergem na conversão de tipos (medido em 11/10/2026). A diferença é declarada e passa a ser contada em toda execução — inválidas, nulas e descartadas | **Nenhuma.** Os pipelines não mudam: gravam exatamente o que gravavam. As execuções de 10/10/2026, reconciliadas de novo, dão as mesmas latências, com 0 inválidas e 0 nulas |
 | 1.7 | 10/10/2026 | **§2.3 alterado; §2.2 corrigido.** A unidade de progresso do Flink deixa de ser o arquivo e passa a ser o **checkpoint, reconhecido pelo grupo de arquivos** cujo `ctime` dista até 1 s: em 10/10/2026 os 8 arquivos de 2 dos 13 checkpoints saíram em dois instantes, a 10 ms um do outro, e a regra antiga contava 15 unidades. O `committed_ts` de cada evento continua sendo o `ctime` do próprio arquivo. A exatidão do `ctime` passa de "±8 ms" para a faixa das duas medições (−7..+8 ms e −10..+7 ms). Nenhuma coluna, layout ou parâmetro de execução muda | **Nenhuma.** É regra de análise, sem efeito no que os pipelines gravam. A execução `20261010T213810Z-r100`, reconciliada pelas duas regras, deu latências idênticas (o primeiro checkpoint não estava dividido); só a contagem passou de 15 para 13 |
 | 1.6 | 25/09/2026 | **§2.2 e §2.3 alterados (decisão C2).** O Flink não grava `batch_id`: a unidade de progresso dele é o arquivo. O `committed_ts` passa a ter **origem por motor**: log de progresso no Spark; `ctime` do arquivo no Flink, verificado a ±8 ms do fim do checkpoint. O Spark fica no log porque o `ctime` dele adianta até ~300 ms quando a pasta de destino é nova. Assimetria de instrumento declarada | **Nenhuma.** O Flink ainda não gravava as colunas de medição, e o Spark não muda |

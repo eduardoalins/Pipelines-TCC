@@ -15,6 +15,9 @@ out/
 *.parquet
 *.crc
 _spark_metadata/
+# O material bruto das rodadas do benchmark. E apagado quando a combinacao fecha
+# (benchmarks/run_combination.py); o que fica dela sao o .txt e o .md de resultado.
+results/
 
 # --- Logs ---
 logs/

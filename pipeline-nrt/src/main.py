@@ -14,8 +14,10 @@ Rodar pelo lancador, nunca por `python main.py`:
 
     bash pipeline-nrt/run_local.sh
 
-O motivo esta no run_local.sh: --driver-memory e --packages precisam ser
-resolvidos ANTES da JVM subir, e este arquivo ja roda depois disso.
+O motivo esta no run_local.sh e no submit.sh: --driver-memory e os jars do
+conector (--jars) precisam ser resolvidos ANTES da JVM subir, e este arquivo ja
+roda depois disso. Ate 10/10/2026, com o Spark no host, os jars vinham por
+--packages; hoje ja estao na imagem.
 """
 
 import json

@@ -208,9 +208,11 @@ def main() -> int:
     # Sem a coluna da chave: o Spark tambem a descartou. O destino tem os dez
     # campos do evento e as colunas de medicao.
     #
-    # 'json.ignore-parse-errors': um evento malformado vira campos nulos em vez
-    # de derrubar o job, como o from_json do Spark. A equivalencia exata dos
-    # dois comportamentos e verificada na limpeza (RT-5).
+    # 'json.ignore-parse-errors': um evento malformado nao derruba o job. O que
+    # acontece com ele NAO e igual ao from_json do Spark (medido na RT-5, em
+    # 11/10/2026): uma mensagem que nao e JSON e DESCARTADA aqui, sem aviso, e
+    # no Spark vira uma linha toda nula; um campo que nao se le vira nulo nos
+    # dois. A diferenca e declarada (CONTRATO.md 2.6) e contada pelo reconcile.py.
     #
     # group.id + commit no checkpoint (decisao F7): o Flink devolve ao Kafka os
     # offsets do ultimo checkpoint completo — o mesmo papel do commit que o

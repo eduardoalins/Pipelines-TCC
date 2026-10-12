@@ -36,8 +36,10 @@ run_id=__HIVE_DEFAULT_PARTITION__ (Spark) e run_id=__DEFAULT_PARTITION__ (Flink)
 --- Por que os dois NAO foram igualados ----------------------------------------
 O pipeline e ELT estrito (decisao de 11/10/2026): carrega, nao limpa. Limpeza e
 transformacao, e fica para o destino. A diferenca acima e declarada no
-CONTRATO.md e CONTADA pelo reconcile.py em toda execucao — num benchmark, as tres
-contagens tem de dar zero.
+CONTRATO.md e CONTADA pelo reconcile.py em toda execucao. As tres contagens sao
+informacao e nunca reprovam (decisao de 11/10/2026): no benchmark, 4 das 10
+rodadas de cada combinacao levam 1% de malformados de proposito, emitidos pelo
+proprio gerador (MALFORMED_RATE).
 
 --- ATENCAO ---------------------------------------------------------------------
 As 42 mensagens quebradas FICAM no topico ate a retencao apaga-las ou o topico
@@ -64,6 +66,9 @@ import yaml
 from confluent_kafka import Producer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from malformed import (  # noqa: E402
+    CONTROLE, GEN_ID_MALFORMADOS, MALFORMADOS, marcador as marcador_de, texto,
+)
 from schema import FabricaDeEventos  # noqa: E402
 
 AQUI = pathlib.Path(__file__).resolve().parent
@@ -73,46 +78,10 @@ VALIDOS = 420
 A_CADA = 10      # um quebrado depois de cada 10 validos
 POR_TIPO = 3
 
-
-def texto(evento: dict) -> bytes:
-    return json.dumps(evento, separators=(",", ":")).encode("utf-8")
-
-
-def com(evento: dict, **troca) -> bytes:
-    return texto({**evento, **troca})
-
-
-def sem(evento: dict, campo: str) -> bytes:
-    return texto({k: v for k, v in evento.items() if k != campo})
-
-
-def numero(marcador: str) -> int:
-    return int(marcador.rsplit("-", 1)[1])
-
-
-# tipo -> funcao(evento base, marcador) -> valor da mensagem (bytes, ou None)
-TIPOS = {
-    # --- nao e um evento ------------------------------------------------------
-    "nao_json":           lambda e, m: f"isto nao e json: {m}".encode(),
-    "json_truncado":      lambda e, m: texto(e)[: len(texto(e)) // 2],
-    "json_array":         lambda e, m: b"[1, 2, 3]",
-    "vazio":              lambda e, m: b"",
-    "nulo":               lambda e, m: None,
-    # --- tipo errado num campo --------------------------------------------------
-    "texto_em_seq":       lambda e, m: com(e, seq="abc"),
-    "numero_como_texto":  lambda e, m: com(e, user_id="17"),
-    # Valor DIFERENTE em cada um dos tres: o Flink trunca a fracao, e tres
-    # eventos com o mesmo seq apareceriam como duplicata no reconcile.py.
-    "fracao_em_inteiro":  lambda e, m: com(e, seq=900_000 + numero(m) + 0.5),
-    "estouro_int32":      lambda e, m: com(e, user_id=9_999_999_999),
-    "texto_em_amount":    lambda e, m: com(e, amount="caro"),
-    "texto_em_event_ts":  lambda e, m: com(e, event_ts="ontem"),
-    # --- campo ausente ----------------------------------------------------------
-    "sem_seq":            lambda e, m: sem(e, "seq"),
-    "sem_run_id":         lambda e, m: sem(e, "run_id"),
-    # --- controle: este e VALIDO e tem de passar ----------------------------------
-    "campo_extra":        lambda e, m: com(e, extra="x"),
-}
+# Os 13 tipos malformados (os mesmos que o gerador usa nas rodadas com
+# malformados) mais o controle, que e valido e tem de passar. A lista vive no
+# malformed.py: um lugar so, para as duas nao divergirem.
+TIPOS = {**MALFORMADOS, **CONTROLE}
 
 
 def main() -> int:
@@ -129,7 +98,8 @@ def main() -> int:
     # Duas fabricas, com seeds diferentes: os quebrados nao consomem a
     # sequencia dos validos, que fica identica a do gerador.
     validos = FabricaDeEventos(random.Random(int(cfg["seed"])), cfg, 0, run_id)
-    quebrados = FabricaDeEventos(random.Random(int(cfg["seed"]) + 1), cfg, 99, run_id)
+    quebrados = FabricaDeEventos(random.Random(int(cfg["seed"]) + 1), cfg,
+                                 GEN_ID_MALFORMADOS, run_id)
 
     confirmados = {"ok": 0, "erro": 0}
     injetados = []
@@ -152,10 +122,10 @@ def main() -> int:
                          value=texto(ev), callback=entregue_valido)
         if (i + 1) % A_CADA == 0 and fila:
             tipo, n = fila.pop(0)
-            marcador = f"malf-{tipo}-{n}"
+            marcador = marcador_de(tipo, n)
             base = quebrados.proximo(agora)
             base["event_id"] = marcador
-            valor = TIPOS[tipo](base, marcador)
+            valor = TIPOS[tipo](base, n)
             registro = {"tipo": tipo, "n": n, "event_id": marcador,
                         "valor": None if valor is None else valor.decode("utf-8", "replace")}
             injetados.append(registro)

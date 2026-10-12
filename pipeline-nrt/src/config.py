@@ -18,8 +18,9 @@ import pyspark
 
 
 # --- Kafka ---------------------------------------------------------------
-# localhost:9092 e o listener EXTERNAL do broker, o mesmo que o gerador usa.
-# Quem roda dentro da rede do Docker usaria kafka:29092; nada aqui roda la.
+# localhost:9092 e o listener EXTERNAL do broker, o mesmo que o gerador usa, e
+# e so o valor PADRAO. Desde 10/10/2026 este codigo roda em conteiner, na rede do
+# Docker, e recebe do docker-compose.yml BOOTSTRAP=kafka:29092, o listener INTERNAL.
 BOOTSTRAP = os.getenv("BOOTSTRAP", "localhost:9092")
 
 TOPIC = os.getenv("TOPIC", "ecommerce.events.v1")

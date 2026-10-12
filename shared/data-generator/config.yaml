@@ -2,7 +2,7 @@
 #
 # Este arquivo e ARNES COMPARTILHADO: o pipeline Flink (OE 2) usa o mesmo
 # gerador com o mesmo config. Ver CONTRATO.md secao 5 — "Gerador e seed:
-# mesmo binario, mesma seed, mesmo config.yaml".
+# mesmo binario, mesmo config.yaml, e a mesma seed na mesma rodada".
 #
 # Rodar:
 #   ~/.venvs/tcc/bin/python shared/data-generator/generator.py
@@ -20,9 +20,17 @@ topic: "ecommerce.events.v1"
 gen_id: 0
 run_id: null
 
-# Seed fixa. Sem ela a carga nao e reproduzivel e a comparacao com o Flink
-# deixa de valer (CONTRATO.md 5.1).
+# Seed. Sem ela a carga nao e reproduzivel e a comparacao com o Flink deixa de
+# valer (CONTRATO.md 5.1). Este e o valor PADRAO; no benchmark cada rodada usa a
+# sua, passada por SEED=..., e a mesma seed vale para os dois motores naquela
+# rodada (decisao de 11/10/2026).
 seed: 42
+
+# Proporcao de mensagens malformadas, que entram NO LUGAR de eventos validos.
+# 0 = so eventos validos, o comportamento de sempre. No benchmark, 4 das 10
+# rodadas usam MALFORMED_RATE=0.01 (1 a cada 100). Os tipos estao no
+# malformed.py; o que cada motor faz com eles, no CONTRATO.md 2.6.
+malformed_rate: 0.0
 
 # --- Carga -------------------------------------------------------------
 rate_per_sec: 100
