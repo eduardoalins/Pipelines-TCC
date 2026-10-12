@@ -65,6 +65,23 @@ METRICS = DATA_DIR / "metrics"
 # CONTRATO.md 2.1: watermark = maximo ACUMULADO de event_ts menos 60 s.
 ATRASO_WATERMARK_MS = 60_000
 
+# --- Aquecimento (decisao de 12/10/2026) --------------------------------------
+# Os primeiros eventos de uma execucao sao processados com o motor frio. As
+# latencias "em regime" deixam de fora os eventos GERADOS nos primeiros
+# AQUECIMENTO_S segundos — contados do primeiro evento da execucao, pelo
+# event_ts. A regra e a MESMA nos dois motores: sai o mesmo TRECHO da carga. A
+# rodada N dos dois recebe os mesmos eventos (mesma seed), mas o event_ts e o
+# instante real da emissao, entao na borda do corte poucos eventos diferem
+# (medido em 12/10/2026: 4999 e 5002 fora, de 60000).
+#
+# No benchmark quem passa o valor e o run_round.py: o intervalo da combinacao —
+# 5 s nas rodadas de 60 s, 30 s nas de 5 min. Sem a variavel, 5 s.
+#
+# Ate 12/10/2026 descartava-se a primeira unidade de progresso (o primeiro lote
+# do Spark, o primeiro checkpoint do Flink). Nao era a mesma coisa nos dois: o
+# primeiro checkpoint do Flink as vezes tinha pouquissimos eventos.
+AQUECIMENTO_S = float(os.getenv("AQUECIMENTO_S", "5"))
+
 # --- Do texto ao tipo do contrato (CONTRATO.md 2.0) -------------------------
 # Os pipelines carregam os dez campos como TEXTO. Os tipos estao na fonte unica
 # do schema, a mesma que os dois pipelines leem.
@@ -215,6 +232,19 @@ def resumo(con, expr: str, origem: str, filtro: str = "") -> dict | None:
     return {k: (round(v) if k != "n" else v) for k, v in zip(chaves, r)}
 
 
+def corte_do_aquecimento(con) -> tuple[str, dict]:
+    """O filtro SQL do "regime" sobre a visao `lat`, e o registro do que saiu."""
+    inicio, total = con.execute("SELECT min(event_ts), count(*) FROM lat").fetchone()
+    if inicio is None:
+        return "true", {"segundos": AQUECIMENTO_S, "eventos_descartados": None}
+    corte = int(inicio + AQUECIMENTO_S * 1000)
+    fora = con.execute(f"SELECT count(*) FROM lat WHERE event_ts < {corte}").fetchone()[0]
+    print(f"  aquecimento ............ os eventos gerados nos primeiros {AQUECIMENTO_S:g} s "
+          f"ficam fora do regime: {fora} de {total}")
+    return f"event_ts >= {corte}", {"segundos": AQUECIMENTO_S, "eventos_descartados": fora,
+                                    "primeiro_event_ts": int(inicio)}
+
+
 def linha_ms(nome: str, s: dict | None) -> str:
     if s is None:
         return f"  {nome:<26} indisponivel"
@@ -320,45 +350,50 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
 
 # --- Throughput medio -------------------------------------------------------
 
-def throughput_medio(con, modo: str) -> dict | None:
-    """Eventos gravados por segundo na execucao, sem a primeira unidade de progresso.
+def throughput_medio(con, modo: str, aquecimento: dict) -> dict | None:
+    """Eventos gravados por segundo na execucao, sem o aquecimento.
 
-        eventos  linhas das unidades DEPOIS da primeira (na pasta do run_id)
-        tempo    do commit da primeira unidade ao commit da ultima
+        eventos  as linhas dos eventos GERADOS depois do aquecimento
+        tempo    do fim do aquecimento ate a ultima gravacao
 
-    A regra de descarte e a mesma das latencias — so o aquecimento sai (decisao
-    de 11/10/2026). Consequencia declarada: a ultima unidade entra, e ela quase
-    sempre grava menos eventos no mesmo intervalo, porque o gerador ja parou.
-    Por isso, quando o pipeline acompanha a carga, este numero fica um pouco
-    ABAIXO dela: ~7% numa execucao de 60 s com intervalo de 5 s, menos de 1% numa
-    de 10 min. Quando nao acompanha, mostra a capacidade do motor.
+    O aquecimento e o mesmo das latencias (decisao de 12/10/2026; ver
+    AQUECIMENTO_S): os eventos gerados nos primeiros segundos da execucao, pelo
+    event_ts. Igual nos dois motores, que descartam o mesmo trecho da carga. Ate
+    entao o throughput descartava a primeira unidade de progresso.
 
-    O commit de cada unidade vem do mesmo lugar que na latencia de visibilidade:
-    log de progresso no Spark, ctime dos arquivos no Flink (CONTRATO.md 2.2).
+    Consequencia declarada: o tempo vai ate a ULTIMA gravacao, que acontece
+    depois de o gerador parar — a fila ainda esta sendo esvaziada. Por isso,
+    quando o pipeline acompanha a carga, este numero fica um pouco ABAIXO dela,
+    e tanto mais abaixo quanto mais o motor demora a gravar o fim da carga.
+    Nessa situacao ele nao distingue capacidade; so passa a mostra-la quando o
+    pipeline nao acompanha.
+
+    Uma linha sem event_ts valido nao tem instante de geracao e fica de fora.
+
+    A ultima gravacao vem do mesmo lugar que na latencia de visibilidade: log de
+    progresso no Spark, ctime dos arquivos no Flink (CONTRATO.md 2.2).
     """
+    inicio = (aquecimento or {}).get("primeiro_event_ts")
     if modo == "arquivo":
-        unidades = con.execute("""
-            SELECT unidade, count(*), max(committed_ts) FROM ev GROUP BY unidade ORDER BY unidade
-        """).fetchall()
+        fim = con.execute("SELECT max(committed_ts) FROM ev").fetchone()[0]
     else:
-        unidades = con.execute("""
-            SELECT u.unidade, u.n, g.committed_ts
-            FROM (SELECT unidade, count(*) AS n FROM ev GROUP BY unidade) u
-            LEFT JOIN prog g ON g.processed_ts = u.unidade
-            ORDER BY u.unidade
-        """).fetchall()
-
-    commits = [c for _, _, c in unidades]
-    if len(unidades) < 2 or any(c is None for c in commits) or commits[-1] <= commits[0]:
-        print("\n  THROUGHPUT MEDIO .......... indisponivel (menos de 2 unidades com commit)")
+        fim = con.execute("""
+            SELECT max(g.committed_ts)
+            FROM (SELECT DISTINCT unidade FROM ev) u JOIN prog g ON g.processed_ts = u.unidade
+        """).fetchone()[0]
+    if inicio is None or fim is None:
+        print("\n  THROUGHPUT MEDIO .......... indisponivel (sem instante de inicio ou de gravacao)")
         return None
-    eventos = sum(n for _, n, _ in unidades[1:])
-    segundos = (commits[-1] - commits[0]) / 1000
+    corte = int(inicio + AQUECIMENTO_S * 1000)
+    eventos = con.execute(f"SELECT count(*) FROM ev WHERE event_ts >= {corte}").fetchone()[0]
+    segundos = (fim - corte) / 1000
+    if segundos <= 0 or not eventos:
+        print("\n  THROUGHPUT MEDIO .......... indisponivel (nada gravado depois do aquecimento)")
+        return None
     evt_s = eventos / segundos
-    print(f"\n  THROUGHPUT MEDIO .......... {evt_s:.1f} evt/s   "
-          f"({eventos} eventos em {segundos:.1f} s, sem a 1a unidade)")
-    return {"evt_s": round(evt_s, 2), "eventos": eventos, "segundos": round(segundos, 3),
-            "unidades": len(unidades) - 1}
+    print(f"\n  THROUGHPUT MEDIO .......... {evt_s:.1f} evt/s   ({eventos} eventos gerados depois "
+          f"dos primeiros {AQUECIMENTO_S:g} s, em {segundos:.1f} s ate a ultima gravacao)")
+    return {"evt_s": round(evt_s, 2), "eventos": eventos, "segundos": round(segundos, 3)}
 
 
 # --- Latencia no Flink (committed_ts = ctime do arquivo) ---------------------
@@ -403,30 +438,27 @@ def latencia_por_arquivo(con, logs: list[Path]) -> dict:
             FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL
         ) WHERE rn = 1
     """)
-    n_unidades, n_instantes, primeira = con.execute(
-        "SELECT count(DISTINCT unidade), count(DISTINCT committed_ts), min(unidade) FROM lat"
+    n_unidades, n_instantes = con.execute(
+        "SELECT count(DISTINCT unidade), count(DISTINCT committed_ts) FROM lat"
     ).fetchone()
-
-    # Aquecimento, pela mesma regra do Spark: descarta a primeira unidade de
-    # progresso (o primeiro checkpoint com dados) — INTEIRA, e por isso a
-    # unidade e o grupo de arquivos, nao o instante de cada um.
-    regime = f"unidade > {primeira}"
     metricas = {
         "espera pelo checkpoint": "committed_ts - processed_ts",
         "LAT. PROCESSAMENTO": "processed_ts - event_ts",
         "LAT. VISIBILIDADE": "committed_ts - event_ts",
     }
-    print(f"  checkpoints com dados .. {n_unidades}   (o 1o e descartado como aquecimento)")
+    print(f"  checkpoints com dados .. {n_unidades}")
     print(f"  instantes de ctime ..... {n_instantes}   (arquivos a ate {AGRUPAR_CTIME_MS} ms "
           "um do outro = mesmo checkpoint)")
     print("  committed_ts ........... ctime de cada arquivo (CONTRATO.md 1.6, 2.2)")
-    print("\n  em regime (sem o 1o checkpoint):")
+    # Aquecimento: a mesma regra do Spark, pelo instante em que o evento foi gerado.
+    regime, aquecimento = corte_do_aquecimento(con)
+    print(f"\n  em regime (sem os primeiros {AQUECIMENTO_S:g} s de eventos):")
     lat = {}
     for nome, expr in metricas.items():
         s = resumo(con, expr, "lat", regime)
         lat[nome] = s
         print(linha_ms(nome, s))
-    print("\n  execucao inteira (com o 1o checkpoint):")
+    print("\n  execucao inteira (com o aquecimento):")
     for nome in ("LAT. PROCESSAMENTO", "LAT. VISIBILIDADE"):
         s = resumo(con, metricas[nome], "lat")
         lat[nome + " (com aquecimento)"] = s
@@ -463,7 +495,7 @@ def latencia_por_arquivo(con, logs: list[Path]) -> dict:
     else:
         print("\n  (sem log de checkpoints para conferir o ctime)")
 
-    return {"latencia_ms": lat, "conferencia_ctime": conferencia,
+    return {"latencia_ms": lat, "aquecimento": aquecimento, "conferencia_ctime": conferencia,
             "agrupamento_ctime": {"checkpoints": n_unidades, "instantes": n_instantes,
                                   "limite_ms": AGRUPAR_CTIME_MS}}
 
@@ -671,13 +703,7 @@ def main() -> int:
         """)
         sem_log = con.execute(
             "SELECT count(*) FROM lat WHERE committed_ts IS NULL").fetchone()[0]
-        n_batches, primeiro_batch = con.execute(
-            "SELECT count(DISTINCT processed_ts), min(processed_ts) FROM lat").fetchone()
-
-        # Aquecimento (planoNRT3 §5.5): o primeiro batch da execucao processa
-        # com a JVM fria e costuma estourar o trigger. As parcelas sao mostradas
-        # sem ele; as latencias totais, com e sem.
-        regime = f"processed_ts > {primeiro_batch}"
+        n_batches = con.execute("SELECT count(DISTINCT processed_ts) FROM lat").fetchone()[0]
         metricas = {
             "espera no trigger": "inicio_ts - event_ts",
             "processamento": "processed_ts - inicio_ts",
@@ -685,27 +711,32 @@ def main() -> int:
             "LAT. PROCESSAMENTO": "processed_ts - event_ts",
             "LAT. VISIBILIDADE": "committed_ts - event_ts",
         }
-        print(f"  batches ................ {n_batches}   (o 1o e descartado como aquecimento)")
+        print(f"  batches ................ {n_batches}")
         if sem_log:
             print(f"  !! eventos sem linha no log de progresso: {sem_log} — "
                   "sem committed_ts, fora da latencia de visibilidade")
-        print("\n  em regime (sem o 1o batch):")
+        # Aquecimento: o primeiro lote processa com a JVM fria. As parcelas sao
+        # mostradas sem os primeiros segundos de eventos; as latencias totais,
+        # com e sem. A mesma regra do Flink.
+        regime, aquecimento = corte_do_aquecimento(con)
+        print(f"\n  em regime (sem os primeiros {AQUECIMENTO_S:g} s de eventos):")
         lat = {}
         for nome, expr in metricas.items():
             s = resumo(con, expr, "lat", regime)
             lat[nome] = s
             print(linha_ms(nome, s))
-        print("\n  execucao inteira (com o 1o batch):")
+        print("\n  execucao inteira (com o aquecimento):")
         for nome in ("LAT. PROCESSAMENTO", "LAT. VISIBILIDADE"):
             s = resumo(con, metricas[nome], "lat")
             lat[nome + " (com aquecimento)"] = s
             print(linha_ms(nome, s))
         relatorio["latencia_ms"] = lat
+        relatorio["aquecimento"] = aquecimento
         relatorio["latencia_eventos_sem_log"] = sem_log
 
     # --- 2b. Throughput medio (Etapa 8) ---------------------------------------
     if "processed_ts" in colunas and (modo == "arquivo" or logs):
-        relatorio["throughput_medio"] = throughput_medio(con, modo)
+        relatorio["throughput_medio"] = throughput_medio(con, modo, relatorio.get("aquecimento"))
 
     # --- 3. Watermark e is_late (CONTRATO.md 2.1) ---------------------------
     print("\n--- 3. Atraso (watermark = max acumulado de event_ts - 60 s) ---")

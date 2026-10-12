@@ -413,8 +413,14 @@ class Rodada:
     # --- 11 e 12. resultado ---------------------------------------------------------
     def reconciliar(self) -> None:
         self.passo("11/12 reconciliador")
+        # Aquecimento (decisao de 12/10/2026): ficam fora do regime os eventos
+        # gerados nos primeiros segundos da rodada — tantos quantos o intervalo
+        # da combinacao: 5 s nas rodadas de 60 s, 30 s nas de 5 min. O MESMO
+        # corte para os dois motores, que assim descartam o mesmo trecho da carga.
+        self.manifesto["aquecimento_s"] = self.intervalo
         r = sh(PY, "shared/analysis/reconcile.py",
-               env={**os.environ, "MOTOR": self.motor, "RUN_ID": self.run_id})
+               env={**os.environ, "MOTOR": self.motor, "RUN_ID": self.run_id,
+                    "AQUECIMENTO_S": str(self.intervalo)})
         (self.pasta / "reconcile.txt").write_text(r.stdout + r.stderr, encoding="utf-8")
         self.manifesto["reconcile_codigo"] = r.returncode
         if r.returncode != 0:
