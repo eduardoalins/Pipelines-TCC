@@ -160,7 +160,7 @@ def main() -> int:
 
     print("=== resumo " + "=" * 57)
     print(f"{'rodada':<8}{'motor':<7}{'vale':<6}{'proc P50':>9}{'vis P50':>9}{'thr':>8}"
-          f"{'CPU %':>8}{'mem MiB':>9}{'inval':>7}{'nulas':>7}{'desc':>6}")
+          f"{'CPU 1nuc':>9}{'mem MiB':>9}{'inval':>7}{'nulas':>7}{'desc':>6}")
     for n, motor in ordem:
         m = manifesto(pasta(n, motor))
         r = (m or {}).get("resultado") or {}
@@ -168,7 +168,7 @@ def main() -> int:
         celula = lambda chave: "-" if r.get(chave) is None else r[chave]
         print(f"{n:<8}{motor:<7}{('sim' if m and m.get('valida') else 'NAO'):<6}"
               f"{p50('latencia_processamento_ms'):>9}{p50('latencia_visibilidade_ms'):>9}"
-              f"{celula('throughput_medio_evt_s'):>8}{celula('cpu_media_pct'):>8}"
+              f"{celula('throughput_medio_evt_s'):>8}{celula('cpu_media_pct'):>9}"
               f"{celula('mem_pico_mib'):>9}{celula('invalidas'):>7}{celula('nulas'):>7}"
               f"{celula('descartadas'):>6}")
     if faltaram:

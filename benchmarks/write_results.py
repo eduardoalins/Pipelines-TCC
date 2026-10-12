@@ -62,6 +62,11 @@ LEITURA_VAZIA = "## 7. Leitura\n\n_Ainda não escrita._\n"
 
 # chave, nome completo, onde esta no bloco "resultado" do manifesto, unidade, casas
 # decimais na linha da rodada. A media e o desvio padrao levam uma casa a mais.
+#
+# CPU (decisao de 12/10/2026): nos arquivos ela sai em porcentagem da MAQUINA
+# INTEIRA — 100% e todos os nucleos ocupados. O manifesto guarda a medicao como
+# foi feita, em porcentagem de UM nucleo (112% = um nucleo e um pouco), e o
+# numero de nucleos; a divisao e feita aqui, em valor().
 CAMPOS = (
     ("proc_p50", "Latência de processamento P50", ("latencia_processamento_ms", "p50"), " ms", 0),
     ("proc_p95", "Latência de processamento P95", ("latencia_processamento_ms", "p95"), " ms", 0),
@@ -72,8 +77,8 @@ CAMPOS = (
     ("vis_p99", "Latência de visibilidade P99", ("latencia_visibilidade_ms", "p99"), " ms", 0),
     ("vis_med", "Latência de visibilidade Média", ("latencia_visibilidade_ms", "media"), " ms", 0),
     ("thr", "Throughput médio", ("throughput_medio_evt_s",), " evt/s", 1),
-    ("cpu_med", "CPU média", ("cpu_media_pct",), "%", 0),
-    ("cpu_pico", "CPU pico", ("cpu_pico_pct",), "%", 0),
+    ("cpu_med", "CPU média", ("cpu_media_pct",), "%", 1),
+    ("cpu_pico", "CPU máximo", ("cpu_pico_pct",), "%", 1),
     ("mem_med", "Memória média", ("mem_media_mib",), " MiB", 0),
     ("mem_pico", "Memória pico", ("mem_pico_mib",), " MiB", 0),
     ("perdas", "Perdas", ("perdas",), "", 0),
@@ -84,6 +89,7 @@ CAMPOS = (
     ("descartadas", "Descartadas", ("descartadas",), "", 0),
 )
 POR_CHAVE = {c[0]: c for c in CAMPOS}
+EM_PCT_DA_MAQUINA = ("cpu_med", "cpu_pico")
 
 
 class Parar(Exception):
@@ -127,10 +133,18 @@ def situacao(r: dict) -> str | None:
     return "não valeu — " + "; ".join(m.get("motivos") or ["motivo não registrado"])
 
 
+def nucleos(manifesto: dict | None) -> int:
+    """Quantos nucleos a maquina tinha na rodada. O run_round.py grava; as rodadas
+    feitas antes de ele gravar sao da mesma maquina que roda este programa."""
+    return int((manifesto or {}).get("nucleos") or os.cpu_count())
+
+
 def valor(r: dict, chave: str):
     v = (r["manifesto"] or {}).get("resultado") or {}
     for parte in POR_CHAVE[chave][2]:
         v = (v or {}).get(parte)
+    if v is not None and chave in EM_PCT_DA_MAQUINA:
+        v = v / nucleos(r["manifesto"])
     return v
 
 
@@ -165,6 +179,7 @@ class Combinacao:
         self.manifestos = [self.rodadas[motor, n]["manifesto"]
                            for motor, _ in MOTORES for n in self.validas[motor]]
         self.duracoes = sorted({m["duracao_s"] for m in self.manifestos})
+        self.nucleos = sorted({nucleos(m) for m in self.manifestos})
         # O intervalo que cada motor usou de fato. O da combinacao e o do Spark; o
         # checkpoint do Flink e fixo (run_round.py). Manifesto antigo nao tem o
         # campo: valia o mesmo intervalo para os dois.
@@ -198,6 +213,11 @@ class Combinacao:
                   for motor, _ in MOTORES if self.intervalos[motor]]
         return "; ".join(partes) or f"{self.intervalo} s"
 
+    def cpu(self) -> str:
+        quantos = lista(self.nucleos) if self.nucleos else "?"
+        return (f"em porcentagem da máquina inteira ({quantos} núcleos): "
+                "100% são todos os núcleos ocupados")
+
     def duracao(self) -> str:
         if not self.duracoes:
             return "sem rodada válida"
@@ -217,7 +237,8 @@ class Combinacao:
     def txt(self) -> str:
         linhas = [f"Resultados Local: {self.titulo()}",
                   f"Intervalo de cada motor: {self.intervalo_dos_motores()}.",
-                  f"Duração de cada rodada: {self.duracao()}."]
+                  f"Duração de cada rodada: {self.duracao()}.",
+                  f"CPU {self.cpu()}."]
         if self.malformadas:
             linhas.append(f"Com falha induzida — {self.falha_induzida()}.")
         if self.total_validas < 2 * len(RODADAS):
@@ -270,6 +291,7 @@ class Combinacao:
                 f"| Intervalo | {self.intervalo_dos_motores()} |",
                 f"| Carga | {self.carga} eventos por segundo |",
                 f"| Duração de cada rodada | {self.duracao()} |",
+                f"| CPU | {self.cpu()} |",
                 f"| Rodadas válidas | {validas} |",
                 f"| Falha induzida | {self.falha_induzida()} |",
                 f"| Período | {dia(min(quando))} a {dia(max(quando))} |" if quando else "| Período | — |",
@@ -309,7 +331,7 @@ class Combinacao:
         return (["## 3. Por rodada", ""]
                 + self.tabela_rodadas(
                     ["Semente", "Proc. P50", "Proc. P99", "Vis. P50", "Vis. P99", "Throughput",
-                     "CPU média", "CPU pico", "Mem. pico"],
+                     "CPU média", "CPU máx.", "Mem. pico"],
                     ("proc_p50", "proc_p99", "vis_p50", "vis_p99", "thr", "cpu_med", "cpu_pico",
                      "mem_pico"),
                     lambda r: [str(r["manifesto"]["seed"])])

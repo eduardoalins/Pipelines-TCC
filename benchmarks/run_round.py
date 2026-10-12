@@ -248,6 +248,10 @@ class Rodada:
         if not imagens[self.m["imagem"]]:
             raise Abortar(f"imagem {self.m['imagem']} ausente: docker compose build {self.motor}")
         self.manifesto["imagens"] = imagens
+        # Quantos nucleos o Docker enxerga. A CPU e medida em % de UM nucleo; os
+        # arquivos de resultado a mostram em % da maquina, dividindo por este numero.
+        nucleos = sh("docker", "info", "--format", "{{.NCPU}}").stdout.strip()
+        self.manifesto["nucleos"] = int(nucleos) if nucleos.isdigit() else os.cpu_count()
 
         # Mudanca nao commitada NAO impede a rodada (decisao de 11/10/2026): o
         # manifesto anota o commit e se a pasta local diferia dele.
@@ -429,7 +433,12 @@ class Rodada:
         self.relatorio = json.loads(relatorio.read_text("utf-8")) if relatorio.is_file() else {}
 
     def recursos(self) -> dict:
-        """CPU e memoria do conteiner do motor, do inicio do gerador ate a fila zerar."""
+        """CPU e memoria do conteiner do motor, do inicio do gerador ate a fila zerar.
+
+        A CPU fica aqui como foi medida: em % de UM nucleo (100 = um nucleo
+        inteiro; passa de 100 com mais de um). Junto com `nucleos`, no manifesto,
+        da a % da maquina, que e como os arquivos de resultado a mostram.
+        """
         arquivos = sorted((self.pasta / "metrics").glob("recursos.*.csv"))
         ini, fim = self.manifesto.get("gerador_inicio_ms"), self.manifesto.get("fila_zerou_ms")
         if not arquivos or ini is None or fim is None:
@@ -525,7 +534,8 @@ class Rodada:
             print(f"  latencia de processamento P50 {r['latencia_processamento_ms']['p50']} ms   "
                   f"visibilidade P50 {r['latencia_visibilidade_ms']['p50']} ms")
             print(f"  throughput medio {r['throughput_medio_evt_s']} evt/s   "
-                  f"CPU media {r.get('cpu_media_pct')} %   memoria pico {r.get('mem_pico_mib')} MiB")
+                  f"CPU media {r.get('cpu_media_pct')} % de um nucleo   "
+                  f"memoria pico {r.get('mem_pico_mib')} MiB")
             print(f"  perdas {r['perdas']}  duplicatas {r['duplicatas']}  invalidas {r['invalidas']}  "
                   f"nulas {r['nulas']}  descartadas {r['descartadas']}")
         print(f"manifesto: {self.pasta / 'manifesto.json'}")
