@@ -19,6 +19,10 @@ _spark_metadata/
 # (benchmarks/run_combination.py); o que fica dela sao o .txt e o .md de resultado.
 results/
 
+# A bateria local inteira, em sequencia: conveniencia da maquina do autor. Fica
+# na pasta e fora do git, por decisao dele (12/10/2026).
+benchmarks/run_all.sh
+
 # --- Logs ---
 logs/
 *.log
