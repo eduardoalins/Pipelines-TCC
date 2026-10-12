@@ -6,7 +6,8 @@ fim, e deixa registrado o que rodou, com qual codigo e em que condicoes.
         ~/.venvs/tcc/bin/python benchmarks/run_round.py
 
     MOTOR      spark | flink
-    INTERVALO  segundos — trigger no Spark, intervalo de checkpoint no Flink
+    INTERVALO  segundos — o trigger do SPARK. E tambem o nome da combinacao. O
+               checkpoint do Flink e FIXO em 5 s, seja qual for o INTERVALO
     CARGA      mensagens por segundo
     DURACAO    segundos de geracao
     RODADA     1 a 10
@@ -14,6 +15,16 @@ fim, e deixa registrado o que rodou, com qual codigo e em que condicoes.
 E o que o plano chama de "arnes": o que antes eram tres abas e nove passos feitos
 a mao, na ordem certa, vira um comando. O valor dele nao e a comodidade — e que
 ele nao esquece de zerar o checkpoint nem de conferir o relogio.
+
+--- O que se varia (decisao de 12/10/2026) -----------------------------------
+  intervalo    so o do Spark varia: 5 s e 30 s. O Flink grava a cada checkpoint,
+               e o intervalo dele fica em 5 s nas duas combinacoes. Na combinacao
+               de intervalo 30 o Flink roda de novo, ao lado do Spark, com a
+               mesma carga e a mesma duracao.
+  carga        1.000, 7.500 e 15.000 mensagens por segundo
+  duracao      60 s nas combinacoes de intervalo 5; 300 s nas de intervalo 30 —
+               com trigger de 30 s, 60 s deixariam UM lote depois do descarte de
+               aquecimento
 
 --- O que a RODADA decide (decisoes de 11/10/2026) ---------------------------
   seed         41 + RODADA: a rodada 1 usa 42, a 10 usa 51. A mesma seed vale
@@ -85,20 +96,24 @@ DISCO_MINIMO_GB = 50        # do MENOR entre o disco dos dados e o do repositori
 ESPERA_PRONTO_S = 180       # ate o pipeline dizer que esta no ar
 ACOMODACAO_S = 10           # do "no ar" ate o primeiro evento
 ESPERA_ENCERRAR_S = 120     # do arquivo de parada ate o processo sair
+INTERVALO_FLINK_S = 5       # o checkpoint do Flink e fixo (decisao de 12/10/2026)
 
+# "intervalo": o intervalo que ESTE motor usa numa combinacao de intervalo i.
 MOTORES = {
     "spark": {
         "grupo": "tcc-nrt-spark", "conteiner": "spark-run", "pronto": "consulta no ar",
         "checkpoint": DATA_DIR / "checkpoints" / "nrt", "imagem": "tcc-spark:4.0.4",
         "lancador": "pipeline-nrt/run_local.sh",
-        "env": lambda i: {"STARTING_OFFSETS": "earliest", "TRIGGER": f"{i} seconds"},
+        "intervalo": lambda i: i,
+        "env": lambda s: {"STARTING_OFFSETS": "earliest", "TRIGGER": f"{s} seconds"},
         "particoes_nulas": ("__HIVE_DEFAULT_PARTITION__",),
     },
     "flink": {
         "grupo": "tcc-rt-flink", "conteiner": "flink-run", "pronto": ">> job no ar",
         "checkpoint": DATA_DIR / "checkpoints" / "rt", "imagem": "tcc-flink:1.20.5",
         "lancador": "pipeline-streaming/run_local.sh",
-        "env": lambda i: {"STARTUP_MODE": "earliest-offset", "CHECKPOINT_INTERVAL": f"{i} s"},
+        "intervalo": lambda i: INTERVALO_FLINK_S,
+        "env": lambda s: {"STARTUP_MODE": "earliest-offset", "CHECKPOINT_INTERVAL": f"{s} s"},
         "particoes_nulas": ("__DEFAULT_PARTITION__",),
     },
 }
@@ -130,6 +145,8 @@ class Rodada:
             raise Abortar("MOTOR tem de ser spark ou flink, e RODADA de 1 a 10.")
 
         self.m = MOTORES[self.motor]
+        # O intervalo que o motor usa de fato: o da combinacao no Spark, 5 s no Flink.
+        self.intervalo_motor = self.m["intervalo"](self.intervalo)
         self.seed = SEED_BASE + self.rodada
         self.malformados = PROPORCAO_MALFORMADOS if self.rodada in RODADAS_COM_MALFORMADOS else 0.0
         carimbo = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -146,7 +163,7 @@ class Rodada:
         self.motivos: list[str] = []      # por que a rodada NAO vale, se nao valer
         self.manifesto: dict = {
             "run_id": self.run_id, "motor": self.motor, "intervalo_s": self.intervalo,
-            "carga_evt_s": self.carga, "duracao_s": self.duracao, "rodada": self.rodada,
+            "intervalo_do_motor_s": self.intervalo_motor, "carga_evt_s": self.carga, "duracao_s": self.duracao, "rodada": self.rodada,
             "seed": self.seed, "malformed_rate": self.malformados, "passos": [],
         }
 
@@ -282,7 +299,7 @@ class Rodada:
     def subir(self) -> None:
         self.passo("5/12 subindo o pipeline")
         self.parada.unlink(missing_ok=True)
-        variaveis = {**self.m["env"](self.intervalo),
+        variaveis = {**self.m["env"](self.intervalo_motor),
                      "STOP_FILE": f"/tcc-data/control/{self.parada.name}"}
         comando = " ".join(f'{k}="{v}"' for k, v in variaveis.items()) + f" bash {self.m['lancador']}"
         self.tela = self.pasta / "pipeline.txt"
@@ -461,6 +478,8 @@ class Rodada:
     def rodar(self) -> int:
         print(f"=== rodada {self.rodada:02d} — {self.motor} — intervalo {self.intervalo} s, "
               f"carga {self.carga} msg/s, {self.duracao} s ===")
+        if self.intervalo_motor != self.intervalo:
+            print(f"    o {self.motor} roda com intervalo de {self.intervalo_motor} s, fixo")
         print(f"    run_id {self.run_id}")
         print(f"    pasta  {self.pasta}")
         try:

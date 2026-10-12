@@ -165,6 +165,14 @@ class Combinacao:
         self.manifestos = [self.rodadas[motor, n]["manifesto"]
                            for motor, _ in MOTORES for n in self.validas[motor]]
         self.duracoes = sorted({m["duracao_s"] for m in self.manifestos})
+        # O intervalo que cada motor usou de fato. O da combinacao e o do Spark; o
+        # checkpoint do Flink e fixo (run_round.py). Manifesto antigo nao tem o
+        # campo: valia o mesmo intervalo para os dois.
+        self.intervalos = {
+            motor: sorted({self.rodadas[motor, n]["manifesto"].get(
+                "intervalo_do_motor_s", self.rodadas[motor, n]["manifesto"]["intervalo_s"])
+                for n in self.validas[motor]})
+            for motor, _ in MOTORES}
         # {rodada: proporcao} das rodadas que levaram eventos malformados, como foi gravado.
         self.malformadas = {}
         for r in self.rodadas.values():
@@ -184,6 +192,12 @@ class Combinacao:
     def titulo(self) -> str:
         return f"Intervalo de {self.intervalo} s, Carga de {self.carga} eventos por segundo"
 
+    def intervalo_dos_motores(self) -> str:
+        papel = {"spark": "trigger do NRT", "flink": "checkpoint do RT"}
+        partes = [f"{papel[motor]} de {lista(f'{s} s' for s in self.intervalos[motor])}"
+                  for motor, _ in MOTORES if self.intervalos[motor]]
+        return "; ".join(partes) or f"{self.intervalo} s"
+
     def duracao(self) -> str:
         if not self.duracoes:
             return "sem rodada válida"
@@ -202,6 +216,7 @@ class Combinacao:
     # --- o .txt --------------------------------------------------------------------
     def txt(self) -> str:
         linhas = [f"Resultados Local: {self.titulo()}",
+                  f"Intervalo de cada motor: {self.intervalo_dos_motores()}.",
                   f"Duração de cada rodada: {self.duracao()}."]
         if self.malformadas:
             linhas.append(f"Com falha induzida — {self.falha_induzida()}.")
@@ -252,7 +267,7 @@ class Combinacao:
         if self.total_validas < 2 * len(RODADAS):
             validas += " — **INCOMPLETO**"
         return ["## 1. Cabeçalho", "", "| | |", "|---|---|",
-                f"| Intervalo | {self.intervalo} s (trigger no NRT, checkpoint no RT) |",
+                f"| Intervalo | {self.intervalo_dos_motores()} |",
                 f"| Carga | {self.carga} eventos por segundo |",
                 f"| Duração de cada rodada | {self.duracao()} |",
                 f"| Rodadas válidas | {validas} |",

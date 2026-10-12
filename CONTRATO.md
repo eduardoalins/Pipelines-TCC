@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 2.0 — 12/10/2026**
+**Versão 2.1 — 12/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -794,6 +794,31 @@ esquentar, outro programa abrir — pesa igual sobre os dois.
 **O relógio é conferido antes de cada rodada** (`scripts/check_clock.py`); uma
 rodada com o relógio reprovado não começa.
 
+**O que se varia (versão 2.1, decisão de 12/10/2026).** Só duas coisas: o
+intervalo do Spark e a carga.
+
+| Combinação | Trigger do Spark | Checkpoint do Flink | Cargas (mensagens/s) | Duração da rodada |
+|---|---|---|---|---|
+| Intervalo 5 | 5 s | 5 s | 1.000, 7.500 e 15.000 | 60 s |
+| Intervalo 30 | 30 s | **5 s** | 1.000, 7.500 e 15.000 | 300 s |
+
+São seis combinações, com 10 rodadas de cada motor em cada uma.
+
+- **O intervalo do Flink é fixo em 5 s.** O "intervalo" que dá nome à combinação é
+  o do Spark. Na combinação de intervalo 30 o Flink roda de novo, ao lado do
+  Spark, com a mesma carga, a mesma duração e as mesmas seeds — é uma segunda
+  medição da mesma configuração do Flink, feita nas condições da combinação.
+- **A duração acompanha o intervalo do Spark.** Com trigger de 30 s, uma rodada de
+  60 s produz dois ou três lotes, e sobra um depois do descarte de aquecimento;
+  em 300 s são dez ou onze. No intervalo de 5 s, 60 s dão doze.
+- Até a versão 2.0 o mesmo intervalo valia para os dois motores (trigger e
+  checkpoint), e os valores e as cargas não estavam fixados.
+
+Verificado em 12/10/2026 por um ensaio de uma rodada por caso: o gerador atinge
+15.000 mensagens por segundo, e os dois motores fecham as rodadas de 7.500 e de
+15.000 sem perda, inclusive o Spark com trigger de 30 s (lotes de ~450 mil
+eventos, pico de memória de 1.178 MiB num contêiner de 1.536).
+
 **O que fica de uma combinação.** Quando as 20 rodadas estão válidas, são escritos
 os arquivos de resultado (`benchmarks/write_results.py`) e o material bruto das
 rodadas é apagado. O Parquet de cada rodada é apagado antes, logo depois de
@@ -840,6 +865,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 2.1 | 12/10/2026 | **§5.2 ampliado.** Fixado o que se varia no benchmark: **o trigger do Spark em 5 s e 30 s, com o checkpoint do Flink fixo em 5 s**; cargas de 1.000, 7.500 e 15.000 mensagens por segundo; rodadas de 60 s nas combinações de intervalo 5 e de 300 s nas de intervalo 30. Até a 2.0 o intervalo era o mesmo para os dois motores | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |
 | 2.0 | 12/10/2026 | **§2.7 novo; §2.6, §4.1, §5 e §6 alterados; §1.1 ajustado.** Os dois pipelines passam a **carregar os dez campos como texto**, sem interpretar tipo: decisão do autor com a orientação. O tratamento dos eventos malformados sai do pipeline e vai para o Transform, depois do Load; a conversão é feita, por ora, pelo `reconcile.py`, com uma regra só para os dois motores. **O gerador deixa de enviar mensagens que não são JSON:** os tipos de malformado passam de 13 para 8. A diferença entre os motores nos campos de tipo errado deixa de existir; sobra, declarada, a da mensagem que não é JSON. As pastas `dt=`/`hh=` passam a sair só de um `event_ts` que seja um inteiro de 1 a 13 dígitos, por uma regra única. Versão maior porque o **formato do destino** muda | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita. Os números de teste anteriores (carga tipada) deixam de servir de referência: o tamanho do destino mudou, e as contagens de inválidas, nulas e descartadas têm outra definição |
 | 1.9 | 12/10/2026 | **§2.6, §3.1, §5 e §5.1 alterados; §5.2 novo; §1.4 e §2.2 ajustados.** A seed deixa de ser fixa: **uma por rodada (41 + N), a mesma para os dois motores**. **Quatro das dez rodadas de cada combinação (2, 5, 7 e 10) levam 1% de eventos malformados**, emitidos pelo gerador no lugar de eventos válidos. As contagens de inválidas, nulas e descartadas **deixam de reprovar** a execução e passam a ser resultado; perdas e duplicatas entre os eventos válidos continuam reprovando. Fica registrado como uma rodada é feita (tópico recriado, leitura desde o início, motores alternados, relógio conferido) e que o material bruto é apagado quando a combinação fecha. A exatidão medida do `ctime` do Flink passa de "±10 ms" para −13 a +16 ms. **Retenção (§3.1):** saem o valor de 2 h para a medição e a guarda que abortaria, que nunca foram implementados; fica um valor só, 168 h, e o controle passa a ser a recriação do tópico | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita. As execuções de aprendizado anteriores usaram a seed 42 e só eventos válidos, e não entram nos resultados |
 | 1.8 | 11/10/2026 | **§2.6 novo; §5 e §6 alterados.** O pipeline passa a ser declarado **ELT estrito**: carrega, não transforma. Saem das invariantes a "mesma limpeza", o "mesmo broadcast join" e a tabela de produtos, que nunca foram implementados. O tratamento de eventos que o motor não consegue ler **não é igualado**: o Spark grava linha nula, o Flink descarta, e os dois divergem na conversão de tipos (medido em 11/10/2026). A diferença é declarada e passa a ser contada em toda execução — inválidas, nulas e descartadas | **Nenhuma.** Os pipelines não mudam: gravam exatamente o que gravavam. As execuções de 10/10/2026, reconciliadas de novo, dão as mesmas latências, com 0 inválidas e 0 nulas |

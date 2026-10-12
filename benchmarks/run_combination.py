@@ -4,7 +4,8 @@ UM intervalo e UMA carga: 20 chamadas ao run_round.py, na ordem certa.
 
     INTERVALO=5 CARGA=1000 DURACAO=600 ~/.venvs/tcc/bin/python benchmarks/run_combination.py
 
-    INTERVALO  segundos — trigger no Spark, intervalo de checkpoint no Flink
+    INTERVALO  segundos — o trigger do SPARK, e o nome da combinacao. O checkpoint
+               do Flink e fixo em 5 s (ver run_round.py)
     CARGA      mensagens por segundo
     DURACAO    segundos de geracao em cada rodada
     RODADAS    opcional: quais rodadas fazer, ex. RODADAS=1,2 (padrao: 1 a 10)
