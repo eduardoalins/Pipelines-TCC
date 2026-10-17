@@ -45,7 +45,8 @@ aws_credentials
 *.tfstate.*
 *.tfvars
 !example.tfvars
-.terraform.lock.hcl
+# O .terraform.lock.hcl ENTRA no git: trava a versao e o checksum do provider
+# da AWS (decisao E7; voto do Eduardo em 17/10/2026).
 
 # --- Sistema operacional / IDE ---
 .DS_Store

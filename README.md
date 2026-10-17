@@ -48,6 +48,7 @@ tenderiam a divergir.
 | 21 | eventos malformados: carregados como texto e contados depois do Load | Etapa 7 / RT-5, revista na Etapa 8.1 |
 | 22 a 24 | o benchmark: uma rodada, as dez rodadas de uma combinação e os arquivos de resultado | Etapa 8 / RT-6 |
 | 25 | a bateria local: as seis combinações | Etapa 9 / RT-7 |
+| 26 | as ferramentas e as credenciais da nuvem | Etapa 10 — em andamento |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -1583,9 +1584,78 @@ checkpoint de 5 s), o Spark acompanha o trigger, e nenhum evento se perde.
 
 ---
 
+## Passo 26 — Ferramentas da nuvem
+
+Daqui em diante, a Etapa 10: o mesmo benchmark numa máquina da AWS, pelo **AWS
+Academy Learner Lab**. Esta parte da receita é escrita junto com a etapa.
+
+Na aba do Ubuntu, dentro do repositório:
+
+```bash
+bash scripts/setup_aws_tools.sh
+```
+
+O script instala, na pasta do usuário e **sem `sudo`**, o Terraform na versão
+travada (o zip é conferido contra a lista de checksums da HashiCorp antes de
+instalar) e a AWS CLI v2, pelo instalador oficial. Escreve também o
+`~/.aws/config`, só com a região. Credenciais ele não toca. É idempotente: rodar de
+novo não quebra nada, e a AWS CLI é atualizada.
+
+**Esperado** (máquina original, 17/10/2026):
+
+```
+>> Terraform 1.16.4
+terraform_1.16.4_linux_amd64.zip: OK
+instalado: Terraform v1.16.4
+...
+>> Ferramentas prontas
+  terraform : Terraform v1.16.4
+  aws       : aws-cli/2.38.1 Python/3.14.6 Linux/5.15.167.4-microsoft-standard-WSL2 exe/x86_64.ubuntu.24
+  regiao    : us-east-1
+```
+
+Se faltar o `unzip`, o script para antes de mudar qualquer coisa e diz o comando
+para instalá-lo. Se avisar que `~/.local/bin` não está no PATH, feche e abra o
+terminal do Ubuntu: o `~/.profile` acrescenta a pasta quando ela existe.
+
+**Por que `us-east-1`.** O laboratório só permite `us-east-1` e `us-west-2`, e o
+par de chaves `vockey`, que ele já traz pronto, só existe na primeira.
+
+**As credenciais — em toda sessão do laboratório.** Elas mudam a cada sessão, e
+quem as coloca é você, à mão:
+
+1. no Learner Lab, **Start Lab**, e esperar a bolinha ao lado de **AWS** ficar
+   verde; depois **AWS Details** → **AWS CLI: Show**. O **AWS Details** fica na
+   barra da página do laboratório, não dentro do console da AWS;
+2. colar o bloco inteiro — do `[default]` até o fim da linha
+   `aws_session_token=…`, a mais longa — em `~/.aws/credentials`
+   (`nano ~/.aws/credentials`; colar com `Ctrl+Shift+V`, salvar com `Ctrl+O` e
+   `Enter`, sair com `Ctrl+X`);
+3. `chmod 600 ~/.aws/credentials`;
+4. conferir:
+
+```bash
+aws sts get-caller-identity
+```
+
+Esperado: um JSON com a conta do laboratório. Um erro de credencial expirada
+(`ExpiredToken`) quer dizer que o bloco colado é de uma sessão anterior.
+
+> **Credenciais nunca entram no repositório.** O `.gitignore` exclui `.aws/`,
+> `credentials`, `aws_credentials`, `.env` e `*.pem`, mas a regra é não as copiar
+> para dentro da pasta do projeto em momento nenhum.
+
+> **Os limites do laboratório são duros.** Tentar passar de um deles — tamanho de
+> máquina acima de `large`, mais de 9 instâncias, mais de 32 vCPUs, volume acima de
+> 100 GB — pode desativar a conta e apagar tudo o que há nela. O orçamento é de
+> USD 50 e **não é reiniciado** pelo botão Reset. O saldo mostrado atrasa de 8 a 12
+> horas.
+
+---
+
 ## Verificação final
 
-Se os vinte e cinco passos acima funcionaram, o ambiente está reproduzido:
+Se os vinte e seis passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -1617,6 +1687,7 @@ Se os vinte e cinco passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `run_combination.py` alterna os motores, pula as rodadas válidas e, com as 20 válidas, escreve os arquivos e apaga o material bruto
 - [x] O `write_results.py` escreve o `.txt` e o `.md`, com a CPU em % da máquina, e rodar de novo dá arquivos idênticos
 - [x] A bateria local fecha as seis combinações: 120 rodadas válidas, `results/` vazia, seis pares de arquivos
+- [x] O `setup_aws_tools.sh` instala o Terraform e a AWS CLI, e o `aws sts get-caller-identity` responde com a conta do laboratório
 
 ---
 
@@ -1682,6 +1753,8 @@ meio dos experimentos invalida as execuções já feitas.
 | Python do host (gerador, coletor, reconciliador) | 3.12.3 | 03/09/2026 |
 | confluent-kafka | 2.15.0 (librdkafka 2.15.0) — no host e na imagem do Spark | 04/09/2026 |
 | DuckDB (leitor do `reconcile.py`) | 1.5.5 | 24/09/2026 |
+| Terraform | 1.16.4, no WSL, conferido pelo checksum da HashiCorp | 17/10/2026 |
+| AWS CLI | 2.38.1 — a mais recente na instalação; só cria e lê recursos, não entra em medida | 17/10/2026 |
 
 Cada ambiente tem o seu arquivo de versões. As das ferramentas do host estão no
 `requirements.txt` da raiz. As do Spark, em `pipeline-nrt/requirements.txt`; as do
@@ -1700,6 +1773,7 @@ scripts/create_topic.sh   cria o tópico com 24 partições
 scripts/check_chain.py    verifica Python → Spark → JVM → Kafka, no contêiner
 scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1)
 scripts/check_clock.py    confere o relógio antes de medir         (Etapa 6.2)
+scripts/setup_aws_tools.sh  instala o Terraform e a AWS CLI no WSL   (Etapa 10)
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
   data-generator/         gerador de eventos; aceita SEED e MALFORMED_RATE (Etapas 3 e 8)
