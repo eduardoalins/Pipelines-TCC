@@ -49,6 +49,7 @@ tenderiam a divergir.
 | 22 a 24 | o benchmark: uma rodada, as dez rodadas de uma combinação e os arquivos de resultado | Etapa 8 / RT-6 |
 | 25 | a bateria local: as seis combinações | Etapa 9 / RT-7 |
 | 26 | as ferramentas e as credenciais da nuvem | Etapa 10 — em andamento |
+| 27 | criar e destruir a máquina na AWS, com o Terraform | Etapa 10 — em andamento |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -1653,9 +1654,98 @@ Esperado: um JSON com a conta do laboratório. Um erro de credencial expirada
 
 ---
 
+## Passo 27 — Criar e destruir a máquina na AWS
+
+A infraestrutura é descrita em `infra/`, com o Terraform: o arquivo diz o que deve
+existir, o `apply` cria e o `destroy` apaga tudo de uma vez. **Com as credenciais
+da sessão coladas** (passo 26).
+
+| O que é criado | Detalhe |
+|---|---|
+| Rede própria | VPC `10.42.0.0/16`, sub-rede pública `10.42.1.0/24` em `us-east-1a`, internet gateway e rotas |
+| Regra de acesso | SSH (porta 22) **só do IP de quem roda o `apply`**, lido de `checkip.amazonaws.com` |
+| A máquina | `m5.large` (2 vCPU, 8 GB), Ubuntu 24.04 LTS oficial da Canonical, chave `vockey`, perfil `LabInstanceProfile`, metadados só com token |
+| O disco | 80 GB `gp3`, apagado junto com a máquina |
+
+As variáveis em `infra/variables.tf` **recusam, antes de chegar à AWS**, um tamanho
+acima de `large`, um disco acima de 100 GB ou uma região fora das duas do
+laboratório.
+
+**A chave de SSH, uma vez só.** No laboratório, **AWS Details** → **Download PEM**.
+O arquivo baixado (`labsuser.pem`) vai para o WSL, e depois sai da pasta Downloads:
+
+```bash
+mkdir -p ~/.ssh
+cp /mnt/c/Users/turbi/Downloads/labsuser.pem ~/.ssh/labsuser.pem
+chmod 400 ~/.ssh/labsuser.pem
+```
+
+O SSH recusa uma chave que outros possam ler: `ls -l ~/.ssh/labsuser.pem` tem de
+começar com `-r--------`.
+
+**Criar, entrar e destruir:**
+
+```bash
+cd infra
+terraform init        # só na primeira vez: baixa os plugins travados no .terraform.lock.hcl
+terraform plan        # o que SERIA criado; não cria nada
+terraform apply       # cria; pede "yes"
+ssh -i ~/.ssh/labsuser.pem ubuntu@$(terraform output -raw ip_publico)
+terraform destroy     # apaga tudo; pede "yes"
+```
+
+No primeiro SSH a uma máquina nova o terminal pergunta se confia nela (`Are you
+sure you want to continue connecting`): `yes`. Como cada `apply` cria uma máquina
+nova, a pergunta volta a cada sessão.
+
+**Esperado** (máquina original, 19/10/2026):
+
+```
+Plan: 7 to add, 0 to change, 0 to destroy.
+...
+Apply complete! Resources: 7 added, 0 changed, 0 destroyed.
+
+Outputs:
+ami_id = "ami-02a9cdd4e98bc3c78"
+ami_nome = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20261017"
+...
+Destroy complete! Resources: 7 destroyed.
+```
+
+Dentro da máquina, `nproc` dá **2**, `free -h` dá **7,6 Gi** e `df -h /` dá **77 G**.
+
+**Conferir que nada sobrou**, pela própria AWS:
+
+```bash
+aws ec2 describe-instances --filters Name=tag:Projeto,Values=tcc-pipelines --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text
+```
+
+Só pode aparecer `terminated`, ou nada. Uma máquina `terminated` continua na lista
+do console por cerca de uma hora e não cobra mais.
+
+> **`terraform destroy` ao fim de TODA sessão.** Quando a sessão do laboratório
+> acaba, as máquinas ligadas são só **paradas**, e voltam a ligar sozinhas na
+> sessão seguinte — cobrando. O disco cobra mesmo com a máquina parada.
+
+> **Cada comando do Terraform leva uns 2 minutos a mais.** O plugin da AWS é um
+> executável de 803 MB e fica em `infra/.terraform/`, no disco do Windows, que o
+> WSL lê devagar. Medido em 19/10/2026: `validate` 120 s, `plan` 163 s, `apply`
+> 240 s, `destroy` 270 s — dos quais a AWS levou poucos segundos. Ficou assim por
+> decisão do autor; `export TF_DATA_DIR=~/tcc-data/terraform`, seguido de um
+> `terraform init`, leva a pasta para o disco do WSL.
+
+> **Não apague o `infra/terraform.tfstate` com a máquina no ar.** É o registro do
+> que o Terraform criou (fora do git). Sem ele o `destroy` não sabe o que apagar, e
+> a limpeza tem de ser feita à mão, no console.
+
+> **Se o seu IP mudar**, o SSH para de entrar. Um novo `terraform apply` lê o IP
+> atual e atualiza só a regra, sem recriar a máquina.
+
+---
+
 ## Verificação final
 
-Se os vinte e seis passos acima funcionaram, o ambiente está reproduzido:
+Se os vinte e sete passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -1688,6 +1778,7 @@ Se os vinte e seis passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `write_results.py` escreve o `.txt` e o `.md`, com a CPU em % da máquina, e rodar de novo dá arquivos idênticos
 - [x] A bateria local fecha as seis combinações: 120 rodadas válidas, `results/` vazia, seis pares de arquivos
 - [x] O `setup_aws_tools.sh` instala o Terraform e a AWS CLI, e o `aws sts get-caller-identity` responde com a conta do laboratório
+- [x] O `terraform apply` cria 7 recursos, o SSH entra numa `m5.large` com 2 núcleos, e o `terraform destroy` apaga os 7 sem deixar sobra
 
 ---
 
@@ -1802,7 +1893,11 @@ benchmarks/               o benchmark                              (Etapas 8 e 9
   run_round.py            uma rodada de um motor, do começo ao fim
   run_combination.py      as 10 rodadas de cada motor para um intervalo e uma carga
   write_results.py        escreve o .txt e o .md de cada combinação
-infra/                    Terraform                                (Etapa 10)
+infra/                    Terraform: rede, acesso e a máquina na AWS (Etapa 10)
+  versions.tf             Terraform 1.16.4 e os plugins; o .terraform.lock.hcl trava as versões
+  variables.tf            região, tipo, disco e chave — com as guardas dos limites do laboratório
+  main.tf                 VPC, sub-rede, rotas, regra de SSH, imagem do Ubuntu e a máquina
+  outputs.tf              IP, comando de SSH e a imagem usada
 results/                  material bruto das rodadas — fora do git, apagado ao fechar a combinação
 ```
 
