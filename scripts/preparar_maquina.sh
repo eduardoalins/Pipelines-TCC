@@ -12,7 +12,7 @@
 #
 # Os passos sao os do README (2 a 5, 12 e 13 e o relogio), na mesma ordem:
 #   1. pacotes do sistema     5. Kafka e o topico de 24 particoes
-#   2. Docker (repo oficial)  6. 6000 eventos e as duas cadeias conferidas
+#   2. Docker (versoes do WSL) 6. 6000 eventos e as duas cadeias conferidas
 #   3. ambiente Python        7. versoes de tudo (scripts/versoes.sh)
 #   4. as duas imagens        8. o relogio
 #
@@ -56,10 +56,18 @@ if [ -z "${PREPARAR_SEGUNDA_PASSADA:-}" ]; then
   "${APT[@]}" install ca-certificates curl python3.12-venv
   echo "OK"
 
-  # --- 2. Docker, do repositorio oficial da Docker ------------------------
-  # A mesma linha do Docker Desktop do WSL de referencia; o docker.io do
-  # Ubuntu costuma vir mais atrasado.
+  # --- 2. Docker, nas MESMAS versoes do WSL de referencia --------------------
+  # Decisao de 19/10/2026: o Docker da nuvem igual ao do Docker Desktop do WSL
+  # (Engine 28.0.4, containerd 1.7.26, Compose 2.34.0, cgroups por cgroupfs).
+  # E o Docker que impoe os tetos de memoria e conta a CPU dos conteineres. As
+  # versoes vem do repositorio oficial, pelo numero; um numero que nao exista
+  # faz o apt falhar aqui, antes de qualquer outra coisa. O que NAO da para
+  # igualar fica declarado: kernel, hipervisor e processador.
   passo "2. Docker"
+  DOCKER_VERSAO="5:28.0.4-1~ubuntu.24.04~noble"
+  CONTAINERD_VERSAO="1.7.26-1"
+  COMPOSE_VERSAO="2.34.0-1~ubuntu.24.04~noble"
+  BUILDX_VERSAO="0.22.0-1~ubuntu.24.04~noble"
   if command -v docker >/dev/null; then
     echo "ja instalado"
   else
@@ -69,10 +77,22 @@ if [ -z "${PREPARAR_SEGUNDA_PASSADA:-}" ]; then
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
       | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
     "${APT[@]}" update
-    "${APT[@]}" install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    # Sem os "recomendados": eles puxariam o docker-ce-rootless-extras na
+    # versao mais recente, fora do par travado acima.
+    "${APT[@]}" install --no-install-recommends \
+      "docker-ce=$DOCKER_VERSAO" "docker-ce-cli=$DOCKER_VERSAO" \
+      "containerd.io=$CONTAINERD_VERSAO" "docker-compose-plugin=$COMPOSE_VERSAO" \
+      "docker-buildx-plugin=$BUILDX_VERSAO"
+    # Travadas: nenhum apt upgrade troca a versao no meio de uma sessao.
+    sudo apt-mark hold docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+    # O Docker Desktop gerencia os cgroups pelo cgroupfs; o padrao no Ubuntu
+    # seria o systemd.
+    echo '{ "exec-opts": ["native.cgroupdriver=cgroupfs"] }' | sudo tee /etc/docker/daemon.json >/dev/null
+    sudo systemctl restart docker
   fi
   sudo usermod -aG docker "$USER"
-  echo "docker $(sudo docker version --format '{{.Server.Version}}'), compose $(sudo docker compose version --short)"
+  echo "docker $(sudo docker version --format '{{.Server.Version}}'), compose $(sudo docker compose version --short)," \
+       "cgroups $(sudo docker info --format '{{.CgroupDriver}}'), armazenamento $(sudo docker info --format '{{.Driver}}')"
 
   # O grupo novo so vale numa sessao nova. Em vez de pedir para sair e entrar,
   # o resto do script roda de novo dentro do grupo, pelo sg.

@@ -25,14 +25,18 @@ say "Host"
 echo "sistema ........ $(lsb_release -ds 2>/dev/null) / kernel $(uname -r)"
 echo "nucleos ........ $(nproc)"
 echo "docker ......... $(docker version --format '{{.Server.Version}}' 2>&1)"
+echo "componentes .... $(docker version --format '{{range .Server.Components}}{{.Name}} {{.Version}}; {{end}}' 2>&1)"
 echo "compose ........ $(docker compose version --short 2>&1)"
+echo "buildx ......... $(docker buildx version 2>&1)"
+echo "cgroups ........ v$(docker info --format '{{.CgroupVersion}}' 2>&1), driver $(docker info --format '{{.CgroupDriver}}' 2>&1)"
+echo "armazenamento .. $(docker info --format '{{.Driver}}' 2>&1)"
 echo "python do venv . $("$HOME/.venvs/tcc/bin/python" -V 2>&1)"
 
 say "Imagem do Spark ($SPARK_IMG)"
 echo "id ............. $(docker image inspect --format '{{.Id}}' "$SPARK_IMG" 2>&1)"
 docker run --rm -i --entrypoint sh "$SPARK_IMG" -s <<'DENTRO'
 echo "python ......... $(python3 -V 2>&1)"
-dpkg-query -W -f='apt ............ ${Package} ${Version}\n' python3 python3-pip
+dpkg-query -W -f='apt ............ ${Package} ${Version}\n' python3 python3.10 python3-pip
 echo "java ........... $(java -version 2>&1 | head -1)"
 echo "pyspark ........ $(python3 -c 'import pyspark; print(pyspark.__version__)' 2>&1)"
 echo "jars do conector $(wc -l < /opt/spark-ivy/jars.sha256) jars; impressao da lista: $(sha256sum /opt/spark-ivy/jars.sha256 | cut -c1-16)"
@@ -42,7 +46,7 @@ say "Imagem do Flink ($FLINK_IMG)"
 echo "id ............. $(docker image inspect --format '{{.Id}}' "$FLINK_IMG" 2>&1)"
 docker run --rm -i --entrypoint sh "$FLINK_IMG" -s <<'DENTRO'
 echo "python ......... $(python3 -V 2>&1)"
-dpkg-query -W -f='apt ............ ${Package} ${Version}\n' python3 python3-pip
+dpkg-query -W -f='apt ............ ${Package} ${Version}\n' python3 python3.10 python3-pip
 echo "java ........... $(java -version 2>&1 | head -1)"
 echo "pyflink ........ $(python3 -c 'from pyflink.version import __version__ as v; print(v)' 2>&1)"
 for jar in /opt/flink-connectors/*.jar; do
