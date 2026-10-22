@@ -266,6 +266,14 @@ incerto.
 - **As dependências estão travadas.** O `pipeline-nrt/requirements.txt` fixa o
   PySpark e o cliente Kafka; o `requirements.lock` fixa também as dependências
   indiretas.
+- **Os pacotes do Ubuntu também** (desde 21/10/2026). O `apt` da imagem lê o
+  repositório **congelado** em 10/10/2026, 20:00 UTC, no arquivo histórico do
+  Ubuntu (`snapshot.ubuntu.com`), e o `python3`, o `python3.10` e o `pip` entram
+  pelo número da versão. Sem isso, um build futuro instalaria as versões do dia;
+  com isso, qualquer build sai com os pacotes das imagens da bateria local,
+  construídas dez minutos depois daquela data. Só fixar o número não bastaria:
+  o repositório normal guarda apenas a versão mais recente, e o pedido falharia
+  na primeira atualização do Ubuntu.
 
 > **Editar um arquivo copiado para a imagem reconstrói as camadas seguintes** —
 > mesmo que a mudança seja um comentário no `requirements.txt`. O resultado deve
@@ -577,6 +585,16 @@ A primeira construção leva cerca de dois minutos, quase todos no `pip install`
 - **As dependências estão travadas.** O `requirements.txt` fixa o PyFlink; o
   `requirements.lock` fixa **todas** as dependências dele, que de outro modo o
   `pip` escolheria de novo a cada build.
+- **Os pacotes do Ubuntu também**, pelo mesmo arquivo histórico do Spark (passo
+  5): o repositório congelado em 10/10/2026, 20:00 UTC, e o `python3`, o
+  `python3.10` e o `pip` pelo número.
+
+> **As imagens da bateria local são anteriores a esse congelamento.** Elas foram
+> construídas em 10/10/2026 com o `apt` do dia — que, naquele dia, era o mesmo
+> do arquivo histórico. Os IDs delas (`ec241f18cf24` e `7d6d36c04457`) só voltam
+> pelo cache de build daquela época; um build com o `Dockerfile` atual gera
+> outro ID, com o mesmo conteúdo. Não apague as imagens locais: elas são o
+> registro do que rodou na bateria.
 
 > **O "OK" do checksum não aparece na tela.** O BuildKit recolhe a saída dos
 > passos que dão certo. Chegar ao `✔ flink Built` já prova que o checksum bateu.
@@ -1665,12 +1683,20 @@ da sessão coladas** (passo 26).
 |---|---|
 | Rede própria | VPC `10.42.0.0/16`, sub-rede pública `10.42.1.0/24` em `us-east-1a`, internet gateway e rotas |
 | Regra de acesso | SSH (porta 22) **só do IP de quem roda o `apply`**, lido de `checkip.amazonaws.com` |
-| A máquina | `m5.large` (2 vCPU, 8 GB), Ubuntu 24.04 LTS oficial da Canonical, chave `vockey`, perfil `LabInstanceProfile`, metadados só com token |
+| A máquina | `m5.large` (2 vCPU, 8 GB), Ubuntu 24.04.5 LTS oficial da Canonical **fixado pelo ID** (`ami-02a9cdd4e98bc3c78`, de 17/10/2026), chave `vockey`, perfil `LabInstanceProfile`, metadados só com token |
 | O disco | 80 GB `gp3`, apagado junto com a máquina |
 
 As variáveis em `infra/variables.tf` **recusam, antes de chegar à AWS**, um tamanho
 acima de `large`, um disco acima de 100 GB ou uma região fora das duas do
 laboratório.
+
+**Por que a imagem é fixa** (decisão de 21/10/2026). A bateria da nuvem não cabe
+numa sessão, e cada combinação roda num dia. Pedindo "a imagem mais recente",
+combinações diferentes poderiam rodar sobre sistemas — e kernels — diferentes, e
+uma diferença entre elas poderia vir da troca do sistema e não da carga. Fixada,
+toda sessão liga o mesmo disco de fábrica, com o mesmo kernel
+(`7.0.0-1014-aws`). Se a imagem deixar de existir, o `plan` falha antes de criar
+qualquer coisa.
 
 **A chave de SSH, uma vez só.** No laboratório, **AWS Details** → **Download PEM**.
 O arquivo baixado (`labsuser.pem`) vai para o WSL, e depois sai da pasta Downloads:
@@ -1766,10 +1792,10 @@ na nuvem depois de `commit` **e** `push`.
 
 | # | Passo | Detalhe |
 |---|---|---|
-| 1 | Pacotes do sistema | `python3.12-venv`; espera o primeiro boot da máquina terminar de mexer no `apt` |
+| 1 | Pacotes do sistema | espera o primeiro boot da máquina terminar de mexer no `apt`; **desliga as atualizações automáticas**; **congela o `apt` do host** no arquivo histórico de 18/10/2026; instala o `python3.12-venv` |
 | 2 | Docker | **as mesmas versões do Docker Desktop do WSL**: Engine 28.0.4, containerd 1.7.26, Compose 2.34.0, buildx 0.22.0, cgroups por `cgroupfs`; os pacotes ficam travados (`apt-mark hold`) |
 | 3 | Ambiente Python | o próprio `setup_env.sh` do passo 2 |
-| 4 | As duas imagens | `docker compose build`, de novo a cada sessão; a base é travada por digest e os jars por checksum |
+| 4 | As duas imagens | `docker compose build`, de novo a cada sessão; a base é travada por digest, os pacotes do Ubuntu pelo arquivo histórico (passos 5 e 12) e os jars por checksum |
 | 5 | Kafka e tópico | o mesmo `docker-compose.yml` e o `create_topic.sh` (24 partições) |
 | 6 | Cadeias | 6000 eventos (1000 evt/s por 6 s), `check_chain.py` e `check_chain_flink.py` |
 | 7 | Versões | `scripts/versoes.sh` |
@@ -1785,28 +1811,34 @@ scp -i ~/.ssh/labsuser.pem ubuntu@$(terraform output -raw ip_publico):tcc-data/p
 
 É a evidência de com que ambiente aquela sessão rodou.
 
-**Esperado** (máquina original, 20/10/2026), cerca de **5 a 7 minutos**:
+**Esperado** (máquina original, 21/10/2026), cerca de **6 minutos**:
 
 ```
->> [   0s] Codigo: commit d46f72c — Step 10: cloud Docker pinned to the local versions
+>> [   0s] Codigo: commit a409abc — Step 10: cloud environment frozen
 >> [   0s] 1. Pacotes do sistema
->> [  23s] 2. Docker
+atualizacoes automaticas desligadas
+apt do host no arquivo historico de 20261018T000000Z
+>> [  36s] 2. Docker
 docker 28.0.4, compose 2.34.0, cgroups cgroupfs, armazenamento overlay2
->> [  41s] 3. Ambiente Python
->> [  49s] 4. Imagem do Spark
->> [ 131s] 4. Imagem do Flink
->> [ 205s] 5. Kafka
+>> [  54s] 3. Ambiente Python
+>> [  63s] 4. Imagem do Spark
+>> [ 144s] 4. Imagem do Flink
+>> [ 236s] 5. Kafka
 OK: o Kafka grava no volume
 OK: ecommerce.events.v1 com 24 particoes.
->> [ 233s] 6. Gerador (6000 eventos) e as cadeias
+>> [ 263s] 6. Gerador (6000 eventos) e as cadeias
 CADEIA COMPLETA OK
 CADEIA COMPLETA OK
->> [ 286s] 7. Versoes
->> [ 287s] 8. Relogio
+>> [ 316s] 7. Versoes
+>> [ 317s] 8. Relogio
 OK: relogio sao. Pode medir.
->> [ 328s] Maquina pronta
+>> [ 357s] Maquina pronta
 disco livre .... 72G
 ```
+
+No build das imagens, todas as linhas `Get:` do `apt` têm de vir de
+`https://snapshot.ubuntu.com/ubuntu/20261010T200000Z` — em 21/10/2026 foram 68, e
+nenhuma do repositório normal.
 
 Somando o `apply` e o `destroy` do passo 27, cada sessão gasta uns **16 minutos**
 só para existir e deixar de existir.
@@ -1823,10 +1855,24 @@ das duas imagens: Python 3.10.12, `python3.10` 3.10.12-1~22.04.18, `pip`
 IDs das imagens diferem — cada build gera o seu — e o kernel, o hipervisor e o
 processador são outros (kernel 7.0 da AWS contra 5.15 do WSL; 2 vCPU contra 8).
 
-> **O `python3` e o `pip` das imagens vêm do `apt` sem versão fixa.** Nas
-> comparações de outubro de 2026 eles saíram iguais aos das imagens da bateria
-> local, mas uma atualização do Ubuntu pode mudá-los num build futuro. Confira com
-> o `versoes.sh` a cada sessão.
+**O ambiente da nuvem é congelado** (decisões de 19 a 21/10/2026). Toda sessão
+monta exatamente a mesma máquina, e nada muda sozinho durante uma medição:
+
+| Camada | Como fica fixa |
+|---|---|
+| Sistema da máquina e kernel | a imagem pelo ID (passo 27) |
+| Pacotes do host | o arquivo histórico do Ubuntu de 18/10/2026 |
+| Atualizações automáticas | desligadas no começo da preparação |
+| Docker | as versões do WSL, pelo número, travadas com `apt-mark hold` |
+| Pacotes das imagens | o arquivo histórico de 10/10/2026 e os números das versões |
+| Bibliotecas Python e jars | `requirements.lock` e checksums, como no local |
+
+O que não dá para congelar fica declarado: o hipervisor e o processador da AWS, e
+as 2 vCPU. Os resultados da nuvem valem para **este** ambiente — que, por estar
+congelado, qualquer pessoa consegue montar de novo.
+
+> **O arquivo histórico depende do `snapshot.ubuntu.com` no ar.** Se o serviço
+> cair, o build falha com erro — nunca instala pacotes do dia em silêncio.
 
 > **Rodar de novo** pula o que já está feito: o script é idempotente. Ele também
 > se recusa a rodar no WSL, para não instalar outra versão do Docker no seu
@@ -1871,6 +1917,7 @@ Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `setup_aws_tools.sh` instala o Terraform e a AWS CLI, e o `aws sts get-caller-identity` responde com a conta do laboratório
 - [x] O `terraform apply` cria 7 recursos, o SSH entra numa `m5.large` com 2 núcleos, e o `terraform destroy` apaga os 7 sem deixar sobra
 - [x] O `preparar_maquina.sh` deixa a máquina pronta em ~6 minutos, com o mesmo Docker do WSL, as duas cadeias completas e o relógio são
+- [x] O `apt` das imagens e o do host leem só do arquivo histórico do Ubuntu, e as versões de dentro das imagens saem iguais às da bateria local
 
 ---
 
@@ -1939,7 +1986,8 @@ meio dos experimentos invalida as execuções já feitas.
 | Terraform | 1.16.4, no WSL, conferido pelo checksum da HashiCorp | 17/10/2026 |
 | AWS CLI | 2.38.1 — a mais recente na instalação; só cria e lê recursos, não entra em medida | 17/10/2026 |
 | Docker | Engine 28.0.4, containerd 1.7.26, runc 1.2.5, Compose 2.34.0, buildx 0.22.0, cgroups `cgroupfs` — o Docker Desktop do WSL, e o mesmo na máquina da AWS (`preparar_maquina.sh`) | 19 e 20/10/2026 |
-| Máquina da AWS | `m5.large`, Ubuntu 24.04.5, imagem `ami-02a9cdd4e98bc3c78` nas sessões de 19 e 20/10/2026 (o Terraform pede a mais recente; o ID de cada sessão sai nos outputs) | 20/10/2026 |
+| Máquina da AWS | `m5.large`, Ubuntu 24.04.5, imagem **fixa** `ami-02a9cdd4e98bc3c78` (17/10/2026), kernel `7.0.0-1014-aws`; `apt` do host no arquivo histórico de 18/10/2026; atualizações automáticas desligadas | 21/10/2026 |
+| Pacotes do Ubuntu nas imagens | arquivo histórico de 10/10/2026, 20:00 UTC; `python3` 3.10.6-1~22.04.1, `python3.10` 3.10.12-1~22.04.18, `python3-pip` 22.0.2+dfsg-1ubuntu0.7 | 21/10/2026 |
 
 Cada ambiente tem o seu arquivo de versões. As das ferramentas do host estão no
 `requirements.txt` da raiz. As do Spark, em `pipeline-nrt/requirements.txt`; as do
