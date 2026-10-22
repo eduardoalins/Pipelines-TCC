@@ -41,8 +41,28 @@ FROM eclipse-temurin:17.0.20_8-jre-jammy@sha256:e85989f3e4d136b3d7dde921e157fddb
 
 # --- Python ---------------------------------------------------------------
 # curl entra so para baixar o conector, logo abaixo.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 python3-pip curl ca-certificates \
+#
+# O apt le o repositorio do Ubuntu CONGELADO numa data (snapshot.ubuntu.com),
+# e o python3, o python3.10 e o pip vem pelo numero (decisao de 21/10/2026).
+# Sem isso o apt instalaria a versao do dia, e um build futuro sairia diferente
+# das imagens da bateria local, construidas em 10/10/2026 (esta as 20:19 UTC).
+# A data abaixo e de antes; nela o repositorio tinha exatamente as versoes
+# daquelas imagens (conferido em 20/10/2026). So o numero nao bastaria: o
+# repositorio normal guarda apenas a versao mais recente, e o pedido falharia na
+# primeira atualizacao do Ubuntu. O mesmo bloco esta no Dockerfile do Spark.
+ARG UBUNTU_SNAPSHOT=20261010T200000Z
+ARG PYTHON3_VERSAO=3.10.6-1~22.04.1
+ARG PYTHON310_VERSAO=3.10.12-1~22.04.18
+ARG PIP_VERSAO=22.0.2+dfsg-1ubuntu0.7
+RUN sed -i \
+      -e "s#http://archive.ubuntu.com/ubuntu/#https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/#" \
+      -e "s#http://security.ubuntu.com/ubuntu/#https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/#" \
+      /etc/apt/sources.list \
+ && ! grep -q '^deb http://' /etc/apt/sources.list \
+ && apt-get -o Acquire::Check-Valid-Until=false update \
+ && apt-get install -y --no-install-recommends \
+      "python3=${PYTHON3_VERSAO}" "python3.10=${PYTHON310_VERSAO}" "python3-pip=${PIP_VERSAO}" \
+      curl ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && ln -s /usr/bin/python3 /usr/bin/python
 

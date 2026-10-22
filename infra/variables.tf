@@ -19,6 +19,12 @@ variable "zona" {
   default     = "us-east-1a"
 }
 
+variable "ami_id" {
+  description = "Imagem da maquina: Ubuntu 24.04.5 LTS da Canonical, publicada em 17/10/2026 (ubuntu-noble-24.04-amd64-server-20261017). A dos testes de 19 e 20/10/2026."
+  type        = string
+  default     = "ami-02a9cdd4e98bc3c78"
+}
+
 variable "tipo_instancia" {
   description = "Tipo da maquina. m5.large: 2 vCPU, 8 GB, CPU sem creditos."
   type        = string

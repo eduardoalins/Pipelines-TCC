@@ -85,21 +85,17 @@ resource "aws_security_group" "ssh" {
   tags = { Name = "tcc-ssh" }
 }
 
-# --- A imagem: Ubuntu 24.04 LTS oficial da Canonical (decisao de 17/10/2026) -
-# O mesmo sistema do WSL. "A mais recente" muda com o tempo: o ID usado sai
-# nos outputs e vai para o registro da etapa.
+# --- A imagem: Ubuntu 24.04 LTS oficial da Canonical, FIXADA pelo ID ---------
+# Decisoes de 17 e 21/10/2026. Toda sessao liga o mesmo "disco de fabrica" — o
+# mesmo kernel, o mesmo Python do sistema —, para nenhuma combinacao rodar
+# sobre um sistema diferente das outras. A busca confere que o ID e mesmo da
+# Canonical; se a imagem deixar de existir, o plan falha antes de criar nada.
 data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
+  owners = ["099720109477"] # Canonical
 
   filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
+    name   = "image-id"
+    values = [var.ami_id]
   }
 }
 

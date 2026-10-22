@@ -52,6 +52,30 @@ if [ -z "${PREPARAR_SEGUNDA_PASSADA:-}" ]; then
   if command -v cloud-init >/dev/null; then
     cloud-init status --wait >/dev/null || true
   fi
+
+  # Nada se atualiza sozinho durante a sessao (decisao de 21/10/2026): o
+  # unattended-upgrades instalaria pacotes, ocupando CPU e disco, no meio de
+  # uma rodada — e so a rodada daquele momento seria atingida.
+  sudo systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service
+  echo "atualizacoes automaticas desligadas"
+
+  # O apt do host le o repositorio do Ubuntu CONGELADO numa data
+  # (snapshot.ubuntu.com), como as imagens: toda sessao instala os mesmos
+  # pacotes. A data e o dia seguinte ao da imagem da maquina (17/10/2026),
+  # para nada vir mais velho que o que ja vem instalado. Uma fonte que nao
+  # tenha sido trocada faz o script parar.
+  UBUNTU_SNAPSHOT_HOST="${UBUNTU_SNAPSHOT_HOST:-20261018T000000Z}"
+  SNAP="https://snapshot.ubuntu.com/ubuntu/$UBUNTU_SNAPSHOT_HOST/"
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+    [ -f "$f" ] && sudo sed -i -E \
+      -e "s#https?://[a-z0-9.-]*archive\.ubuntu\.com/ubuntu/?#$SNAP#g" \
+      -e "s#https?://security\.ubuntu\.com/ubuntu/?#$SNAP#g" "$f"
+  done
+  if grep -rhE '^[^#]*(archive|security)\.ubuntu\.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+    echo "ERRO: ainda ha fonte do Ubuntu fora do arquivo historico (acima). Parei."
+    exit 1
+  fi
+  echo "apt do host no arquivo historico de $UBUNTU_SNAPSHOT_HOST"
   "${APT[@]}" update
   "${APT[@]}" install ca-certificates curl python3.12-venv
   echo "OK"

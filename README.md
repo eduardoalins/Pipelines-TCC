@@ -50,6 +50,7 @@ tenderiam a divergir.
 | 25 | a bateria local: as seis combinações | Etapa 9 / RT-7 |
 | 26 | as ferramentas e as credenciais da nuvem | Etapa 10 — em andamento |
 | 27 | criar e destruir a máquina na AWS, com o Terraform | Etapa 10 — em andamento |
+| 28 | preparar a máquina da AWS: Docker, imagens, Kafka e conferências | Etapa 10 — em andamento |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -1743,9 +1744,99 @@ do console por cerca de uma hora e não cobra mais.
 
 ---
 
+## Passo 28 — Preparar a máquina da AWS
+
+A máquina nasce como um Ubuntu vazio, e é destruída ao fim de cada sessão: a
+preparação se repete em **toda** sessão. Um script a deixa igual ao WSL de
+referência, refazendo dentro dela os passos 2 a 5, 12 e 13 e a conferência do
+relógio.
+
+**Dentro da máquina** (depois do `ssh` do passo 27):
+
+```bash
+git clone https://github.com/eduardoalins/Pipelines-TCC.git
+bash Pipelines-TCC/scripts/preparar_maquina.sh
+```
+
+**O código vem do GitHub**, não do seu computador: a máquina roda exatamente um
+commit publicado, e o manifesto de cada rodada registra qual. Uma correção só vale
+na nuvem depois de `commit` **e** `push`.
+
+**O que o script faz**, nesta ordem:
+
+| # | Passo | Detalhe |
+|---|---|---|
+| 1 | Pacotes do sistema | `python3.12-venv`; espera o primeiro boot da máquina terminar de mexer no `apt` |
+| 2 | Docker | **as mesmas versões do Docker Desktop do WSL**: Engine 28.0.4, containerd 1.7.26, Compose 2.34.0, buildx 0.22.0, cgroups por `cgroupfs`; os pacotes ficam travados (`apt-mark hold`) |
+| 3 | Ambiente Python | o próprio `setup_env.sh` do passo 2 |
+| 4 | As duas imagens | `docker compose build`, de novo a cada sessão; a base é travada por digest e os jars por checksum |
+| 5 | Kafka e tópico | o mesmo `docker-compose.yml` e o `create_topic.sh` (24 partições) |
+| 6 | Cadeias | 6000 eventos (1000 evt/s por 6 s), `check_chain.py` e `check_chain_flink.py` |
+| 7 | Versões | `scripts/versoes.sh` |
+| 8 | Relógio | `check_clock.py` — fora do WSL há um sincronizador só, e ele ligado é o estado certo |
+
+Tudo que sai na tela vai também para `~/tcc-data/preparacao.txt`, **na máquina**,
+com o tempo de cada passo. Como o disco é apagado no `destroy`, traga o arquivo
+para o seu computador antes (no WSL, dentro de `infra/`):
+
+```bash
+scp -i ~/.ssh/labsuser.pem ubuntu@$(terraform output -raw ip_publico):tcc-data/preparacao.txt ~/tcc-data/preparacao_aws_$(date +%Y%m%d_%H%M).txt
+```
+
+É a evidência de com que ambiente aquela sessão rodou.
+
+**Esperado** (máquina original, 20/10/2026), cerca de **5 a 7 minutos**:
+
+```
+>> [   0s] Codigo: commit d46f72c — Step 10: cloud Docker pinned to the local versions
+>> [   0s] 1. Pacotes do sistema
+>> [  23s] 2. Docker
+docker 28.0.4, compose 2.34.0, cgroups cgroupfs, armazenamento overlay2
+>> [  41s] 3. Ambiente Python
+>> [  49s] 4. Imagem do Spark
+>> [ 131s] 4. Imagem do Flink
+>> [ 205s] 5. Kafka
+OK: o Kafka grava no volume
+OK: ecommerce.events.v1 com 24 particoes.
+>> [ 233s] 6. Gerador (6000 eventos) e as cadeias
+CADEIA COMPLETA OK
+CADEIA COMPLETA OK
+>> [ 286s] 7. Versoes
+>> [ 287s] 8. Relogio
+OK: relogio sao. Pode medir.
+>> [ 328s] Maquina pronta
+disco livre .... 72G
+```
+
+Somando o `apply` e o `destroy` do passo 27, cada sessão gasta uns **16 minutos**
+só para existir e deixar de existir.
+
+**Comparar com o WSL.** O `scripts/versoes.sh` roda nos dois ambientes:
+
+```bash
+bash scripts/versoes.sh
+```
+
+Na comparação de 19 e 20/10/2026, tudo o que ele lê saiu igual, no Docker e dentro
+das duas imagens: Python 3.10.12, `python3.10` 3.10.12-1~22.04.18, `pip`
+22.0.2, Java 17.0.20, PySpark 4.0.4, PyFlink 1.20.5 e os checksums dos jars. Os
+IDs das imagens diferem — cada build gera o seu — e o kernel, o hipervisor e o
+processador são outros (kernel 7.0 da AWS contra 5.15 do WSL; 2 vCPU contra 8).
+
+> **O `python3` e o `pip` das imagens vêm do `apt` sem versão fixa.** Nas
+> comparações de outubro de 2026 eles saíram iguais aos das imagens da bateria
+> local, mas uma atualização do Ubuntu pode mudá-los num build futuro. Confira com
+> o `versoes.sh` a cada sessão.
+
+> **Rodar de novo** pula o que já está feito: o script é idempotente. Ele também
+> se recusa a rodar no WSL, para não instalar outra versão do Docker no seu
+> computador por engano.
+
+---
+
 ## Verificação final
 
-Se os vinte e sete passos acima funcionaram, o ambiente está reproduzido:
+Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -1779,6 +1870,7 @@ Se os vinte e sete passos acima funcionaram, o ambiente está reproduzido:
 - [x] A bateria local fecha as seis combinações: 120 rodadas válidas, `results/` vazia, seis pares de arquivos
 - [x] O `setup_aws_tools.sh` instala o Terraform e a AWS CLI, e o `aws sts get-caller-identity` responde com a conta do laboratório
 - [x] O `terraform apply` cria 7 recursos, o SSH entra numa `m5.large` com 2 núcleos, e o `terraform destroy` apaga os 7 sem deixar sobra
+- [x] O `preparar_maquina.sh` deixa a máquina pronta em ~6 minutos, com o mesmo Docker do WSL, as duas cadeias completas e o relógio são
 
 ---
 
@@ -1846,6 +1938,8 @@ meio dos experimentos invalida as execuções já feitas.
 | DuckDB (leitor do `reconcile.py`) | 1.5.5 | 24/09/2026 |
 | Terraform | 1.16.4, no WSL, conferido pelo checksum da HashiCorp | 17/10/2026 |
 | AWS CLI | 2.38.1 — a mais recente na instalação; só cria e lê recursos, não entra em medida | 17/10/2026 |
+| Docker | Engine 28.0.4, containerd 1.7.26, runc 1.2.5, Compose 2.34.0, buildx 0.22.0, cgroups `cgroupfs` — o Docker Desktop do WSL, e o mesmo na máquina da AWS (`preparar_maquina.sh`) | 19 e 20/10/2026 |
+| Máquina da AWS | `m5.large`, Ubuntu 24.04.5, imagem `ami-02a9cdd4e98bc3c78` nas sessões de 19 e 20/10/2026 (o Terraform pede a mais recente; o ID de cada sessão sai nos outputs) | 20/10/2026 |
 
 Cada ambiente tem o seu arquivo de versões. As das ferramentas do host estão no
 `requirements.txt` da raiz. As do Spark, em `pipeline-nrt/requirements.txt`; as do
@@ -1865,6 +1959,8 @@ scripts/check_chain.py    verifica Python → Spark → JVM → Kafka, no contê
 scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1)
 scripts/check_clock.py    confere o relógio antes de medir         (Etapa 6.2)
 scripts/setup_aws_tools.sh  instala o Terraform e a AWS CLI no WSL   (Etapa 10)
+scripts/preparar_maquina.sh prepara a máquina da AWS, dentro dela    (Etapa 10)
+scripts/versoes.sh        versões do Docker e de dentro das imagens, para comparar ambientes
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
   data-generator/         gerador de eventos; aceita SEED e MALFORMED_RATE (Etapas 3 e 8)

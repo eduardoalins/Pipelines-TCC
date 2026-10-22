@@ -31,6 +31,7 @@ echo "buildx ......... $(docker buildx version 2>&1)"
 echo "cgroups ........ v$(docker info --format '{{.CgroupVersion}}' 2>&1), driver $(docker info --format '{{.CgroupDriver}}' 2>&1)"
 echo "armazenamento .. $(docker info --format '{{.Driver}}' 2>&1)"
 echo "python do venv . $("$HOME/.venvs/tcc/bin/python" -V 2>&1)"
+dpkg-query -W -f='apt do host ... ${Package} ${Version}\n' python3.12 python3.12-venv 2>&1
 
 say "Imagem do Spark ($SPARK_IMG)"
 echo "id ............. $(docker image inspect --format '{{.Id}}' "$SPARK_IMG" 2>&1)"
