@@ -26,12 +26,13 @@ ele nao esquece de zerar o checkpoint nem de conferir o relogio.
                com trigger de 30 s, 60 s deixariam UM lote depois do descarte de
                aquecimento
 
---- O que a RODADA decide (decisoes de 11/10/2026) ---------------------------
-  seed         41 + RODADA: a rodada 1 usa 42, a 10 usa 51. A mesma seed vale
-               para os dois motores — a rodada N do Spark e a do Flink recebem
-               os mesmos eventos.
-  malformados  as rodadas 2, 5, 7 e 10 levam 1% de mensagens malformadas, no
-               lugar de eventos validos; as outras seis, so eventos validos.
+--- O que a RODADA decide (CONTRATO.md 3.0, decisoes de 23/10/2026) ----------
+  janela       os eventos vem da base real (CONTRATO.md 1.5), pelo replayer:
+               uma janela continua de CARGA x DURACAO linhas, com o inicio
+               sorteado pela seed 41 + RODADA (a rodada 1 usa 42, a 10 usa 51).
+               A rodada N do Spark e a do Flink recebem a mesma janela.
+  sem malformados desde o contrato 3.0. Ate a 2.2 as rodadas 2, 5, 7 e 10
+               levavam 1% de mensagens malformadas, do gerador sintetico.
 
 --- Os passos -----------------------------------------------------------------
    1. conferencias: disco, relogio, Kafka, nenhum pipeline esquecido, imagens
@@ -41,8 +42,8 @@ ele nao esquece de zerar o checkpoint nem de conferir o relogio.
    4. anota os offsets do topico (antes)
    5. sobe o pipeline e espera ficar pronto
    6. liga o coletor: lag, CPU e memoria, uma amostra por segundo
-   7. roda o gerador
-   8. espera a fila zerar — gerador terminado E lag zero —, por ate DURACAO
+   7. roda o replayer: posiciona na janela, depois envia na taxa pedida
+   8. espera a fila zerar — replayer terminado E lag zero —, por ate DURACAO
       segundos; se o pipeline cair no caminho, a rodada e registrada como quebra
    9. anota os offsets (depois): e o que permite contar as descartadas
   10. cria o arquivo de parada e espera o pipeline encerrar
@@ -89,8 +90,10 @@ METRICS = DATA_DIR / "metrics"
 CONTROLE = DATA_DIR / "control"
 PY = sys.executable
 
-RODADAS_COM_MALFORMADOS = (2, 5, 7, 10)
-PROPORCAO_MALFORMADOS = 0.01
+# A base real e onde ela deve estar: as mesmas constantes que o replayer usa.
+sys.path.insert(0, str(REPO / "shared" / "data-generator"))
+from replayer import BASE, BASE_BYTES  # noqa: E402
+
 SEED_BASE = 41
 DISCO_MINIMO_GB = 50        # do MENOR entre o disco dos dados e o do repositorio
 ESPERA_PRONTO_S = 180       # ate o pipeline dizer que esta no ar
@@ -148,7 +151,7 @@ class Rodada:
         # O intervalo que o motor usa de fato: o da combinacao no Spark, 5 s no Flink.
         self.intervalo_motor = self.m["intervalo"](self.intervalo)
         self.seed = SEED_BASE + self.rodada
-        self.malformados = PROPORCAO_MALFORMADOS if self.rodada in RODADAS_COM_MALFORMADOS else 0.0
+        self.malformados = 0.0      # sem malformados desde o contrato 3.0 (secao 2.6)
         carimbo = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         self.run_id = f"{carimbo}-{self.motor}-i{self.intervalo}-c{self.carga}-r{self.rodada:02d}"
         self.pasta = (REPO / "results" / f"Intervalo{self.intervalo}Carga{self.carga}"
@@ -233,6 +236,11 @@ class Rodada:
         if relogio.returncode != 0:
             raise Abortar("o relogio reprovou (ver relogio.txt). "
                           "sudo systemctl stop systemd-timesyncd, esperar ~2 min e tentar de novo.")
+
+        # A base real tem de estar pronta; o sha256 dela e conferido pelo
+        # preparar_base.sh, e aqui o tamanho basta para pegar arquivo errado.
+        if not BASE.is_file() or BASE.stat().st_size != BASE_BYTES:
+            raise Abortar(f"a base nao esta pronta em {BASE}: bash scripts/preparar_base.sh")
 
         saude = sh("docker", "inspect", "-f", "{{.State.Health.Status}}", "kafka").stdout.strip()
         if saude != "healthy":
@@ -333,15 +341,15 @@ class Rodada:
 
     # --- 7 a 9. carga -----------------------------------------------------------------
     def gerar(self) -> None:
-        self.passo(f"7/12 gerador: {self.carga} msg/s por {self.duracao} s, seed {self.seed}"
-                   + (f", {self.malformados:.0%} malformados" if self.malformados else ""))
+        self.passo(f"7/12 replayer: {self.carga} msg/s por {self.duracao} s, "
+                   f"janela da base pela seed {self.seed}")
         env = {**os.environ, "RATE": str(self.carga), "DURATION": str(self.duracao),
                "SEED": str(self.seed), "RUN_ID": self.run_id}
-        if self.malformados:
-            env["MALFORMED_RATE"] = str(self.malformados)
+        # Substituido abaixo pelo instante em que o replayer comecou a ENVIAR,
+        # depois de posicionar na janela.
         self.manifesto["gerador_inicio_ms"] = int(time.time() * 1000)
-        gerador = subprocess.Popen([PY, "shared/data-generator/generator.py"], cwd=REPO, env=env,
-                                   stdout=open(self.pasta / "gerador.txt", "wb"),
+        gerador = subprocess.Popen([PY, "shared/data-generator/replayer.py"], cwd=REPO, env=env,
+                                   stdout=open(self.pasta / "replayer.txt", "wb"),
                                    stderr=subprocess.STDOUT)
         while gerador.poll() is None:
             if not self.pipeline_vivo():
@@ -354,7 +362,16 @@ class Rodada:
         self.manifesto["gerador_fim_ms"] = int(time.time() * 1000)
         self.manifesto["gerador_codigo"] = gerador.returncode
         if gerador.returncode != 0:
-            self.motivos.append(f"o gerador saiu com codigo {gerador.returncode}")
+            self.motivos.append(f"o replayer saiu com codigo {gerador.returncode}")
+        # A janela da base e o instante do primeiro envio, do manifesto do replayer.
+        gen = METRICS / f"{self.run_id}.gen0.json"
+        if gen.is_file():
+            g = json.loads(gen.read_text(encoding="utf-8"))
+            self.manifesto["janela"] = g.get("janela")
+            self.manifesto["base_sha256_gz"] = (g.get("base") or {}).get("sha256_gz")
+            self.manifesto["posicionamento_s"] = g.get("posicionamento_s")
+            if g.get("envio_inicio_ms"):
+                self.manifesto["gerador_inicio_ms"] = g["envio_inicio_ms"]
 
         self.passo(f"8/12 esperando a fila zerar (ate {self.duracao} s)")
         inicio = time.monotonic()

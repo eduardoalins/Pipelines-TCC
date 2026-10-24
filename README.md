@@ -16,11 +16,17 @@ Ambos consomem o mesmo tópico Kafka e escrevem os mesmos eventos em Parquet, no
 mesmo layout. O que varia é o motor — é isso que torna a comparação válida. As
 invariantes que garantem essa equivalência estão no `CONTRATO.md`.
 
+**Os eventos são reais** (desde o `CONTRATO.md` 3.0, 23/10/2026): 42,4 milhões de
+eventos de uma loja online, de outubro de 2019, da base pública *eCommerce behavior
+data from multi category store* (REES46, no
+[Kaggle](https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store)).
+Um **replayer** os envia ao Kafka na taxa pedida pelo experimento.
+
 Os pipelines são **ELT estrito**: extraem e carregam, sem transformar. Não há
 join nem limpeza dentro deles; a transformação acontece depois, no destino, é a
 mesma para os dois motores e fica fora da comparação. O que o trabalho compara é
-o **E** e o **L**. Os dez campos do evento são carregados **como texto**, do jeito
-que chegam (passo 21).
+o **E** e o **L**. Os campos do evento são carregados **como texto**, do jeito
+que chegam (passo 10).
 
 ---
 
@@ -40,12 +46,14 @@ tenderiam a divergir.
 
 | Passos | O que reconstroem | Até onde chegou |
 |---|---|---|
-| 1 a 8 | ambiente, Kafka, tópico e gerador — **compartilhados** (o passo 5 constrói a imagem do Spark) | Etapas 0 a 3 |
+| 1 a 5 | ambiente, Kafka, tópico — **compartilhados** (o passo 5 constrói a imagem do Spark) | Etapas 0 a 3 |
+| antes do 6 | **a base de eventos reais**: baixar, conferir e descompactar | Etapa 9.1 |
+| 6 a 8 | o replayer, a distribuição nas partições e a persistência | Etapas 3 e 9.1 |
 | 9 a 11 | pipeline NRT (Spark), em contêiner | Etapa 5 — Parquet com checkpoint |
 | 12 a 16 | pipeline Streaming (Flink), em contêiner | Etapa RT-3 — Parquet com checkpoint |
 | antes do 17 | **conferir o relógio** — obrigatório antes de qualquer medição | Etapa 6.2 |
 | 17 a 20 | instrumento de medição, nos dois motores | Etapa 6 / RT-4 — lag, reconciliação e latências |
-| 21 | eventos malformados: carregados como texto e contados depois do Load | Etapa 7 / RT-5, revista na Etapa 8.1 |
+| 21 | eventos malformados — **aposentado** no contrato 3.0; fica o registro do que foi medido | Etapa 7 / RT-5, revista na 8.1 |
 | 22 a 24 | o benchmark: uma rodada, as dez rodadas de uma combinação e os arquivos de resultado | Etapa 8 / RT-6 |
 | 25 | a bateria local: as seis combinações | Etapa 9 / RT-7 |
 | 26 | as ferramentas e as credenciais da nuvem | Etapa 10 — em andamento |
@@ -131,7 +139,7 @@ wsl -d Ubuntu -u root -- apt-get update
 wsl -d Ubuntu -u root -- apt-get install -y python3.12-venv
 ```
 
-**O que este venv é.** As ferramentas que ficam **fora** dos motores: o gerador, o
+**O que este venv é.** As ferramentas que ficam **fora** dos motores: o replayer, o
 coletor de lag e o reconciliador. É o que o `requirements.txt` da raiz instala
 (`confluent-kafka`, `PyYAML`, `duckdb`). O Spark e o Flink **não** estão nele:
 cada um roda no próprio contêiner, com o próprio `requirements.txt` (passos 5 e
@@ -285,62 +293,119 @@ instalação de Spark e não afeta medição.
 
 ---
 
-## Passo 6 — Gerar eventos
+## Antes do passo 6 — a base de eventos reais
+
+Desde o `CONTRATO.md` 3.0 (23/10/2026, pedido da orientação), os eventos são
+**reais**: a base *eCommerce behavior data from multi category store*, eventos de
+uma loja online multicategoria coletados pela REES46 e publicados no Kaggle por
+Michael Kechinov. O trabalho usa **outubro de 2019**: 42.448.764 eventos.
 
 ```bash
-~/.venvs/tcc/bin/python shared/data-generator/generator.py
+bash scripts/preparar_base.sh
 ```
 
-Emite 100 eventos por segundo durante 60 segundos, no schema completo do
-`CONTRATO.md`, com a seed do `config.yaml` (42).
+O script baixa o `2019-Oct.csv.gz` (1,7 GB) pelo link direto da REES46 — sem login
+— se ele ainda não estiver em `~/tcc-data/base`; confere o **sha256**; descompacta
+para `2019-Oct.csv` (5,7 GB, mantendo o `.gz` ao lado); e confere a contagem. É
+idempotente.
 
-**Saída esperada:** 6000 tentados, 6000 confirmados, 0 erros, duração ~60,0 s,
-payload médio ~253,8 bytes.
+**Esperado** (máquina original, 23/10/2026):
+
+```
+>> 2. Checksum
+OK: 8ebca1ad741295297368f2cf0315e3f36853a1a11768fb16babf8c9b83838147
+>> 4. Contagem
+OK: 42448764 eventos
+>> Base pronta
+  tamanho ... 5668612855 bytes
+```
+
+O `.csv` tem **exatamente o tamanho** que o Kaggle informa para o `2019-Oct.csv`:
+o arquivo da REES46 é o mesmo. Quem preferir baixar pelo Kaggle (pede login) põe o
+`.gz` em `~/tcc-data/base` e roda o script: o checksum é o que vale.
+
+> **Citação obrigatória.** A base é de uso livre com a condição de citar a página
+> do Kaggle e a REES46 (https://rees46.com).
+
+> **A base nunca é alterada.** O replayer só lê o `.csv`. O que vira mensagem, e
+> como, está no `CONTRATO.md` §1.5.
+
+---
+
+## Passo 6 — Enviar eventos reais ao Kafka
+
+```bash
+~/.venvs/tcc/bin/python shared/data-generator/replayer.py
+```
+
+Envia **100 eventos por segundo durante 60 segundos**, lidos da base real: uma
+**janela** de 6000 linhas consecutivas, na ordem original, cujo início é sorteado
+pela seed do `config.yaml` (42).
+
+**Saída esperada** (23/10/2026):
+
+```
+carga ........... 100 evt/s por 60s = 6000 eventos
+janela .......... linhas 27139042 a 27145041 (seed 42)
+posicionamento .. 5.0s ate a linha 27139042
+...
+tentados ................ 6000
+confirmados pelo broker . 6000
+carga oferecida ......... 100.0 evt/s
+carga atingida .......... 100.0 evt/s
+payload medio ........... 294.0 bytes
+```
+
+A janela de 6000 eventos com a seed 42 é **sempre a mesma**: linhas 27.139.042 a
+27.145.041 da base, um trecho de 20/10/2019 por volta das 12:47. O
+**posicionamento** — avançar no arquivo até o início da janela — acontece antes de
+o envio começar e leva alguns segundos (no pior caso, ~9 s).
 
 A carga de 100 evt/s foi escolhida porque **a resposta certa é conhecida de
 antemão**. Qualquer divergência é defeito, não resultado.
 
-**Variar a carga sem editar arquivo:**
+**Cada mensagem é uma linha da base**, com os valores da loja como vieram, mais os
+campos que o replayer carimba para a medição:
+
+```
+{"event_id":"2019-10:00000005","seq":4,"gen_id":0,"run_id":"…","event_type":"view",
+ "user_id":535871217,"product_id":1004237,"amount":"1081.98",
+ "session_id":"c6bd7419-…","event_ts":1792808350162,"event_time":"2019-10-01 00:00:04 UTC"}
+```
+
+- `event_id` é o **endereço da linha** na base (o 5º evento de outubro);
+- `event_ts` é o **instante do envio**, de onde saem todas as latências;
+  `event_time` é o instante **original**, intacto;
+- o preço (`amount`) vai **entre aspas, exatamente como na base**, para nenhum motor
+  reescrevê-lo (`CONTRATO.md` §2.7).
+
+**Variar a carga e a janela sem editar arquivo:**
 
 ```bash
-RATE=1000 DURATION=600 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
+RATE=1000 DURATION=600 SEED=43 ~/.venvs/tcc/bin/python shared/data-generator/replayer.py
 ```
 
-**Trocar a seed e misturar eventos malformados**, do mesmo jeito (Etapa 8):
+No benchmark quem escolhe a carga, a duração e a seed é o script de rodada (passo
+22), não você. **O ritmo é do experimento, não da loja**: a loja teve, em média, 16
+eventos por segundo; o replayer acelera a base, mantendo a ordem.
 
-```bash
-SEED=43 MALFORMED_RATE=0.01 RATE=100 DURATION=60 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
-```
-
-A mesma seed produz a mesma sequência de eventos. Com `MALFORMED_RATE=0.01`, uma
-mensagem a cada 100 sai malformada, **no lugar** de um evento válido, com 8 tipos
-em rodízio (`shared/data-generator/malformed.py`). Os oito são JSON válido, com um
-campo de tipo errado ou ausente: desde o `CONTRATO.md` 2.0 o gerador não envia
-mensagem que não seja JSON (passo 21). O relatório passa a mostrar:
-
-```
-malformados ..... 1 a cada 100 mensagens, no lugar de um evento valido (8 tipos em rodizio)
-tentados ................ 5940
-confirmados pelo broker . 5940
-malformados ............. 60 confirmados de 60 (erros 0)
-```
-
-`tentados` e `confirmados` contam só os eventos **válidos**: 5940 + 60 = 6000
-mensagens no tópico. No benchmark quem escolhe a seed e a proporção é o script de
-rodada (passo 22), não você.
-
-O relatório separa **carga oferecida** (o que o gerador tentou emitir) de **carga
+O relatório separa **carga oferecida** (o que o replayer tentou enviar) de **carga
 atingida** (o que o broker confirmou pelo callback de entrega). É a distinção
 central da análise de escalabilidade: sem ela, corre-se o risco de medir o limite
-do próprio gerador e chamar isso de limite do Spark.
+do próprio replayer e chamar isso de limite do Spark.
 
 Cada execução grava um manifesto em `~/tcc-data/metrics/<run_id>.gen<N>.json` com
-os contadores, o último `seq`, as taxas e o payload médio. O programa **sai com
-código 1** se `confirmados != tentados`, para que o arnês de benchmark perceba a
-falha sem ninguém precisar ler a tela.
+os contadores, o último `seq`, as taxas, o payload médio, **a base e a janela**. O
+programa **sai com código 1** se `confirmados != tentados`.
 
-Parâmetros da carga e do produtor ficam em `shared/data-generator/config.yaml`,
-nunca no código — é o mesmo arquivo que o pipeline Flink usará.
+Parâmetros do Kafka e do produtor ficam em `shared/data-generator/config.yaml`,
+lido pela mesma função que o gerador antigo usava.
+
+> **O gerador sintético (`generator.py`) continua no repositório, sem uso.** Ele
+> produziu tudo até o contrato 2.2, inclusive a bateria local de 12–13/10/2026, e
+> fica para que aquilo siga reproduzível (`git checkout 013b646`). Com o esquema
+> atual, os eventos dele não têm o `event_time` e o `reconcile.py` os contaria como
+> inválidos: **não o use nos passos seguintes**.
 
 ---
 
@@ -353,14 +418,17 @@ docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
              END {printf "particoes=%d total=%d media=%.1f min=%d max=%d\n", n, s, s/n, min, max}'
 ```
 
-**Esperado:** `particoes=24 total=6000 media=250.0`, com `min` e `max` entre ~180
-e ~320. A referência medida na máquina original é **186 e 317**.
+**Esperado:** `particoes=24 total=6000 media=250.0`.
 
-Esse desequilíbrio é previsto e declarado no `CONTRATO.md` §1.4: com 2000 chaves
-uniformes em 24 partições, o desvio nos extremos é de ±25%. Ele não ameaça a
-comparação porque o sorteio é determinístico pela seed — com a mesma seed, o
-desequilíbrio é idêntico em toda execução e nos dois motores. No benchmark cada
-rodada tem a sua seed, e ela é a mesma para os dois motores (passo 22).
+> **A remedir com a base real.** O `min` e o `max` abaixo foram medidos com o
+> gerador sintético (2000 usuários uniformes): **186 e 317**. Com os usuários reais
+> da base (3 milhões, concentração baixa — `CONTRATO.md` §1.4) a expectativa é um
+> espalhamento parecido ou mais uniforme; o valor de referência será medido de novo
+> no começo da bateria local.
+
+O desequilíbrio entre partições é declarado no `CONTRATO.md` §1.4. Ele não ameaça
+a comparação: a rodada N recebe a **mesma janela** da base nos dois motores, então
+a distribuição é idêntica para o Spark e para o Flink (passo 22).
 
 Se o `max` vier muito acima disso, o partitioner não está espalhando como se
 espera e vale investigar antes de seguir.
@@ -410,10 +478,10 @@ o `[batch 0]` engole de uma vez os eventos que já estão no tópico — devem s
 > manda descartar. Se esse aviso aparecer de forma **persistente** durante uma
 > execução medida, aí sim é sinal de saturação.
 
-**Aba 2 — o gerador:**
+**Aba 2 — o replayer:**
 
 ```bash
-~/.venvs/tcc/bin/python shared/data-generator/generator.py
+~/.venvs/tcc/bin/python shared/data-generator/replayer.py
 ```
 
 Agora a aba 1 imprime **um lote a cada 5 segundos**, com ~500 eventos cada
@@ -486,9 +554,13 @@ A estrutura deve ser `events/run_id=…/dt=…/hh=…/`, o layout do `CONTRATO.m
 Dois `hh=` significam que a execução cruzou a virada de hora — previsto, é o preço
 de particionar por `event_ts`.
 
-**As dez colunas do evento são texto** (`CONTRATO.md` §2.7, desde 12/10/2026), nos
+**As colunas do evento são texto** (`CONTRATO.md` §2.7, desde 12/10/2026), nos
 dois motores: o pipeline grava o que chegou, e a conversão para os tipos do
-contrato acontece depois do Load (passo 21). `dt` e `hh` continuam vindo do
+contrato acontece depois do Load. Desde o contrato 3.0 são **onze**: o
+`event_time`, o instante original da base, entrou no fim, e os dois pipelines o
+carregam sem nenhuma mudança no código — eles leem a lista de campos do
+`shared/schema/evento.json` (verificado em 23/10/2026). O `run_id` não fica dentro
+do arquivo: é o nome da pasta. `dt` e `hh` continuam vindo do
 `event_ts`, mas só quando ele é um inteiro de milissegundos; senão a linha vai para
 a pasta de data nula. As colunas que o pipeline acrescenta (`processed_ts`,
 `batch_id`) mantêm o tipo delas.
@@ -503,9 +575,9 @@ lotes produz ~312. A referência medida na máquina original, para 6000 eventos:
 | Lote único (backlog) | 24 | 632 KB |
 | Trigger de 5 s | ~300 | ~3,6 MB |
 
-Os tamanhos são de setembro, com os campos ainda tipados; com os campos em texto os
-arquivos ficam maiores. Os da bateria local estão no `.md` de cada combinação
-(passo 24).
+Os tamanhos são de setembro, com os campos ainda tipados e eventos sintéticos;
+**a remedir com a base real** (a mensagem real tem ~294 bytes, contra ~254 do
+gerador antigo).
 
 É o trade-off latência-versus-custo: trigger curto entrega mais rápido, gera mais
 arquivos, e mais arquivos custam mais PUTs no S3 e mais espaço. O efeito é
@@ -638,7 +710,7 @@ CADEIA COMPLETA OK
 **Esta verificação é mais forte que a do Spark.** O `check_chain.py` conta as
 partições *atribuídas*; esta conta as partições **de onde chegou dado** — prova
 que o Flink leu de cada uma das 24. Por isso exige o tópico povoado: com ele
-vazio, falha avisando para rodar o gerador.
+vazio, falha avisando para rodar o replayer (passo 6).
 
 **O broker é `kafka:29092`, não `localhost:9092`.** O contêiner está na rede do
 Docker e usa o listener interno. O Spark usa o mesmo caminho desde que passou
@@ -663,7 +735,7 @@ Referência medida na máquina original: pico de **~830 MiB** no Flink e
 
 ## Passo 14 — Rodar o pipeline Streaming (Flink)
 
-O espelho do passo 9. O job lê o tópico, lê o JSON com os dez campos como texto
+O espelho do passo 9. O job lê o tópico, lê o JSON com os campos como texto
 (passo 10) e grava Parquet em `~/tcc-data/out/flink`, com checkpoint a cada 5 s.
 
 ```bash
@@ -739,7 +811,7 @@ while true; do
 done
 ```
 
-**Aba 3:** o gerador.
+**Aba 3:** o replayer (passo 6).
 
 **Esperado, e é o ponto do teste:**
 
@@ -802,7 +874,7 @@ Agora tem que aparecer:
 !! CHECKPOINT EXISTENTE — retomando de /tcc-data/checkpoints/rt/<id-do-job>/chk-<n>
 ```
 
-Conte as linhas: o número não muda. Rode o gerador de novo e conte: tem que subir
+Conte as linhas: o número não muda. Rode o replayer de novo e conte: tem que subir
 **exatamente** 6000. Se o job tivesse reprocessado o tópico, subiria muito mais.
 
 **A diferença em relação ao Spark.** O Spark retoma sozinho: basta apontar o
@@ -904,15 +976,15 @@ STARTING_OFFSETS=latest bash pipeline-nrt/run_local.sh
 ```
 
 > **O `rm -rf` não é enfeite.** Os dois motores leem o **mesmo** tópico: tudo que
-> o gerador produziu para medir o Flink fica pendente para o Spark, e vice-versa.
+> o replayer enviou para medir o Flink fica pendente para o Spark, e vice-versa.
 > Com checkpoint existente, `STARTING_OFFSETS=latest` não vale — o Spark retoma de
 > onde parou e processa essa pendência logo no primeiro lote, com minutos de
 > latência, sob o `run_id` da outra medição.
 
-Espere o `[batch 0] vazio`. Aba 2, o gerador:
+Espere o `[batch 0] vazio`. Aba 2, o replayer:
 
 ```bash
-RATE=100 DURATION=60 ~/.venvs/tcc/bin/python shared/data-generator/generator.py
+RATE=100 DURATION=60 ~/.venvs/tcc/bin/python shared/data-generator/replayer.py
 ```
 
 Aba 3, **assim que aparecer o primeiro batch com eventos na aba 1**, o coletor de lag:
@@ -982,7 +1054,7 @@ Flink, `CONTAINERS=flink-run,kafka`.
 
 ## Passo 18 — Reconciliar a execução do Spark
 
-O `reconcile.py` confere o que foi gravado contra o manifesto do gerador. Sem
+O `reconcile.py` confere o que foi gravado contra o manifesto do replayer. Sem
 `RUN_ID`, lista as execuções disponíveis:
 
 ```bash
@@ -996,7 +1068,7 @@ RUN=$(ls -1 ~/tcc-data/out/spark/events | grep 'run_id=[0-9]' | tail -1 | sed 's
 RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
 ```
 
-O `grep` deixa só as execuções do gerador, cujo `run_id` começa pela data. Sem ele,
+O `grep` deixa só as execuções do replayer, cujo `run_id` começa pela data. Sem ele,
 "a mais recente" poderia ser uma pasta do passo 21.
 
 **Esperado** (referência medida na máquina original em 10/10/2026, com o Spark em
@@ -1013,7 +1085,9 @@ OK: perdas=0  duplicatas=0  invalidas=0  nulas=0  descartadas=?
 ```
 
 Uma segunda execução, logo em seguida, deu 3914 e 4386 ms. Em setembro, com o
-Spark ainda no host, eram 3903 e 4298 ms.
+Spark ainda no host, eram 3903 e 4298 ms. **Com a base real** (23/10/2026, pelo
+script de rodada, 100 evt/s): 3919 e 4410 ms — a mesma faixa. O bloco acima é
+**a remedir** com o replayer à mão, no começo da bateria local.
 
 A **espera no trigger** com mediana perto de **metade do trigger** (2,6 s de 5 s) é a
 aritmética do micro-batch aparecendo no dado. O programa sai com **0** se não há
@@ -1063,7 +1137,7 @@ rm -rf ~/tcc-data/checkpoints/rt
 STARTUP_MODE=latest-offset bash pipeline-streaming/run_local.sh
 ```
 
-Depois do `>> job no ar`, o gerador e o coletor como no passo 17, trocando o grupo:
+Depois do `>> job no ar`, o replayer e o coletor como no passo 17, trocando o grupo:
 
 ```bash
 GROUP_ID=tcc-rt-flink DURATION=75 ~/.venvs/tcc/bin/python shared/monitoring/collector.py
@@ -1111,7 +1185,8 @@ checkpoint de 5 s):
 OK: perdas=0  duplicatas=0  invalidas=0  nulas=0  descartadas=?
 ```
 
-Em setembro eram 8 ms e 2626 ms. Como no passo 18, os números são de antes do
+Em setembro eram 8 ms e 2626 ms. **Com a base real** (23/10/2026, pelo script de
+rodada, 100 evt/s): 7 ms e 2535 ms. Como no passo 18, os números são de antes do
 aquecimento por tempo; na rodada de teste de 12/10/2026, a 1000 evt/s por 60 s: 5002
 de 60000 eventos fora do regime (o Spark tirou 4999), processamento P50 6 ms,
 visibilidade P50 2548 ms e 958,0 evt/s.
@@ -1140,131 +1215,38 @@ declarada no `CONTRATO.md` §2.2, com o motivo e o tamanho do erro de cada um.
 
 ---
 
-## Passo 21 — Eventos malformados: carregados como texto
+## Passo 21 — Eventos malformados (aposentado no contrato 3.0)
 
-Os pipelines são **ELT estrito**: carregam o que chega, não limpam. Desde o
-`CONTRATO.md` 2.0 (12/10/2026) os dois carregam os **dez campos do evento como
-texto** — o Spark lê o JSON com todos os campos `StringType`, o Flink com todas as
-colunas `STRING`. Um campo de tipo errado chega ao destino do jeito que veio. Quem
-converte para os tipos do contrato, e conta o que não converte, é o
-`reconcile.py`, depois do Load. Assim os dois motores gravam **o mesmo** para os
-mesmos eventos — é o que este passo mostra.
+**Este passo não roda mais com o código atual** (decisão do autor, 23/10/2026). O
+injetor (`shared/data-generator/inject_malformed.py`) monta os eventos com o
+gerador sintético, que não tem o campo `event_time` do contrato 3.0: o
+`reconcile.py` contaria todas as linhas como inválidas. Ele fica no repositório
+como registro, e o benchmark não leva mais eventos malformados.
 
-> **Este passo suja o tópico.** As 27 mensagens com defeito de cada execução ficam
-> lá até a retenção apagá-las ou o tópico ser recriado — o script de rodada (passo
-> 22) o recria a cada rodada. Nunca rode no meio de uma medição feita à mão.
-
-**Com o Spark.** Aba 1:
-
-```bash
-rm -rf ~/tcc-data/checkpoints/nrt
-STARTING_OFFSETS=latest bash pipeline-nrt/run_local.sh
-```
-
-Espere o `[batch 0] vazio`. Aba 2, o injetor — 420 eventos válidos e 27 com
-defeito, de 9 tipos (os 8 do gerador e um controle, válido, com um campo a mais):
-
-```bash
-~/.venvs/tcc/bin/python shared/data-generator/inject_malformed.py
-```
-
-Quando a aba 1 mostrar os 447 eventos gravados (num lote ou em dois), `Ctrl+C` e:
-
-```bash
-RUN=$(ls -1 ~/tcc-data/out/spark/events | grep 'run_id=malformados' | tail -1 | sed 's/run_id=//'); echo "$RUN"
-RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
-```
-
-**Com o Flink.** Aba 1:
-
-```bash
-rm -rf ~/tcc-data/checkpoints/rt
-STARTUP_MODE=latest-offset bash pipeline-streaming/run_local.sh
-```
-
-Espere o `>> job no ar` e **mais uns 10 segundos**. Aba 2, o mesmo injetor. Espere
-três linhas de `[checkpoint N]` depois da que tiver o `estado=` maior, `Ctrl+C` e:
-
-```bash
-RUN=$(ls -1 ~/tcc-data/out/flink/events | grep 'run_id=malformados' | tail -1 | sed 's/run_id=//'); echo "$RUN"
-MOTOR=flink RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/analysis/reconcile.py
-```
-
-**Esperado** (referência medida na máquina original em 12/10/2026) — **igual nos
-dois motores**:
-
-```
-    INVALIDAS (obrigatorio nulo ou que nao converte) 18
-        nulos por campo: seq 9, user_id 3, event_ts 3, run_id 3
-        texto que nao converte: seq 6, user_id 3, amount 3, event_ts 3
-    NULAS (todos os campos nulos) .. 0
-```
+**O que ele demonstrava, e foi medido em 12/10/2026:** com os campos carregados
+como texto (contrato 2.0), um evento com defeito chega ao destino **do mesmo jeito
+nos dois motores**. 420 eventos válidos e 27 com defeito, de 9 tipos:
 
 | | Spark | Flink |
 |---|---|---|
-| Válidos gravados | 420 de 420 | 420 de 420 |
 | Linhas no destino | 447 | 447 |
-| **INVÁLIDAS** — campo obrigatório nulo, ou texto que não converte | 18 | 18 |
-| **NULAS** — todos os campos nulos | 0 | 0 |
-| **DESCARTADAS** — a mensagem sumiu | 0 | 0 |
-| Erro ou aviso do motor | nenhum | nenhum |
+| Inválidas | 18 | 18 |
+| Nulas | 0 | 0 |
+| Descartadas | 0 | 0 |
 
-Nos dois o programa termina com `OK` e código **0**: os 420 válidos chegaram, sem
-perda nem duplicata. As três contagens aparecem na última linha e são
-**informação**, não reprovação (decisão de 11/10/2026). O bloco do `gen_id 99`, com
-`PERDAS ?` e muitas lacunas, são os próprios eventos com defeito: eles não têm
-manifesto.
+Antes do contrato 2.0, com os campos tipados, os motores divergiam: 462 linhas, 21
+inválidas e 15 nulas no Spark contra 447 linhas, 15 inválidas e 15 descartadas no
+Flink. A diferença que sobra, declarada no `CONTRATO.md` §6: uma mensagem que
+**não é JSON** vira linha nula no Spark e é descartada pelo Flink.
 
-**Cada tipo, do destino à conversão:**
+**Para reproduzir a demonstração**, voltar ao último commit anterior ao contrato
+3.0 e seguir o passo 21 daquela versão do README:
 
-| Evento | Chega ao destino como | Depois da conversão |
-|---|---|---|
-| `"seq": "abc"` | `abc` | não converte: inválida |
-| `"user_id": "17"` | `17` | converte para 17: válida |
-| `"seq": 900000.5` (fração em inteiro) | `900000.5` | não converte: inválida |
-| `"user_id": 9999999999` (não cabe) | `9999999999` | não converte: inválida |
-| `"amount": "caro"` | `caro` | não converte, mas `amount` não é obrigatório: válida |
-| `"event_ts": "ontem"` | `ontem` | inválida; a linha vai para a pasta de data nula |
-| sem `seq`, sem `run_id` | nulo | inválida |
-| campo a mais (o controle) | o campo é ignorado | válida |
+```bash
+git checkout 013b646
+```
 
-**A conversão é a mesma regra para os dois** (`CONTRATO.md` §2.6 e §2.7): um texto
-só vira número se tiver forma de número — `-?[0-9]+` nos campos inteiros. Por isso
-`900000.5` não converte, em vez de ser truncado (como faria o `TRY_CAST` do Flink)
-ou arredondado (como faria o do DuckDB). A regra é provisória: o módulo de
-Transform, depois da Etapa 9, decide o que fazer com cada tipo.
-
-**A pasta de data também é a mesma regra** (`CONTRATO.md` §4.1): `dt` e `hh` só
-saem do `event_ts` quando ele casa com `^[0-9]{1,13}\z`, guardado em
-`shared/schema/evento.json` e lido pelos dois motores. Sem essa guarda o Spark 4,
-que roda com o modo ANSI ligado, **derrubaria o job** ao converter `"ontem"`.
-
-**O que continua diferente: mensagem que não é JSON** — texto solto, JSON cortado,
-lista, mensagem vazia ou nula. O Spark grava uma linha toda nula; o Flink descarta,
-sem aviso. Desde 12/10/2026 o gerador e o injetor não enviam esse tipo; a diferença
-fica declarada no `CONTRATO.md` §6, não foi igualada.
-
-**Onde vão as linhas sem `run_id`.** Para uma pasta à parte, com nome diferente em
-cada motor: `run_id=__HIVE_DEFAULT_PARTITION__` no Spark e
-`run_id=__DEFAULT_PARTITION__` no Flink. O `reconcile.py` lê essas pastas e
-atribui as linhas à execução pelo instante em que foram gravadas.
-
-**As DESCARTADAS dependem de uma anotação.** Uma mensagem que sumiu não aparece no
-destino: a conta é *mensagens que o tópico recebeu − linhas gravadas*. O injetor
-grava esse número em `~/tcc-data/metrics/<run_id>.topico.json`, e o script de
-rodada (passo 22) também, em toda rodada. Numa execução feita à mão (passos 17 a
-20) a anotação não existe, e o `reconcile.py` mostra `descartadas=?`, sem estimar.
-
-> **No benchmark, quatro das dez rodadas levam malformados de propósito** — as
-> rodadas 2, 5, 7 e 10, com 1% das mensagens, emitidos pelo próprio gerador (passo
-> 6). Na bateria local as inválidas saíram **iguais nos dois motores** em todas
-> essas rodadas — 450 numa rodada de 1000 evt/s por 60 s —, com 0 nulas e 0
-> descartadas.
-
-> **Antes do contrato 2.0** (até 11/10/2026) os campos eram carregados já tipados,
-> e os motores divergiam: das 462 mensagens de então, 21 inválidas e 15 nulas no
-> Spark contra 15 inválidas e 15 descartadas no Flink — o Flink convertia `"17"` e
-> truncava `1.5`, que o Spark anulava. O percurso está no `DecisaoEtapa8.1.md`.
+O registro completo está em `Informações/EtapaNRT/DecisaoEtapa8.1.md`.
 
 ---
 
@@ -1296,9 +1278,12 @@ MOTOR=spark INTERVALO=5 CARGA=7500 DURACAO=60 RODADA=1 ~/.venvs/tcc/bin/python b
 
 **O que o número da rodada decide** (`CONTRATO.md` §5.1 e §2.6):
 
-- **a seed**: 41 + rodada — a rodada 1 usa 42, a 10 usa 51 —, a mesma para os dois
-  motores. A rodada N do Spark e a do Flink recebem os mesmos eventos;
-- **os malformados**: as rodadas 2, 5, 7 e 10 levam 1% de mensagens malformadas.
+- **a janela da base**: carga × duração linhas consecutivas, com o início sorteado
+  pela seed 41 + rodada — a rodada 1 usa 42, a 10 usa 51. A rodada N do Spark e a
+  do Flink recebem **a mesma janela** (`CONTRATO.md` §5.1). O manifesto registra a
+  primeira e a última linha.
+- Sem malformados desde o contrato 3.0. Até a 2.2, as rodadas 2, 5, 7 e 10 levavam
+  1% de mensagens malformadas.
 
 **O que o intervalo decide**, além do trigger: o **aquecimento**. Ficam fora do
 regime os eventos gerados nos primeiros `INTERVALO` segundos — 5 s ou 30 s —, o
@@ -1317,7 +1302,7 @@ local, 12/10/2026, na máquina original):
 >> [18:41:37] 4/12 offsets do topico, antes
 >> [18:41:37] 5/12 subindo o pipeline
 >> [18:41:57] 6/12 ligando o coletor
->> [18:42:00] 7/12 gerador: 7500 msg/s por 60 s, seed 42
+>> [18:42:00] 7/12 gerador: 7500 msg/s por 60 s, seed 42      ← desde o 3.0: "7/12 replayer: … janela da base pela seed 42"
 >> [18:43:01] 8/12 esperando a fila zerar (ate 60 s)
 >> [18:43:08] 9/12 offsets do topico, depois
 >> [18:43:08] 10/12 arquivo de parada
@@ -1352,12 +1337,13 @@ RODADA VALIDA.
   perdas 0  duplicatas 0  invalidas 0  nulas 0  descartadas 0
 ```
 
-Nas rodadas com malformados as inválidas aparecem (na carga de 7.500, 3375 nos dois
-motores), e a rodada **vale** do mesmo jeito.
+A saída acima é da bateria com o gerador sintético (contrato 2.2); com a base real
+a forma é a mesma, e a linha do passo 7 passa a nomear o replayer e a janela.
 
 **O que ela confere antes de começar.** Se algo falhar, não começa e sai com
 código **2**:
 
+- a base real pronta, com o tamanho certo (`preparar_base.sh`);
 - 50 GB livres, no menor entre o disco dos dados e o do repositório;
 - a pasta da rodada ainda não existe (`REFAZER=1` refaz, guardando a anterior ao lado);
 - o relógio (`scripts/check_clock.py`);
@@ -1373,11 +1359,11 @@ combinação fechar (passo 23):
 
 | Arquivo | O quê |
 |---|---|
-| `manifesto.json` | a rodada inteira: parâmetros, seed, commit do código, imagens, relógio, cada passo com horário, códigos de saída e os números |
+| `manifesto.json` | a rodada inteira: parâmetros, seed, **janela da base**, commit do código, imagens, relógio, cada passo com horário, códigos de saída e os números |
 | `metrics/lag.*.csv`, `metrics/recursos.*.csv` | a fila, a CPU e a memória, uma amostra por segundo |
 | `spark.progresso.*.jsonl` | o log de progresso do motor |
 | `reconcile.txt` e `reconcile.spark.*.json` | o relatório do reconciliador |
-| `pipeline.txt`, `gerador.txt`, `coletor.txt`, `relogio.txt` | as telas de cada programa |
+| `pipeline.txt`, `replayer.txt` (`gerador.txt` até o 3.0), `coletor.txt`, `relogio.txt` | as telas de cada programa |
 
 O **Parquet não fica**: é apagado assim que o reconciliador dá `OK`, porque a
 15 mil evt/s uma rodada de 5 minutos grava cerca de 250 MB por motor. Se a rodada não valer, ele
@@ -1521,7 +1507,8 @@ Rodada 1 NRT: Latência de processamento P50 - 18624 ms, Latência de processame
 - o **desvio padrão** é o amostral (divide por n − 1);
 - uma rodada que **não valeu** aparece no lugar dela, com o motivo, e fica fora da
   média; o título avisa `INCOMPLETO`;
-- as rodadas com malformados são sinalizadas no título;
+- as rodadas com malformados eram sinalizadas no título (até o contrato 2.2; com a
+  base real não há malformados, e a linha não aparece);
 - a **CPU** sai em **% da máquina inteira**, média e máximo: o que o coletor mede em
   % de um núcleo, dividido pelo número de núcleos que o Docker enxerga (8 na
   máquina original, gravado no manifesto de cada rodada). 100% são todos os
@@ -1550,7 +1537,8 @@ O desenho da Etapa 9 (`CONTRATO.md` §5.2): só o trigger do Spark e a carga var
 | Carga | 1.000, 7.500 e 15.000 eventos por segundo |
 | Duração da rodada | 60 s nas combinações de intervalo 5; 300 s nas de intervalo 30 |
 | Aquecimento | os eventos dos primeiros 5 s ou 30 s — o intervalo da combinação |
-| Rodadas | 10 por motor e por combinação; malformados nas 2, 5, 7 e 10 |
+| Rodadas | 10 por motor e por combinação; sem malformados desde o contrato 3.0 (até a 2.2, nas rodadas 2, 5, 7 e 10) |
+| Eventos | a base real, uma janela por rodada (desde o contrato 3.0) |
 
 São seis chamadas ao passo 23:
 
@@ -1583,6 +1571,10 @@ limpa — o manifesto de cada rodada registra o commit do código.
 cada combinação as 20 rodadas válidas. Na máquina original: 120 de 120 válidas na
 primeira tentativa; 0 perdas, duplicatas, atrasados, nulas e descartadas em todas;
 inválidas iguais nos dois motores em todas as rodadas com malformados.
+
+> **A bateria abaixo foi feita com o gerador sintético** (contrato 2.2,
+> 12–13/10/2026) e **será refeita com a base real** (decisão de 23/10/2026). Os
+> números ficam como histórico até a bateria nova.
 
 **Médias de referência** (Spark / Flink; latências P50 em ms; CPU média em % da
 máquina de 8 núcleos):
@@ -1889,8 +1881,9 @@ Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
 - [x] `docker exec kafka ls /var/lib/kafka/data` lista `meta.properties`
 - [x] O tópico existe com 24 partições
 - [x] A imagem `tcc-spark:4.0.4` constrói, e o `check_chain.py` fecha a cadeia até o Spark dentro dela
-- [x] O gerador reporta tentados = confirmados, 0 erros
-- [x] As 24 partições recebem ~250 eventos cada
+- [x] O `preparar_base.sh` confere o sha256 da base e conta 42.448.764 eventos
+- [x] O replayer reporta tentados = confirmados, 0 erros, e a janela da seed 42 começa na linha 27.139.042
+- [x] As 24 partições recebem os 6000 eventos (a distribuição de referência, a remedir com a base real)
 - [x] Os eventos sobrevivem a `down` → `up`
 - [x] O Spark grava um lote a cada 5 segundos, somando 6000 eventos
 - [x] O destino tem o layout `run_id=…/dt=…/hh=…` em Parquet
@@ -1906,10 +1899,11 @@ Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `reconcile.py` do Spark: 0 perdas, 0 duplicatas, espera no trigger ~metade do trigger
 - [x] O Flink imprime uma linha por checkpoint e commita offsets sob `tcc-rt-flink`
 - [x] O `reconcile.py` do Flink: 0 perdas, 0 duplicatas, processamento em ms, conferência do `ctime` em poucos ms
-- [x] Os dois motores gravam os dez campos do evento como texto
-- [x] Com eventos malformados, o `reconcile.py` conta 18 inválidas, 0 nulas e 0 descartadas nos dois motores, e sai com código 0
+- [x] Os dois motores gravam os campos do evento como texto, inclusive o `event_time` do contrato 3.0, sem mudança nos pipelines
+- [x] Com a base real, os dois destinos saem idênticos entre si e iguais às linhas da base, com o preço exatamente como veio (`543.10`)
+- [ ] ~~Com eventos malformados, o `reconcile.py` conta 18 inválidas~~ — passo 21 aposentado no contrato 3.0 (resultado de 12/10/2026)
 - [x] O `run_round.py` fecha uma rodada válida de cada motor: 0 perdas, 0 duplicatas, fila zerada
-- [x] Nas rodadas com malformados a rodada vale, e as inválidas saem iguais nos dois motores
+- [x] Nas rodadas com malformados a rodada vale, e as inválidas saem iguais nos dois motores (até o contrato 2.2)
 - [x] O Flink roda com checkpoint de 5 s nas combinações de intervalo 30, e avisa na tela
 - [x] O `run_combination.py` alterna os motores, pula as rodadas válidas e, com as 20 válidas, escreve os arquivos e apaga o material bruto
 - [x] O `write_results.py` escreve o `.txt` e o `.md`, com a CPU em % da máquina, e rodar de novo dá arquivos idênticos
@@ -1931,9 +1925,10 @@ Decisão E6: **código no Windows, dados em ext4 nativo do WSL.**
 |---|---|
 | Código (este repo) | `/mnt/c/.../Pipelines-TCC` |
 | Ambiente Python do host | `~/.venvs/tcc` — gerador, coletor e reconciliador |
+| A base real | `~/tcc-data/base/2019-Oct.csv` e o `.gz` de origem — `scripts/preparar_base.sh` |
 | Parquet de saída | `~/tcc-data/out/spark` e `~/tcc-data/out/flink` — um `<base>` por motor |
 | Checkpoints | `~/tcc-data/checkpoints/nrt` (Spark) e `~/tcc-data/checkpoints/rt` (Flink) |
-| Métricas coletadas | `~/tcc-data/metrics` — manifestos do gerador, logs de progresso dos dois motores, CSVs do coletor e relatórios do `reconcile.py` |
+| Métricas coletadas | `~/tcc-data/metrics` — manifestos do replayer, logs de progresso dos dois motores, CSVs do coletor e relatórios do `reconcile.py` |
 | Material bruto das rodadas | `results/`, neste repositório e **fora do git** — apagado quando a combinação fecha (passo 23) |
 | Arquivos de resultado | `../../Informações/Resultados Local`, ou a pasta dada em `SAIDA` (passo 24) |
 | Ambiente do Spark | imagem Docker `tcc-spark:4.0.4` — fora do venv |
@@ -1944,7 +1939,7 @@ O motivo é medido, não estético: escrita sequencial em `/mnt/c` roda a
 gargalo do pipeline seria o sistema de arquivos do Windows, e o Experimento A
 estaria medindo drvfs em vez de Spark.
 
-Nada de `~/tcc-data` entra no git. O que reproduz aqueles dados é o gerador mais
+Nada de `~/tcc-data` entra no git. O que reproduz aqueles dados é a base (com o sha256), a janela e
 o `run_id` da execução.
 
 ### Protocolo de execução
@@ -1983,6 +1978,7 @@ meio dos experimentos invalida as execuções já feitas.
 | Python do host (gerador, coletor, reconciliador) | 3.12.3 | 03/09/2026 |
 | confluent-kafka | 2.15.0 (librdkafka 2.15.0) — no host e na imagem do Spark | 04/09/2026 |
 | DuckDB (leitor do `reconcile.py`) | 1.5.5 | 24/09/2026 |
+| Base de eventos | REES46 `2019-Oct.csv.gz`, sha256 `8ebca1ad…38147`, 42.448.764 eventos | 23/10/2026 |
 | Terraform | 1.16.4, no WSL, conferido pelo checksum da HashiCorp | 17/10/2026 |
 | AWS CLI | 2.38.1 — a mais recente na instalação; só cria e lê recursos, não entra em medida | 17/10/2026 |
 | Docker | Engine 28.0.4, containerd 1.7.26, runc 1.2.5, Compose 2.34.0, buildx 0.22.0, cgroups `cgroupfs` — o Docker Desktop do WSL, e o mesmo na máquina da AWS (`preparar_maquina.sh`) | 19 e 20/10/2026 |
@@ -2006,14 +2002,17 @@ scripts/create_topic.sh   cria o tópico com 24 partições
 scripts/check_chain.py    verifica Python → Spark → JVM → Kafka, no contêiner
 scripts/check_chain_flink.py  verifica Python → Flink → JVM → Kafka  (RT-1)
 scripts/check_clock.py    confere o relógio antes de medir         (Etapa 6.2)
+scripts/preparar_base.sh  baixa, confere e descompacta a base real (Etapa 9.1)
 scripts/setup_aws_tools.sh  instala o Terraform e a AWS CLI no WSL   (Etapa 10)
 scripts/preparar_maquina.sh prepara a máquina da AWS, dentro dela    (Etapa 10)
 scripts/versoes.sh        versões do Docker e de dentro das imagens, para comparar ambientes
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
-  data-generator/         gerador de eventos; aceita SEED e MALFORMED_RATE (Etapas 3 e 8)
-    malformed.py          os 8 tipos de evento malformado, todos JSON, para o gerador e o injetor (Etapas 8 e 8.1)
-    inject_malformed.py   injetor de eventos quebrados, para o passo 21 (Etapa 7)
+  data-generator/         a origem dos eventos
+    replayer.py           envia a base real ao Kafka, uma janela por rodada (contrato 3.0)
+    generator.py          o gerador sintético — sem uso desde o 3.0, mantido como registro (Etapas 3 e 8)
+    malformed.py          os 8 tipos de malformado do gerador antigo — sem uso no benchmark desde o 3.0
+    inject_malformed.py   injetor de eventos quebrados — aposentado no 3.0 (Etapa 7)
   analysis/reconcile.py   conversão dos campos, perdas, duplicatas, latências, throughput e is_late, via DuckDB (Etapas 6 a 9)
   monitoring/collector.py consumer lag, CPU e memória a cada 1 s, os dois motores (Etapas 6 e 8)
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
@@ -2088,6 +2087,11 @@ Em 12 e 13/10/2026 a bateria local fechou as seis combinações (Etapa 9 = RT-7)
 com os dois motores carregando os campos como texto (Etapa 8.1). Os resultados
 ficam fora do repositório, em `../../Informações/Resultados Local`.
 
+Em 23/10/2026, a pedido da orientação, os eventos passaram a ser **reais** (Etapa
+9.1, contrato 3.0): a base da REES46, reproduzida por um replayer. A bateria local
+de 12–13/10, feita com o gerador sintético, fica como histórico e **será refeita**
+com a base real. A Etapa 10 (AWS) está pausada nas decisões que dependem disso.
+
 ### Pipeline Streaming (Flink) — `planoRT.md`
 
 - [x] **RT-1** — Versões travadas e cadeia verificada: Flink 1.20.5 LTS em
@@ -2105,7 +2109,8 @@ ficam fora do repositório, em `../../Informações/Resultados Local`.
 - [x] **RT-6** — Arnês unificado: é a Etapa 8 do NRT, a mesma para os dois
       motores — ver abaixo
 - [x] **RT-7** — Validação local: é a Etapa 9 do NRT, a mesma bateria para os
-      dois motores, com o checkpoint do Flink fixo em 5 s — ver abaixo
+      dois motores, com o checkpoint do Flink fixo em 5 s — ver abaixo. Os
+      eventos reais (Etapa 9.1) valem para os dois
 
 ### Pipeline NRT (Spark) — `planoNRT3.md`
 
@@ -2141,7 +2146,14 @@ ficam fora do repositório, em `../../Informações/Resultados Local`.
       30 s, Flink fixo em 5 s; 1.000, 7.500 e 15.000 evt/s), 120 rodadas válidas,
       0 perdas; aquecimento por tempo e CPU em % da máquina. Contratos 2.1 e 2.2.
       Derrubar serviços saiu do plano na Etapa 8; os testes de quebra por volume
-      seguem em aberto
-- [ ] **Etapa 10** — Terraform e AWS
+      seguem em aberto. Feita com o gerador sintético: será refeita com a base real
+- [x] **Etapa 9.1** — Eventos reais: a base da REES46 (outubro de 2019, 42,4
+      milhões de eventos, sha256 conferido), um replayer com uma janela da base por
+      rodada, o `event_time` original como 11º campo, sem malformados. Testado de
+      ponta a ponta nos dois motores: destinos idênticos entre si e iguais à base.
+      Contrato 3.0
+- [ ] **Etapa 10** — Terraform e AWS: ferramentas, Terraform e preparação da
+      máquina feitos e testados, ambiente da nuvem congelado; o ensaio de carga
+      mostrou que uma `m5.large` com tudo dentro não aguenta 15.000 evt/s
 - [ ] **Etapa 11** — Benchmarks oficiais
 - [ ] **Etapa 12** — Análise e guia de decisão

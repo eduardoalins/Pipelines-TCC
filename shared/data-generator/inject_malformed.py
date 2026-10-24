@@ -1,4 +1,11 @@
 """
+APOSENTADO NO CONTRATO 3.0 (23/10/2026, decisao do autor). Este injetor monta os
+eventos com o gerador SINTETICO, que nao tem o campo event_time do contrato 3.0:
+com o codigo atual, o reconcile.py contaria todas as linhas como invalidas. Ele
+fica no repositorio como registro da demonstracao das Etapas 7 e 8.1. Para
+reproduzi-la, voltar ao ultimo commit anterior ao 3.0:  git checkout 013b646
+Os resultados medidos estao abaixo e no CONTRATO.md (secoes 2.6 e 2.7).
+
 Injetor de eventos malformados — Etapa 7 (= RT-5), revisto no contrato 2.0.
 
     ~/.venvs/tcc/bin/python shared/data-generator/inject_malformed.py

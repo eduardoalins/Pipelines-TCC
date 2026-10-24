@@ -2,27 +2,29 @@
   "_sobre": [
     "FONTE UNICA do schema do evento. Transcricao executavel do CONTRATO.md secao 1.1.",
     "Spark e Flink leem este arquivo: pipeline-nrt/src/esquema.py e pipeline-streaming/src/esquema.py. Assim os dois NAO TEM COMO divergir — decisao da Etapa RT-3.",
-    "DESDE O CONTRATO 2.0 OS PIPELINES NAO APLICAM OS TIPOS: carregam os dez campos como TEXTO, e a conversao para o tipo declarado aqui acontece DEPOIS do Load (hoje no shared/analysis/reconcile.py; depois, no modulo de Transform). O que os pipelines usam daqui sao os NOMES, a ORDEM e a regra de particionamento. Os tipos continuam sendo o contrato do evento, e e por eles que a conversao se guia.",
+    "DESDE O CONTRATO 3.0 OS EVENTOS SAO REAIS: vem da base da REES46 (outubro de 2019), reproduzida pelo replayer. Os campos de negocio guardam o valor da loja; seq, gen_id, run_id, event_id e event_ts sao carimbados pelo replayer para a medicao, e event_time guarda o instante original (CONTRATO.md 1.5).",
+    "DESDE O CONTRATO 2.0 OS PIPELINES NAO APLICAM OS TIPOS: carregam os campos como TEXTO, e a conversao para o tipo declarado aqui acontece DEPOIS do Load (hoje no shared/analysis/reconcile.py; depois, no modulo de Transform). O que os pipelines usam daqui sao os NOMES, a ORDEM e a regra de particionamento. Os tipos continuam sendo o contrato do evento, e e por eles que a conversao se guia.",
     "JSON e nao YAML: e lido pela biblioteca padrao do Python, e o arquivo precisa funcionar nos tres ambientes — o venv do host e os dois conteineres —, que nao compartilham pacotes.",
     "A ORDEM dos campos e parte do schema. Mudar a ordem, um nome ou um tipo e alterar o CONTRATO.md, com as consequencias da regra de alteracao dele.",
     "Tipos logicos permitidos: string, int32, int64, float64. Um tipo desconhecido FALHA nos dois esquema.py e no reconcile.py — nunca e adivinhado."
   ],
-  "versao_contrato": "2.0",
+  "versao_contrato": "3.0",
   "particionamento": {
     "_sobre": "As pastas dt= e hh= do destino saem de event_ts (CONTRATO.md 4.1), que chega como texto. So vira data o texto que casa INTEIRO com esta expressao: 1 a 13 digitos, nada mais (13 digitos de milissegundos vao ate o ano 2286). Qualquer outro vai para a pasta sem data. A MESMA expressao nos dois motores — os dois usam o motor de expressoes regulares do Java, onde \\z e o fim absoluto do texto (o $ aceitaria uma quebra de linha no fim).",
     "campo": "event_ts",
     "valido": "^[0-9]{1,13}\\z"
   },
   "campos": [
-    {"nome": "event_id",   "tipo": "string",  "descricao": "uuid, derivado do rng semeado"},
-    {"nome": "seq",        "tipo": "int64",   "descricao": "sequencial monotonico por gerador; buraco e perda, repeticao e duplicata"},
-    {"nome": "gen_id",     "tipo": "int32",   "descricao": "identificador do processo gerador"},
+    {"nome": "event_id",   "tipo": "string",  "descricao": "endereco da linha na base: <mes>:<linha>, ex. 2019-10:00000005 (unico)"},
+    {"nome": "seq",        "tipo": "int64",   "descricao": "sequencial monotonico por replayer; buraco e perda, repeticao e duplicata"},
+    {"nome": "gen_id",     "tipo": "int32",   "descricao": "identificador do processo replayer"},
     {"nome": "run_id",     "tipo": "string",  "descricao": "identificador da execucao; o destino e particionado por ele"},
-    {"nome": "event_type", "tipo": "string",  "descricao": "pageview | add_to_cart | purchase | payment"},
-    {"nome": "user_id",    "tipo": "int32",   "descricao": "1 a 2000, uniforme; e a chave da mensagem no Kafka"},
-    {"nome": "product_id", "tipo": "int32",   "descricao": "1 a 10000"},
-    {"nome": "amount",     "tipo": "float64", "descricao": "nulo para pageview e add_to_cart"},
-    {"nome": "session_id", "tipo": "string",  "descricao": "uuid, derivado do rng semeado"},
-    {"nome": "event_ts",   "tipo": "int64",   "descricao": "epoch em MILISSEGUNDOS, momento da geracao"}
+    {"nome": "event_type", "tipo": "string",  "descricao": "da base: view | cart | purchase (em outubro de 2019 nao ha remove_from_cart)"},
+    {"nome": "user_id",    "tipo": "int32",   "descricao": "da base: usuario real (3.022.290 em outubro); e a chave da mensagem no Kafka"},
+    {"nome": "product_id", "tipo": "int32",   "descricao": "da base: produto real (166.794 em outubro)"},
+    {"nome": "amount",     "tipo": "float64", "descricao": "da base (price): preco do produto, presente em todos os eventos, inclusive view e cart; viaja como TEXTO, exatamente como na base (ex. \"543.10\")"},
+    {"nome": "session_id", "tipo": "string",  "descricao": "da base (user_session)"},
+    {"nome": "event_ts",   "tipo": "int64",   "descricao": "epoch em MILISSEGUNDOS, momento do ENVIO pelo replayer; e dele que saem latencias, aquecimento e as pastas dt/hh"},
+    {"nome": "event_time", "tipo": "string",  "descricao": "da base: o instante ORIGINAL do evento na loja, como veio (ex. 2019-10-01 00:00:04 UTC)"}
   ]
 }

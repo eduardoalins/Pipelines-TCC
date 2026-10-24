@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 2.2 — 12/10/2026**
+**Versão 3.0 — 23/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -29,21 +29,28 @@ alteração é registrada na seção 8, com data, motivo e execuções invalidad
 
 ```json
 {
-  "event_id":   "string — uuid",
-  "seq":        "int64  — sequencial monotônico por processo gerador",
-  "gen_id":     "int    — identificador do processo gerador",
+  "event_id":   "string — endereço da linha na base: 2019-10:00000005",
+  "seq":        "int64  — sequencial monotônico por processo replayer",
+  "gen_id":     "int    — identificador do processo replayer",
   "run_id":     "string — identificador da execução do benchmark",
-  "event_type": "string — pageview | add_to_cart | purchase | payment",
-  "user_id":    "int    — 1 a 2000, distribuição uniforme",
-  "product_id": "int",
-  "amount":     "float  — nulo para pageview e add_to_cart",
-  "session_id": "string — uuid",
-  "event_ts":   "int64  — epoch em MILISSEGUNDOS, momento da geração"
+  "event_type": "string — da base: view | cart | purchase",
+  "user_id":    "int    — da base: o usuário real",
+  "product_id": "int    — da base: o produto real",
+  "amount":     "float  — da base (price): o preço do produto, em todo evento; viaja como texto",
+  "session_id": "string — da base (user_session)",
+  "event_ts":   "int64  — epoch em MILISSEGUNDOS, momento do ENVIO",
+  "event_time": "string — da base: o instante original do evento na loja"
 }
 ```
 
+**Desde a versão 3.0 os eventos são reais** (seção 1.5). Os campos marcados "da
+base" levam o valor que a loja registrou; os outros são carimbados pelo replayer
+para a medição. Até a versão 2.2 eram dez campos, todos produzidos por um gerador
+sintético; o `event_time` entrou como 11º, no fim, para a ordem dos dez anteriores
+não mudar.
+
 **Estes são os tipos do evento, não os do destino.** Desde a versão 2.0 os
-pipelines carregam os dez campos como **texto**, e a conversão para os tipos acima
+pipelines carregam os campos como **texto**, e a conversão para os tipos acima
 acontece depois do Load (seção 2.7).
 
 **Forma executável: `shared/schema/evento.json`.** É a fonte única deste schema
@@ -89,15 +96,26 @@ dois motores estariam lendo dados distribuídos de forma diferente.
 
 - **A ordem por sessão é preservada.** Todo evento de uma sessão pertence ao
   mesmo usuário, logo cai na mesma partição. A sequência
-  `pageview → add_to_cart → purchase` chega ordenada.
+  `view → cart → purchase` chega ordenada.
 - **A porta do caminho agregado fica aberta.** Se a extensão com janela e
   watermark nativo (decisão B1.1) entrar depois da Etapa 9, agregação por
   usuário é possível sem tocar no contrato.
 
 ### 1.4 Distribuição de `user_id`
 
-**`user_id` é sorteado com distribuição uniforme sobre o intervalo fechado
-[1, 2000], com a seed da rodada (seção 5.1).**
+**Desde a versão 3.0 o `user_id` é o da base real** (seção 1.5): 3.022.290
+usuários diferentes no mês, com a distribuição que a loja teve. Medido na base
+inteira (23/10/2026): o usuário mais ativo tem 7.436 eventos, a mediana é 4 por
+usuário e o percentil 99 é 141; os 100 mais ativos somam 0,38% dos eventos. Com
+milhões de chaves e concentração baixa, as 24 partições recebem cargas próximas —
+mais próximas do que com as 2000 chaves de antes. Como a rodada N recebe a mesma
+janela da base nos dois motores (seção 5.1), a distribuição de cada rodada é
+idêntica para o Spark e para o Flink.
+
+O texto a seguir descreve a regra **até a versão 2.2**, mantida como registro.
+
+**`user_id` era sorteado com distribuição uniforme sobre o intervalo fechado
+[1, 2000], com a seed da rodada.**
 
 **Por que a cardinalidade entra no contrato.** Ela não tem relação com o volume
 de carga — este é controlado pela taxa do gerador e pela duração da execução. O
@@ -115,6 +133,59 @@ muda de uma rodada para outra, mas dentro de cada rodada é idêntico para o Spa
 para o Flink. O efeito é um leve pessimismo na latência absoluta —
 o micro-batch termina quando a partição mais pesada termina. Registrado como
 característica do desenho, não como ameaça à validade.
+
+### 1.5 A fonte dos eventos: uma base real (versão 3.0, 23/10/2026)
+
+**Decisão**, do autor, a pedido da orientação: os eventos deixam de ser gerados
+por nós e passam a ser **reais**, reproduzidos de uma base pública.
+
+| | |
+|---|---|
+| Base | *eCommerce behavior data from multi category store* — eventos de uma loja online multicategoria, coletados pela REES46 e publicados no Kaggle por Michael Kechinov |
+| Endereços | https://www.kaggle.com/datasets/mkechinov/ecommerce-behavior-data-from-multi-category-store ; https://rees46.com |
+| Licença | uso livre, **citando as duas fontes acima** |
+| Arquivo | `2019-Oct.csv.gz`, baixado de `https://data.rees46.com/datasets/marketplace/2019-Oct.csv.gz` — o mesmo arquivo do Kaggle (descompactado, 5.668.612.855 bytes, o tamanho que o Kaggle informa) |
+| Impressão digital | sha256 `8ebca1ad741295297368f2cf0315e3f36853a1a11768fb16babf8c9b83838147` (1.741.928.540 bytes) |
+| Conteúdo | **42.448.764 eventos**, de 01/10/2019 00:00:00 a 31/10/2019 23:59:59 UTC, já ordenados pelo instante; 3.022.290 usuários, 166.794 produtos |
+| Estado | estática: sem atualização desde 09/12/2019 (versão 8 no Kaggle) |
+
+`scripts/preparar_base.sh` baixa (se faltar), confere o sha256, descompacta e
+confere a contagem. **O arquivo da base nunca é alterado**: o replayer só o lê.
+
+**Como uma linha da base vira mensagem** (`shared/data-generator/replayer.py`):
+
+| Campo da mensagem | Origem |
+|---|---|
+| `event_type`, `user_id`, `product_id`, `event_time` | a coluna de mesmo nome da base, como veio |
+| `amount` | a coluna `price`, em **todo** evento — o preço do produto, inclusive em `view` e `cart`; 68.673 eventos têm preço 0. Vai **como texto, exatamente como na base** (`"543.10"`), para nenhum motor reescrevê-lo (seção 2.7) |
+| `session_id` | a coluna `user_session` (vazia em 2 linhas do mês) |
+| `event_id` | o endereço da linha: `2019-10:` e o número da linha de dados, com 8 dígitos. É único — o instante não é: há até 116 eventos no mesmo segundo |
+| `seq`, `gen_id`, `run_id` | o replayer, como o gerador fazia, para a contagem de perdas e duplicatas |
+| `event_ts` | o replayer: o **instante do envio**. Toda latência, o atraso, o aquecimento e as pastas `dt=`/`hh=` saem dele |
+
+`category_id`, `category_code` e `brand` **não entram na mensagem**; continuam na
+base, ligadas ao evento pelo `event_id`.
+
+**Por que o `event_ts` não é o instante original.** Com o instante da loja, cada
+evento teria anos de latência, todos sairiam atrasados e cairiam em pastas de
+2019. O instante original viaja intacto, em outra coluna: o `event_time`.
+
+**O que fica como a loja registrou, de propósito** (ELT estrito, seção 2.6 — limpar
+é do Transform):
+- os **tipos de evento** da base (`view`, `cart`, `purchase`). Outubro de 2019
+  não tem `remove_from_cart`, embora a página da base o descreva;
+- as **30.220 linhas idênticas** que a base tem repetidas (0,07%). Para a medição
+  não são duplicatas: cada uma recebe o seu `seq` e o seu `event_id`;
+- os 2 eventos sem `user_session`. Se caírem numa janela, saem como **inválidos**
+  na contagem (seção 2.6) — defeito da base, não do pipeline.
+
+**O ritmo é do experimento, não da loja.** A loja teve, em média, 16 eventos por
+segundo (pico de 116). As cargas do benchmark (seção 5.2) são de 60 a 1000 vezes
+maiores: o replayer **acelera** a base, enviando os eventos na ordem original, na
+taxa pedida. Os eventos são reais; o ritmo, não.
+
+**Sem eventos malformados.** A base não tem nenhum, e desde a versão 3.0 nenhum é
+injetado (seção 2.6).
 
 ---
 
@@ -429,9 +500,19 @@ JSON**: numa rodada do benchmark as duas têm de dar zero nos dois motores, e as
 decisão de 11/10/2026).** O que reprova é **perda ou duplicata entre os eventos
 válidos** — é o que faz o `reconcile.py` sair com código 1.
 
-**No benchmark, 4 das 10 rodadas de cada combinação levam eventos malformados de
+**Desde a versão 3.0 o benchmark não leva eventos malformados** (decisão do autor,
+23/10/2026): a base real não tem nenhum, e eles deixaram de ser injetados, para o
+dado chegar como a loja o registrou. As três contagens continuam sendo feitas, como
+guarda, e o esperado é zero — salvo os 2 eventos da base sem `user_session`, que
+saem como inválidos se caírem numa janela (seção 1.5). O destino do teste dedicado
+(`inject_malformed.py`, README passo 21), que monta os malformados sobre eventos do
+gerador sintético, ainda será decidido.
+
+O que segue descreve a regra **até a versão 2.2**, mantida como registro.
+
+**No benchmark, 4 das 10 rodadas de cada combinação levavam eventos malformados de
 propósito** — as rodadas 2, 5, 7 e 10, as mesmas para os dois motores e para todas
-as combinações. Nelas, **1% das mensagens** é malformada: o próprio gerador as
+as combinações. Nelas, **1% das mensagens** era malformada: o próprio gerador as
 emite (`MALFORMED_RATE`), **no lugar** de eventos válidos, a intervalos fixos, com
 os **8 tipos** de `shared/data-generator/malformed.py` em rodízio. Todos são JSON
 válido: um objeto com um campo de tipo errado, ou sem um campo.
@@ -522,6 +603,21 @@ ocupa diferente. Numa rodada de 6.000 eventos: 287,9 bytes por evento no Spark
 
 **Uma exceção, e só uma: o `event_ts` é lido para montar as pastas** `dt=` e
 `hh=` (seção 4.1).
+
+**Desde a versão 3.0 são onze campos.** O `event_time` original (seção 1.5) entra
+como texto, como os outros, e não é interpretado por nenhum motor.
+
+**O `amount` da base viaja como texto (decisão do autor, 23/10/2026).** A base
+escreve preços com zero à direita (`543.10`, `33.20`), justamente o caso em que, se
+o preço fosse enviado como número JSON, o Spark reescreveria o texto (`543.1`) e o
+Flink não (limite acima). O replayer envia o `price` **exatamente como está na
+base, entre aspas** (`"amount": "543.10"`): nenhum valor é reescrito antes do Load,
+e os dois motores gravam o mesmo texto, igual ao da base. O tipo do contrato
+(`float64`) continua sendo o do evento: a conversão, depois do Load, transforma
+`"543.10"` em 543,1 pela regra da tabela acima. Reescrever o número para a forma
+canônica no replayer foi considerado e recusado, por ser transformação antes do
+Load. Os inteiros (`user_id`, `product_id`) seguem como número: nesses os dois
+motores gravam o mesmo texto.
 
 ---
 
@@ -758,15 +854,16 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 
 | Invariante | Valor fixado |
 |---|---|
-| Schema do evento | Seção 1.1, sem alteração |
-| Carga dos campos | Os dez campos como **texto**, sem interpretar tipo (seção 2.7) |
+| Schema do evento | Seção 1.1, sem alteração: os onze campos |
+| Fonte dos eventos | A base real da seção 1.5, conferida pelo sha256 |
+| Carga dos campos | Os onze campos como **texto**, sem interpretar tipo (seção 2.7) |
 | Chave da mensagem | `user_id`, representação decimal em UTF-8 (seção 1.3) |
-| Distribuição de `user_id` | Uniforme em [1, 2000], pela seed da rodada (seções 1.4 e 5.1) |
+| Distribuição de `user_id` | A da base, pela janela da rodada (seções 1.4 e 5.1) |
 | Colunas de saída | Seção 2. `processed_ts` idêntica nos dois (2.5); `batch_id` só no Spark — no Flink a unidade de progresso é o checkpoint, reconhecido pelo grupo de arquivos que ficam visíveis juntos (2.3). `committed_ts` com origem por motor, declarada (2.2) |
 | Cálculo do watermark | Máximo acumulado de `event_ts` menos 60 s, monotônico — **derivado na análise**, igual para os dois motores (seção 2.1) |
 | Tópico e partições | `ecommerce.events.v1`, 24 partições |
-| Gerador e seed | Mesmo binário, mesmo `config.yaml`, e **a mesma seed na mesma rodada**: a rodada N do Spark e a do Flink recebem os mesmos eventos (seção 5.1) |
-| Carga | Mesmos níveis, mesma duração, mesmas 10 rodadas por combinação, com malformados nas mesmas quatro (seções 2.6 e 5.1) |
+| Replayer e janela | Mesmo programa, mesma base, e **a mesma janela na mesma rodada**: a rodada N do Spark e a do Flink recebem os mesmos eventos, na mesma ordem (seção 5.1) |
+| Carga | Mesmos níveis, mesma duração, mesmas 10 rodadas por combinação, sem eventos malformados (seções 2.6 e 5.1) |
 | Estado inicial de cada rodada | Tópico recriado e vazio, checkpoint do motor apagado, leitura desde o início do tópico (seção 5.2) |
 | Transformações | **Nenhuma dentro do pipeline** (ELT estrito, seção 2.6): os dois carregam os dez campos como chegam, **em texto** (seção 2.7), sem limpeza e sem join. A conversão para os tipos do contrato é depois do Load, pela mesma regra para os dois. O watermark é derivado na análise (2.1). Até a versão 1.7 esta linha previa "mesma limpeza, mesmo broadcast join", e havia uma linha para a tabela de produtos; nenhum dos dois chegou a ser implementado |
 | Particionamento do destino | Derivado de `event_ts`, em UTC, pela mesma regra do que vale como instante (seção 4.1) |
@@ -776,9 +873,56 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Análise | O mesmo `reconcile.py` |
 | Infraestrutura | Mesmos tipos de instância, mesma AZ, mesma região |
 
-### 5.1 Reprodução da carga: uma seed por rodada, sem replay
+### 5.1 Reprodução da carga: uma janela da base por rodada (versão 3.0)
 
-O gerador é pseudoaleatório e semeado. **Cada rodada tem a sua seed, e ela é a
+**Cada rodada recebe uma janela contínua da base** (decisão do autor, 23/10/2026):
+os eventos de uma faixa de linhas consecutivas, na ordem original. O tamanho da
+janela é o número de eventos da rodada — **carga × duração**: 60 mil a 1.000 evt/s
+por 60 s, 4,5 milhões a 15.000 evt/s por 300 s.
+
+**Onde a janela começa é sorteado pela seed da rodada**, a mesma de antes: 41 + N.
+A linha inicial é sorteada, com um gerador pseudoaleatório semeado por ela, entre
+a primeira linha da base e a última que ainda deixa a janela inteira. A rodada N
+do Spark e a do Flink recebem **a mesma janela**. O manifesto de cada rodada
+registra as linhas de início e de fim.
+
+**Por que janela contínua, e não eventos sorteados.** Sortear linhas soltas
+desfaria as sessões (`view → cart → purchase` de um mesmo usuário) e os picos de
+movimento da loja — justamente o que torna o dado real. A janela os preserva.
+
+**As janelas podem se sobrepor**, e isso é aceito. Na carga mais pesada, dez
+janelas de 4,5 milhões não cabem nos 42,4 milhões do mês sem se cruzar. Não dá
+vantagem a nenhuma rodada: cada uma começa do zero — tópico recriado, checkpoint
+apagado, JVM nova (seção 5.2) — e o motor não guarda nada da anterior.
+
+**A sobreposição medida** (seeds 42 a 51, 23/10/2026), em eventos que aparecem em
+mais de uma das 10 rodadas: **0%** nas combinações de 1.000 × 60 s, 7.500 × 60 s,
+15.000 × 60 s e 1.000 × 300 s; **10,8%** em 7.500 × 300 s; **34,2%** em
+15.000 × 300 s — o mínimo inevitável nesta seria ~6%. O sorteio é livre em todo o
+mês; sortear a rodada N dentro de uma faixa N do mês reduziria a sobreposição, e
+foi considerado e recusado pelo autor, para manter a regra mais simples.
+
+**A janela é lida durante a medição, linha a linha** (decisão do autor,
+23/10/2026). **Antes** de o relógio da rodada começar, o replayer só avança no
+arquivo até a linha inicial — sem isso, a rodada passaria o começo sem enviar nada.
+Do relógio em diante, ele lê uma linha, monta a mensagem e a envia, uma de cada
+vez, na taxa pedida: como um produtor real, que envia o evento quando ele acontece.
+O trabalho de ler e montar disputa a CPU com o motor, e **essa disputa faz parte do
+que se mede**. Considerou-se carregar a janela inteira antes, com as mensagens
+prontas; recusado porque, na combinação mais pesada, ocuparia ~1,4 GB e não
+caberia com folga no teto de 4 GB do WSL de referência. A escolha é revista se, na
+nuvem, o replayer continuar na mesma máquina do motor.
+
+Exige as mesmas garantias de antes: **um único thread produtor por `gen_id`**, e
+**nenhum uso de relógio ou entropia** no sorteio da janela.
+
+O `event_ts` difere entre as execuções do Spark e do Flink, o que é irrelevante:
+toda latência é calculada em relação ao próprio `event_ts` de cada evento. O que
+precisa ser idêntico é a **sequência de eventos**, não o instante absoluto.
+
+O que segue descreve a regra **até a versão 2.2**, mantida como registro.
+
+O gerador era pseudoaleatório e semeado. **Cada rodada tem a sua seed, e ela é a
 mesma para os dois motores (versão 1.9):** a rodada N usa a seed 41 + N — a
 rodada 1 usa 42, a rodada 10 usa 51. Até a versão 1.8 a seed era uma só, fixa.
 
@@ -787,18 +931,11 @@ sequência de eventos, e a variação entre elas mediria apenas o ruído da máq
 Com uma seed por rodada, a variação inclui a dos dados. E com a mesma seed nos
 dois motores, a rodada N continua sendo uma comparação sobre entrada idêntica.
 
-Nas rodadas 2, 5, 7 e 10 (seção 2.6) os malformados entram em posições fixas e
-com os tipos em rodízio, de modo que os dois motores recebem os mesmos
-malformados, nas mesmas posições.
-
-Exige duas garantias de implementação:
-
-1. **Um único thread produtor por `gen_id`**
-2. **Nenhum uso de relógio ou entropia** no sorteio dos campos
-
-O `event_ts` difere entre as execuções do Spark e do Flink, o que é irrelevante:
-toda latência é calculada em relação ao próprio `event_ts` de cada evento. O que
-precisa ser idêntico é a **sequência de eventos**, não o instante absoluto.
+Nas rodadas 2, 5, 7 e 10 (seção 2.6) os malformados entravam em posições fixas e
+com os tipos em rodízio, de modo que os dois motores recebiam os mesmos
+malformados, nas mesmas posições. O gerador sintético
+(`shared/data-generator/generator.py`) continua no repositório, sem uso nas
+rodadas, para que a bateria feita com ele siga reproduzível.
 
 ### 5.2 Como uma rodada é feita (versão 1.9)
 
@@ -810,8 +947,9 @@ inicial:
    toda rodada começa com as 24 partições vazias, sem mensagens da rodada anterior
    nem do outro motor;
 3. o pipeline lê **desde o início do tópico** (`earliest`);
-4. o gerador roda pela duração da rodada;
-5. a rodada termina quando o gerador terminou **e** a fila do grupo de consumo
+4. o replayer carrega a janela da rodada e então a envia, na taxa pedida, pela
+   duração da rodada (seção 5.1);
+5. a rodada termina quando o replayer terminou **e** a fila do grupo de consumo
    zerou; o pipeline é então encerrado por um arquivo de parada.
 
 **As 10 rodadas de uma combinação alternam os motores**, e quem começa inverte a
@@ -842,7 +980,7 @@ São seis combinações, com 10 rodadas de cada motor em cada uma.
 - Até a versão 2.0 o mesmo intervalo valia para os dois motores (trigger e
   checkpoint), e os valores e as cargas não estavam fixados.
 
-Verificado em 12/10/2026 por um ensaio de uma rodada por caso: o gerador atinge
+Verificado em 12/10/2026, com o gerador sintético, por um ensaio de uma rodada por caso: o gerador atinge
 15.000 mensagens por segundo, e os dois motores fecham as rodadas de 7.500 e de
 15.000 sem perda, inclusive o Spark com trigger de 30 s (lotes de ~450 mil
 eventos, pico de memória de 1.178 MiB num contêiner de 1.536).
@@ -868,7 +1006,8 @@ a igualar o que não deve ser igualado.
 | **Número de arquivos por execução** | É **resultado medido**, não parâmetro a igualar |
 | Retenção do tópico | É a mesma para os dois motores (168 h) e não age numa rodada: o tópico é recriado no começo de cada uma (seção 3.1) |
 | **Destino de uma mensagem que não é JSON** | O Spark grava uma linha nula e o Flink descarta (seção 2.6). O gerador não envia mensagens assim; a diferença fica **declarada**, não foi igualada. Até a versão 1.9 esta linha cobria também os campos de tipo errado — que, com a carga em texto, os dois motores passaram a gravar igual |
-| O **texto** de um número decimal escrito de forma incomum | O Spark reescreve o número, o Flink guarda como veio (seção 2.7). O valor convertido é o mesmo, e o gerador não produz esses casos |
+| O **texto** de um número decimal escrito de forma incomum | O Spark reescreve o número, o Flink guarda como veio (seção 2.7). O valor convertido é o mesmo. O replayer envia o `amount` como texto, exatamente como na base, e por isso o caso não ocorre no benchmark |
+| O **ritmo** dos eventos | É a taxa pedida pelo benchmark, não a da loja: a base é acelerada (seção 1.5). A ordem original é mantida |
 
 **Sobre o número de arquivos.** É tentador tratá-lo como invariante. Forçá-lo a
 ser igual nos dois motores exigiria um `repartition`, o que violaria a decisão
@@ -893,6 +1032,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 3.0 | 23/10/2026 | **§1.5 novo; §1.1, §1.3, §1.4, §2.6, §2.7, §5, §5.1, §5.2 e §6 alterados.** Os eventos passam a ser **reais**: a base *eCommerce behavior data from multi category store* (REES46, outubro de 2019, 42.448.764 eventos, sha256 conferido), pedido da orientação. Um **replayer** substitui o gerador sintético nas rodadas: cada rodada recebe uma **janela contínua** da base, com o início sorteado pela seed da rodada, a mesma nos dois motores, carregada antes da medição. O evento ganha o 11º campo, **`event_time`**, o instante original; o `event_ts` passa a ser o instante do envio, e o `event_id`, o endereço da linha na base. Tipos de evento, preço, usuários e produtos passam a ser os da loja, como vieram. **Sem eventos malformados no benchmark.** Versão maior porque **a fonte dos dados** muda | **Todas as do benchmark.** A bateria local de 12–13/10/2026 (120 rodadas, gerador sintético) e o ensaio da nuvem de 21/10/2026 foram feitos com eventos gerados; ficam como histórico, e a bateria local **será refeita** com a base real (decisão do autor, 23/10/2026) |
 | 2.2 | 12/10/2026 | **§2.3 alterado.** O descarte de aquecimento deixa de ser a primeira unidade de progresso de cada motor e passa a ser um **tempo fixo de eventos, igual nos dois motores**: os eventos gerados nos primeiros 5 s nas rodadas de 60 s, e nos primeiros 30 s nas de 300 s. Os dois motores descartam o mesmo trecho da carga. O throughput médio segue a mesma regra | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |
 | 2.1 | 12/10/2026 | **§5.2 ampliado.** Fixado o que se varia no benchmark: **o trigger do Spark em 5 s e 30 s, com o checkpoint do Flink fixo em 5 s**; cargas de 1.000, 7.500 e 15.000 mensagens por segundo; rodadas de 60 s nas combinações de intervalo 5 e de 300 s nas de intervalo 30. Até a 2.0 o intervalo era o mesmo para os dois motores. | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |
 | 2.0 | 12/10/2026 | **§2.7 novo; §2.6, §4.1, §5 e §6 alterados; §1.1 ajustado.** Os dois pipelines passam a **carregar os dez campos como texto**, sem interpretar tipo: decisão do autor com a orientação. O tratamento dos eventos malformados sai do pipeline e vai para o Transform, depois do Load; a conversão é feita, por ora, pelo `reconcile.py`, com uma regra só para os dois motores. **O gerador deixa de enviar mensagens que não são JSON:** os tipos de malformado passam de 13 para 8. A diferença entre os motores nos campos de tipo errado deixa de existir; sobra, declarada, a da mensagem que não é JSON. As pastas `dt=`/`hh=` passam a sair só de um `event_ts` que seja um inteiro de 1 a 13 dígitos, por uma regra única. Versão maior porque o **formato do destino** muda | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita. Os números de teste anteriores (carga tipada) deixam de servir de referência: o tamanho do destino mudou, e as contagens de inválidas, nulas e descartadas têm outra definição |
