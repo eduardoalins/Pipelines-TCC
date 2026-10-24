@@ -175,7 +175,8 @@ evento teria anos de latência, todos sairiam atrasados e cairiam em pastas de
 - os **tipos de evento** da base (`view`, `cart`, `purchase`). Outubro de 2019
   não tem `remove_from_cart`, embora a página da base o descreva;
 - as **30.220 linhas idênticas** que a base tem repetidas (0,07%). Para a medição
-  não são duplicatas: cada uma recebe o seu `seq` e o seu `event_id`;
+  não são duplicatas: cada uma recebe o seu `seq` e o seu `event_id`. Quem as
+  tira é o Transform, depois do Load (seção 2.8, versão 3.1);
 - os 2 eventos sem `user_session`. Se caírem numa janela, saem como **inválidos**
   na contagem (seção 2.6) — defeito da base, não do pipeline.
 
@@ -456,7 +457,7 @@ carregados como texto, do jeito que vieram (seção 2.7). Um campo com o tipo er
 — texto onde se esperava número, fração num inteiro, número entre aspas — chega ao
 destino **como veio**, nos dois motores. Converter para o tipo do contrato e
 decidir o que fazer com o que não converte é trabalho do **Transform**, depois do
-Load.
+Load (seção 2.8, desde a versão 3.1).
 
 **O que isso substitui.** Até a versão 1.9 os campos eram carregados já tipados,
 e cada motor decidia sozinho o que fazer com um valor de tipo errado — e os dois
@@ -584,8 +585,11 @@ o que veio, e a regra de conversão passa a ser uma só, aplicada depois.
 - Inteiros saem iguais, até com 20 dígitos. Um objeto ou uma lista num campo vira
   o próprio JSON em texto, nos dois.
 
-**A conversão, depois do Load.** Hoje é feita pelo `reconcile.py`, ao ler o
-destino, com uma regra provisória e sem conserto:
+**A conversão, depois do Load.** Até a versão 3.0 era feita pelo `reconcile.py`,
+ao ler o destino, com uma regra provisória e sem conserto. Desde a 3.1 a regra
+mora no módulo de Transform (`shared/transform/conversao.py`, seção 2.8), que o
+`reconcile.py` importa; os tipos novos da 3.1 estão no fim desta seção. A regra
+até a 3.0:
 
 | Tipo do contrato | Converte quando o texto é | Senão |
 |---|---|---|
@@ -593,9 +597,8 @@ destino, com uma regra provisória e sem conserto:
 | decimal (`float64`) | um número, por extenso ou em notação científica | nulo |
 | texto | — fica como veio | — |
 
-Nada é arredondado, truncado ou adivinhado. O lugar definitivo dessa regra é um
-**módulo de Transform** separado, a escrever depois da Etapa 9, onde também se
-decide o que fazer com cada tipo que não converte.
+Nada é arredondado, truncado ou adivinhado. O lugar definitivo dessa regra, como
+previsto, passou a ser um **módulo de Transform** separado (seção 2.8, versão 3.1).
 
 **Consequência declarada: o tamanho do destino muda.** Número guardado como texto
 ocupa diferente. Numa rodada de 6.000 eventos: 287,9 bytes por evento no Spark
@@ -633,6 +636,65 @@ convertê-lo. Por isso:
 Os pipelines **não mudam**: continuam carregando os onze campos como texto, e só
 aprendem os dois nomes de tipo, para não recusarem o `evento.json`. O destino é o
 mesmo byte a byte.
+
+**Verificado (24/10/2026).** A regra aceita a base inteira: os 42.448.764 preços
+têm exatamente duas casas no texto e convertem sem mudar de valor, e os
+42.448.764 `event_time` convertem (de 01/10/2019 00:00:00 a 31/10/2019 23:59:59).
+
+### 2.8 O Transform: a tabela tipada, sem duplicatas (versão 3.1, 24/10/2026)
+
+**O "T" do ELT, implementado.** Até a versão 3.0 ele era só declarado. Desde a
+3.1 existe um módulo pequeno e separado, `shared/transform/`, que roda **depois
+do Load e fora da medição**: nenhuma rodada o chama, e ele não entra em nenhum
+número do benchmark. Decisões do autor, de 12/10/2026 (um módulo separado) e de
+24/10/2026 (o que ele faz).
+
+| Arquivo | O que faz |
+|---|---|
+| `conversao.py` | A regra do texto ao tipo (seção 2.7) e a lista dos campos obrigatórios, tudo lido do `evento.json`. O `reconcile.py` a importa para contar as inválidas |
+| `transform.py` | Lê o destino bruto de uma rodada e grava a **tabela tipada**, sem duplicatas |
+
+**As camadas.** O destino bruto não muda: continua com o texto que cada motor
+gravou, e toda linha removida continua lá. A tabela tipada é uma camada nova, ao
+lado:
+
+```
+~/tcc-data/out/<motor>/events/run_id=<run_id>/            bruto: onze campos em texto + colunas de medição
+~/tcc-data/transformado/<motor>/run_id=<run_id>/eventos.parquet   tipada: os onze campos nos tipos do contrato
+```
+
+**O que entra na tabela tipada: só os onze campos do evento.** As colunas de
+medição (`processed_ts`, `batch_id`) são instrumentos do benchmark, diferentes em
+cada motor, e ficam no bruto. Por isso a mesma rodada, transformada a partir do
+Spark e do Flink, tem de dar a mesma tabela — salvo o `run_id` e o `event_ts`,
+que são de cada rodada.
+
+**Duplicatas: saem duas espécies, cada uma contada à parte** (decisão do autor,
+24/10/2026):
+
+| Etapa | O que é | Regra | Fica |
+|---|---|---|---|
+| 1. Técnica | o motor gravou a mesma linha da base mais de uma vez (o Spark entrega "pelo menos uma vez" depois de uma falha) | mesmo `event_id` | a cópia de menor `seq` |
+| 2. Da origem | a própria base tem a linha repetida; chega como eventos diferentes, com `event_id` diferente | os seis campos que vêm da loja idênticos: `event_time`, `event_type`, `product_id`, `user_id`, `amount`, `session_id` | a de menor `event_id`, a primeira na base |
+
+Uma linha incompleta — um dos seis campos nulo, porque não veio ou não converteu
+— não entra na etapa 2, e uma sem `event_id` não entra na etapa 1: dois nulos
+não provam que duas linhas são iguais. A repetida da origem só é achada se as
+duas cópias caírem na mesma rodada. A etapa 2 compara os seis campos que o
+evento leva; a contagem de 23/10/2026 (30.220 linhas repetidas, seção 1.5)
+comparava as nove colunas da base, inclusive marca e categoria, que não viajam.
+
+**O que o Transform não faz:** não conserta (um valor que não converte fica nulo,
+e a linha fica), não enriquece (categoria e marca dos produtos foram levantadas
+e ficaram de fora, por decisão do autor), não lê a partição nula (uma linha sem
+`run_id` não diz de que rodada é) e não roda sozinho.
+
+**Verificado (24/10/2026), com uma rodada de 6.000 eventos de cada motor, antes
+da remoção de duplicatas:** o `reconcile.py` com a regra no módulo deu o mesmo
+relatório que antes, nos dois motores; a tabela tipada do Spark e a do Flink
+saíram idênticas (0 diferenças), e as duas iguais ao texto da base nos seis
+campos da loja, com os 486 preços de zero à direita preservados. **A remoção de
+duplicatas está escrita e ainda não foi testada.**
 
 ---
 
@@ -880,7 +942,7 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 | Replayer e janela | Mesmo programa, mesma base, e **a mesma janela na mesma rodada**: a rodada N do Spark e a do Flink recebem os mesmos eventos, na mesma ordem (seção 5.1) |
 | Carga | Mesmos níveis, mesma duração, mesmas 10 rodadas por combinação, sem eventos malformados (seções 2.6 e 5.1) |
 | Estado inicial de cada rodada | Tópico recriado e vazio, checkpoint do motor apagado, leitura desde o início do tópico (seção 5.2) |
-| Transformações | **Nenhuma dentro do pipeline** (ELT estrito, seção 2.6): os dois carregam os dez campos como chegam, **em texto** (seção 2.7), sem limpeza e sem join. A conversão para os tipos do contrato é depois do Load, pela mesma regra para os dois. O watermark é derivado na análise (2.1). Até a versão 1.7 esta linha previa "mesma limpeza, mesmo broadcast join", e havia uma linha para a tabela de produtos; nenhum dos dois chegou a ser implementado |
+| Transformações | **Nenhuma dentro do pipeline** (ELT estrito, seção 2.6): os dois carregam os dez campos como chegam, **em texto** (seção 2.7), sem limpeza e sem join. A conversão para os tipos do contrato e a remoção de duplicatas são depois do Load, pela mesma regra para os dois, no módulo de Transform (2.8), fora da medição. O watermark é derivado na análise (2.1). Até a versão 1.7 esta linha previa "mesma limpeza, mesmo broadcast join", e havia uma linha para a tabela de produtos; nenhum dos dois chegou a ser implementado |
 | Particionamento do destino | Derivado de `event_ts`, em UTC, pela mesma regra do que vale como instante (seção 4.1) |
 | Codec do Parquet | `snappy`, declarado explicitamente nos dois (seção 4.4) |
 | Destino | Mesmo formato, mesmo particionamento, mesma política de escrita (sem `repartition`) |
@@ -1047,7 +1109,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
-| 3.1 | 24/10/2026 | **§1.1, §2.6 e §2.7 alterados.** Dois tipos novos, para a conversão depois do Load: `amount` passa de `float64` a **`decimal(10,2)`**, exato, para `"543.10"` continuar 543,10 também depois de convertido; `event_time` passa de `string` a **`timestamp`** em UTC. **Os onze campos passam a ser obrigatórios** na contagem de inválidas: entram o `amount`, que a base traz em todo evento, e o `event_time`. Decisões do autor, ao começar o módulo de Transform. Os pipelines continuam carregando texto e só aprendem os nomes dos tipos novos | **Nenhuma medida.** O destino não muda. Nenhuma rodada do benchmark com a base real havia sido feita: só testes (23/10 local, 24/10 na nuvem) |
+| 3.1 | 24/10/2026 | **§2.8 novo; §1.1, §2.6 e §2.7 alterados.** O módulo de Transform passa a existir (`shared/transform/`): a regra de conversão sai do `reconcile.py` para ele, e um programa grava, depois do Load e fora da medição, a tabela tipada de cada rodada, sem duplicatas técnicas nem repetidas da origem. Dois tipos novos, para a conversão depois do Load: `amount` passa de `float64` a **`decimal(10,2)`**, exato, para `"543.10"` continuar 543,10 também depois de convertido; `event_time` passa de `string` a **`timestamp`** em UTC. **Os onze campos passam a ser obrigatórios** na contagem de inválidas: entram o `amount`, que a base traz em todo evento, e o `event_time`. Decisões do autor, ao começar o módulo de Transform. Os pipelines continuam carregando texto e só aprendem os nomes dos tipos novos | **Nenhuma medida.** O destino não muda. Nenhuma rodada do benchmark com a base real havia sido feita: só testes (23/10 local, 24/10 na nuvem) |
 | 3.0 | 23/10/2026 | **§1.5 novo; §1.1, §1.3, §1.4, §2.6, §2.7, §5, §5.1, §5.2 e §6 alterados.** Os eventos passam a ser **reais**: a base *eCommerce behavior data from multi category store* (REES46, outubro de 2019, 42.448.764 eventos, sha256 conferido), pedido da orientação. Um **replayer** substitui o gerador sintético nas rodadas: cada rodada recebe uma **janela contínua** da base, com o início sorteado pela seed da rodada, a mesma nos dois motores, carregada antes da medição. O evento ganha o 11º campo, **`event_time`**, o instante original; o `event_ts` passa a ser o instante do envio, e o `event_id`, o endereço da linha na base. Tipos de evento, preço, usuários e produtos passam a ser os da loja, como vieram. **Sem eventos malformados no benchmark.** Versão maior porque **a fonte dos dados** muda | **Todas as do benchmark.** A bateria local de 12–13/10/2026 (120 rodadas, gerador sintético) e o ensaio da nuvem de 21/10/2026 foram feitos com eventos gerados; ficam como histórico, e a bateria local **será refeita** com a base real (decisão do autor, 23/10/2026) |
 | 2.2 | 12/10/2026 | **§2.3 alterado.** O descarte de aquecimento deixa de ser a primeira unidade de progresso de cada motor e passa a ser um **tempo fixo de eventos, igual nos dois motores**: os eventos gerados nos primeiros 5 s nas rodadas de 60 s, e nos primeiros 30 s nas de 300 s. Os dois motores descartam o mesmo trecho da carga. O throughput médio segue a mesma regra | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |
 | 2.1 | 12/10/2026 | **§5.2 ampliado.** Fixado o que se varia no benchmark: **o trigger do Spark em 5 s e 30 s, com o checkpoint do Flink fixo em 5 s**; cargas de 1.000, 7.500 e 15.000 mensagens por segundo; rodadas de 60 s nas combinações de intervalo 5 e de 300 s nas de intervalo 30. Até a 2.0 o intervalo era o mesmo para os dois motores. | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |

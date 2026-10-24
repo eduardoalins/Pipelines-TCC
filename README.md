@@ -1219,6 +1219,78 @@ declarada no `CONTRATO.md` §2.2, com o motivo e o tamanho do erro de cada um.
 
 ---
 
+## Depois do passo 20 — o Transform: a tabela tipada
+
+Os passos 9 a 20 fizeram o **E** e o **L**: os dois motores carregam os onze
+campos do evento como **texto**, exatamente como vieram. O **T** vem depois, fora
+dos pipelines e fora da medição (`CONTRATO.md` §2.8). Ele lê o destino bruto de uma
+execução e grava ao lado uma **tabela tipada**: os onze campos nos tipos do
+contrato, sem duplicatas.
+
+```bash
+RUN=$(ls -1 ~/tcc-data/out/flink/events | grep 'run_id=[0-9]' | tail -1 | sed 's/run_id=//'); echo "$RUN"
+MOTOR=flink RUN_ID=$RUN ~/.venvs/tcc/bin/python shared/transform/transform.py
+```
+
+Para o Spark, o mesmo com `out/spark` e `MOTOR=spark`.
+
+**Esperado** (rodada do Spark de 24/10/2026, 6.000 eventos reais, antes da remoção
+de duplicatas existir):
+
+```
+destino bruto ..... /home/<usuário>/tcc-data/out/spark/events/run_id=20261024T191535Z-spark-i5-c100-r01   (312 arquivos)
+linhas ............ 6000
+
+campo         tipo            nulos   (nao vieram / texto que nao converte)
+event_id      string               0   (0 / 0)
+seq           int64                0   (0 / 0)
+...
+amount        decimal(10,2)        0   (0 / 0)
+session_id    string               0   (0 / 0)
+event_ts      int64                0   (0 / 0)
+event_time    timestamp            0   (0 / 0)
+
+tabela tipada ..... /home/<usuário>/tcc-data/transformado/spark/run_id=…/eventos.parquet   (0.30 MB)
+    ...
+    amount        DECIMAL(10,2)
+    event_time    TIMESTAMP
+
+6000 linhas gravadas; 0 valores nao converteram
+```
+
+Agora a saída tem também duas linhas novas, entre a tabela de campos e a tabela
+tipada: `duplicatas tecnicas removidas` e `repetidas da origem removidas`.
+**A remedir:** a remoção de duplicatas foi escrita em 24/10/2026 e ainda não rodou
+sobre uma execução real. Numa janela de 6.000 eventos, o esperado é 0 técnicas e
+poucas repetidas da origem (a base tem 0,07% de linhas repetidas).
+
+**O que a tabela tipada tem:**
+
+| Campo | No destino bruto | Na tabela tipada |
+|---|---|---|
+| `amount` | texto `"543.10"` | `DECIMAL(10,2)` **543.10** — exato, o zero à direita fica |
+| `event_time` | texto `"2019-10-20 12:47:26 UTC"` | `TIMESTAMP` 2019-10-20 12:47:26, em UTC |
+| `seq`, `event_ts` | texto | `BIGINT` |
+| `gen_id`, `user_id`, `product_id` | texto | `INTEGER` |
+| os outros | texto | texto |
+
+**Só os onze campos.** As colunas de medição (`processed_ts`, `batch_id`) ficam no
+destino bruto: são de cada motor. Por isso a tabela tipada do Spark e a do Flink,
+da mesma janela, saem **iguais** — salvo o `run_id` e o `event_ts`, que são de cada
+execução. Verificado em 24/10/2026: 0 diferenças entre as duas, e 0 contra o texto
+da base nos seis campos que vêm da loja.
+
+**As duas espécies de duplicata** (`CONTRATO.md` §2.8): a **técnica** é o motor ter
+gravado a mesma linha da base duas vezes (mesmo `event_id`); a **da origem** é a
+própria base ter a linha repetida (os seis campos da loja iguais, `event_id`
+diferente). Fica uma cópia de cada. O destino bruto continua com todas.
+
+**O que ele não faz:** não conserta (um valor que não converte fica nulo, e a
+linha fica), não mexe no destino bruto e não roda sozinho — o script de rodada
+(passo 22) não o chama.
+
+---
+
 ## Passo 21 — Eventos malformados (aposentado no contrato 3.0)
 
 **Este passo não roda mais com o código atual** (decisão do autor, 23/10/2026). O
@@ -1920,6 +1992,8 @@ Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `reconcile.py` do Flink: 0 perdas, 0 duplicatas, processamento em ms, conferência do `ctime` em poucos ms
 - [x] Os dois motores gravam os campos do evento como texto, inclusive o `event_time` do contrato 3.0, sem mudança nos pipelines
 - [x] Com a base real, os dois destinos saem idênticos entre si e iguais às linhas da base, com o preço exatamente como veio (`543.10`)
+- [x] O `transform.py` grava a tabela tipada de cada motor: `amount` em `DECIMAL(10,2)` com o `543.10` intacto, `event_time` em `TIMESTAMP`, e as duas tabelas iguais entre si e à base
+- [ ] O `transform.py` remove as duplicatas técnicas e as repetidas da origem — escrito em 24/10/2026, a testar
 - [ ] ~~Com eventos malformados, o `reconcile.py` conta 18 inválidas~~ — passo 21 aposentado no contrato 3.0 (resultado de 12/10/2026)
 - [x] O `run_round.py` fecha uma rodada válida de cada motor: 0 perdas, 0 duplicatas, fila zerada
 - [x] Nas rodadas com malformados a rodada vale, e as inválidas saem iguais nos dois motores (até o contrato 2.2)
@@ -1946,6 +2020,7 @@ Decisão E6: **código no Windows, dados em ext4 nativo do WSL.**
 | Ambiente Python do host | `~/.venvs/tcc` — gerador, coletor e reconciliador |
 | A base real | `~/tcc-data/base/2019-Oct.csv` e o `.gz` de origem — `scripts/preparar_base.sh` |
 | Parquet de saída | `~/tcc-data/out/spark` e `~/tcc-data/out/flink` — um `<base>` por motor |
+| Tabela tipada (Transform) | `~/tcc-data/transformado/<motor>/run_id=<run_id>/eventos.parquet` — gerada à mão, depois do Load |
 | Checkpoints | `~/tcc-data/checkpoints/nrt` (Spark) e `~/tcc-data/checkpoints/rt` (Flink) |
 | Métricas coletadas | `~/tcc-data/metrics` — manifestos do replayer, logs de progresso dos dois motores, CSVs do coletor e relatórios do `reconcile.py` |
 | Material bruto das rodadas | `results/`, neste repositório e **fora do git** — apagado quando a combinação fecha (passo 23) |
@@ -1996,7 +2071,7 @@ meio dos experimentos invalida as execuções já feitas.
 | Coletor de lixo da JVM | Serial nos dois — escolhido pela JVM por causa do teto de 1536 MB do contêiner | 10/10/2026 |
 | Python do host (gerador, coletor, reconciliador) | 3.12.3 | 03/09/2026 |
 | confluent-kafka | 2.15.0 (librdkafka 2.15.0) — no host e na imagem do Spark | 04/09/2026 |
-| DuckDB (leitor do `reconcile.py`) | 1.5.5 | 24/09/2026 |
+| DuckDB (leitor do `reconcile.py` e do Transform) | 1.5.5 | 24/09/2026 |
 | Base de eventos | REES46 `2019-Oct.csv.gz`, sha256 `8ebca1ad…38147`, 42.448.764 eventos | 23/10/2026 |
 | Terraform | 1.16.4, no WSL, conferido pelo checksum da HashiCorp | 17/10/2026 |
 | AWS CLI | 2.38.1 — a mais recente na instalação; só cria e lê recursos, não entra em medida | 17/10/2026 |
@@ -2032,7 +2107,10 @@ shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
     generator.py          o gerador sintético — sem uso desde o 3.0, mantido como registro (Etapas 3 e 8)
     malformed.py          os 8 tipos de malformado do gerador antigo — sem uso no benchmark desde o 3.0
     inject_malformed.py   injetor de eventos quebrados — aposentado no 3.0 (Etapa 7)
-  analysis/reconcile.py   conversão dos campos, perdas, duplicatas, latências, throughput e is_late, via DuckDB (Etapas 6 a 9)
+  analysis/reconcile.py   perdas, duplicatas, inválidas, latências, throughput e is_late, via DuckDB (Etapas 6 a 9)
+  transform/              o "T" do ELT, depois do Load e fora da medição (contrato 3.1)
+    conversao.py          a regra do texto ao tipo do contrato — usada também pelo reconcile.py
+    transform.py          grava a tabela tipada de uma execução, sem duplicatas
   monitoring/collector.py consumer lag, CPU e memória a cada 1 s, os dois motores (Etapas 6 e 8)
 pipeline-nrt/             pipeline Spark Structured Streaming      (Etapa 4+)
   Dockerfile              runtime: Java 17.0.20, Python, PySpark, conector (Etapa 6.2)
@@ -2110,6 +2188,11 @@ Em 23/10/2026, a pedido da orientação, os eventos passaram a ser **reais** (Et
 9.1, contrato 3.0): a base da REES46, reproduzida por um replayer. A bateria local
 de 12–13/10, feita com o gerador sintético, fica como histórico e **será refeita**
 com a base real. A Etapa 10 (AWS) está pausada nas decisões que dependem disso.
+
+Em 24/10/2026 o **T** do ELT deixou de ser só declarado (contrato 3.1): o módulo
+`shared/transform/` converte o texto do destino para os tipos do contrato — o
+preço em decimal exato, o instante original em data e hora — e grava uma tabela
+tipada por execução, sem duplicatas, depois do Load e fora da medição.
 
 ### Pipeline Streaming (Flink) — `planoRT.md`
 
