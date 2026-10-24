@@ -211,6 +211,11 @@ def main() -> int:
 
     base.close()
     cont.ultimo_seq = cont.tentados - 1
+    # O ritmo em que o envio aconteceu, sem a espera final pelas confirmacoes.
+    # E por ele que o run_round.py confere se a carga pedida foi enviada
+    # (regra dos 99%, decisao de 24/10/2026).
+    duracao_envio = time.perf_counter() - t0
+    envio = cont.tentados / duracao_envio if duracao_envio > 0 else 0.0
 
     pendentes = produtor.flush(timeout=30)
     duracao_real = time.perf_counter() - t0
@@ -228,6 +233,7 @@ def main() -> int:
     print(f"erros de entrega ........ {cont.erros_entrega}")
     print(f"pendentes no flush ...... {pendentes}")
     print(f"ultimo seq (gen {gen_id}) ..... {cont.ultimo_seq}")
+    print(f"ritmo de envio .......... {envio:.1f} evt/s  ({duracao_envio:.2f}s de envio)")
     print(f"carga oferecida ......... {oferecida:.1f} evt/s")
     print(f"carga atingida .......... {atingida:.1f} evt/s")
     print(f"payload medio ........... {payload_medio:.1f} bytes")
@@ -253,6 +259,8 @@ def main() -> int:
                 "taxa_pedida": taxa,
                 "duracao_pedida_s": duracao,
                 "duracao_real_s": round(duracao_real, 3),
+                "duracao_envio_s": round(duracao_envio, 3),
+                "ritmo_envio_evt_s": round(envio, 2),
                 "tentados": cont.tentados,
                 "enfileirados": cont.enfileirados,
                 "nao_enfileirados": cont.nao_enfileirados,

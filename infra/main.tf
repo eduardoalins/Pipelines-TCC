@@ -124,5 +124,17 @@ resource "aws_instance" "benchmark" {
     delete_on_termination = true # o disco sai junto com a maquina
   }
 
+  # --- Autodestruicao (decisao de 24/10/2026) ---------------------------------
+  # A maquina se ENCERRA sozinha depois de var.autodestruicao_min minutos ligada,
+  # mesmo que o computador que a comanda trave ou a sessao do laboratorio acabe.
+  # O desligamento pedido de dentro vira encerramento (terminate), e o disco sai
+  # junto. Isto e a unica coisa que a maquina faz sozinha no boot: a preparacao
+  # continua por script via SSH (decisao de 19/10/2026), para a saida aparecer.
+  instance_initiated_shutdown_behavior = "terminate"
+  user_data                            = <<-FIM
+    #!/bin/bash
+    shutdown -h +${var.autodestruicao_min} "autodestruicao: ${var.autodestruicao_min} min ligada"
+  FIM
+
   tags = { Name = "tcc-benchmark" }
 }

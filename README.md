@@ -353,8 +353,12 @@ tentados ................ 6000
 confirmados pelo broker . 6000
 carga oferecida ......... 100.0 evt/s
 carga atingida .......... 100.0 evt/s
-payload medio ........... 294.0 bytes
+payload medio ........... ~281 bytes
 ```
+
+O payload médio depende também do tamanho do `run_id`, que vai em toda mensagem:
+pelo script de rodada (passo 22), com `run_id` mais longo, ele foi de 294,0 bytes;
+chamado assim, sozinho, de ~281.
 
 A janela de 6000 eventos com a seed 42 é **sempre a mesma**: linhas 27.139.042 a
 27.145.041 da base, um trecho de 20/10/2019 por volta das 12:47. O
@@ -1574,7 +1578,10 @@ inválidas iguais nos dois motores em todas as rodadas com malformados.
 
 > **A bateria abaixo foi feita com o gerador sintético** (contrato 2.2,
 > 12–13/10/2026) e **será refeita com a base real** (decisão de 23/10/2026). Os
-> números ficam como histórico até a bateria nova.
+> números ficam como histórico até a bateria nova. Os arquivos dela foram movidos
+> para `../../Informações/Resultados Local/Resultados Sinteticos/`, para a pasta
+> principal ficar livre: o `run_combination.py` não começa uma combinação cujo
+> `.txt` já esteja na pasta de saída.
 
 **Médias de referência** (Spark / Flink; latências P50 em ms; CPU média em % da
 máquina de 8 núcleos):
@@ -1766,8 +1773,8 @@ do console por cerca de uma hora e não cobra mais.
 
 A máquina nasce como um Ubuntu vazio, e é destruída ao fim de cada sessão: a
 preparação se repete em **toda** sessão. Um script a deixa igual ao WSL de
-referência, refazendo dentro dela os passos 2 a 5, 12 e 13 e a conferência do
-relógio.
+referência, refazendo dentro dela os passos 2 a 5, a preparação da base, os passos 12 e 13 e
+a conferência do relógio.
 
 **Dentro da máquina** (depois do `ssh` do passo 27):
 
@@ -1788,10 +1795,11 @@ na nuvem depois de `commit` **e** `push`.
 | 2 | Docker | **as mesmas versões do Docker Desktop do WSL**: Engine 28.0.4, containerd 1.7.26, Compose 2.34.0, buildx 0.22.0, cgroups por `cgroupfs`; os pacotes ficam travados (`apt-mark hold`) |
 | 3 | Ambiente Python | o próprio `setup_env.sh` do passo 2 |
 | 4 | As duas imagens | `docker compose build`, de novo a cada sessão; a base é travada por digest, os pacotes do Ubuntu pelo arquivo histórico (passos 5 e 12) e os jars por checksum |
-| 5 | Kafka e tópico | o mesmo `docker-compose.yml` e o `create_topic.sh` (24 partições) |
-| 6 | Cadeias | 6000 eventos (1000 evt/s por 6 s), `check_chain.py` e `check_chain_flink.py` |
-| 7 | Versões | `scripts/versoes.sh` |
-| 8 | Relógio | `check_clock.py` — fora do WSL há um sincronizador só, e ele ligado é o estado certo |
+| 5 | A base real | o `preparar_base.sh` (antes do passo 6): baixa o `.gz` da REES46 **dentro da AWS**, confere o sha256 — se não bater, para —, descompacta e conta |
+| 6 | Kafka e tópico | o mesmo `docker-compose.yml` e o `create_topic.sh` (24 partições) |
+| 7 | Cadeias | 6000 eventos **reais** pelo replayer (1000 evt/s por 6 s), `check_chain.py` e `check_chain_flink.py` |
+| 8 | Versões | `scripts/versoes.sh` |
+| 9 | Relógio | `check_clock.py` — fora do WSL há um sincronizador só, e ele ligado é o estado certo |
 
 Tudo que sai na tela vai também para `~/tcc-data/preparacao.txt`, **na máquina**,
 com o tempo de cada passo. Como o disco é apagado no `destroy`, traga o arquivo
@@ -1803,36 +1811,47 @@ scp -i ~/.ssh/labsuser.pem ubuntu@$(terraform output -raw ip_publico):tcc-data/p
 
 É a evidência de com que ambiente aquela sessão rodou.
 
-**Esperado** (máquina original, 21/10/2026), cerca de **6 minutos**:
+**Esperado** (máquina original, 24/10/2026), cerca de **8 minutos**:
 
 ```
->> [   0s] Codigo: commit a409abc — Step 10: cloud environment frozen
+>> [   0s] Codigo: commit 1e10b76 — Step 10: machine preparation downloads the real base
 >> [   0s] 1. Pacotes do sistema
 atualizacoes automaticas desligadas
 apt do host no arquivo historico de 20261018T000000Z
->> [  36s] 2. Docker
+>> [  49s] 2. Docker
 docker 28.0.4, compose 2.34.0, cgroups cgroupfs, armazenamento overlay2
->> [  54s] 3. Ambiente Python
->> [  63s] 4. Imagem do Spark
->> [ 144s] 4. Imagem do Flink
->> [ 236s] 5. Kafka
+>> [  69s] 3. Ambiente Python
+>> [  76s] 4. Imagem do Spark
+>> [ 176s] 4. Imagem do Flink
+>> [ 267s] 5. A base real
+baixando de https://data.rees46.com/datasets/marketplace/2019-Oct.csv.gz (1,7 GB)
+OK: 8ebca1ad741295297368f2cf0315e3f36853a1a11768fb16babf8c9b83838147
+OK: 42448764 eventos
+>> [ 345s] 6. Kafka
 OK: o Kafka grava no volume
 OK: ecommerce.events.v1 com 24 particoes.
->> [ 263s] 6. Gerador (6000 eventos) e as cadeias
+>> [ 375s] 7. Replayer (6000 eventos reais) e as cadeias
+janela .......... linhas 27139042 a 27145041 (seed 42)
 CADEIA COMPLETA OK
 CADEIA COMPLETA OK
->> [ 316s] 7. Versoes
->> [ 317s] 8. Relogio
+>> [ 447s] 8. Versoes
+>> [ 450s] 9. Relogio
 OK: relogio sao. Pode medir.
->> [ 357s] Maquina pronta
-disco livre .... 72G
+>> [ 490s] Maquina pronta
+disco livre .... 65G
 ```
+
+**A base, dentro da AWS:** o download de 1,7 GB levou **28 s** (~58 MB/s), e o
+passo inteiro — download, checksum, descompactação e contagem — 78 s. Nada passa
+pela sua internet. Sobram **65 GB**, acima da guarda de 50 GB do `run_round.py`.
+O posicionamento do replayer até a janela levou 11,8 s na nuvem, contra ~5 s no
+WSL; ele acontece antes do envio e não entra na medição.
 
 No build das imagens, todas as linhas `Get:` do `apt` têm de vir de
 `https://snapshot.ubuntu.com/ubuntu/20261010T200000Z` — em 21/10/2026 foram 68, e
 nenhuma do repositório normal.
 
-Somando o `apply` e o `destroy` do passo 27, cada sessão gasta uns **16 minutos**
+Somando o `apply` e o `destroy` do passo 27, cada sessão gasta uns **18 minutos**
 só para existir e deixar de existir.
 
 **Comparar com o WSL.** O `scripts/versoes.sh` roda nos dois ambientes:

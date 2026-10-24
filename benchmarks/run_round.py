@@ -95,6 +95,10 @@ sys.path.insert(0, str(REPO / "shared" / "data-generator"))
 from replayer import BASE, BASE_BYTES  # noqa: E402
 
 SEED_BASE = 41
+# A carga pedida tem de ter sido ENVIADA: abaixo de 99% dela, a rodada nao vale
+# (decisao de 24/10/2026). Sem esta regra, um replayer lento que nao descarta nada
+# deixaria valer uma rodada que nunca recebeu a carga declarada.
+CARGA_MINIMA = 0.99
 DISCO_MINIMO_GB = 50        # do MENOR entre o disco dos dados e o do repositorio
 ESPERA_PRONTO_S = 180       # ate o pipeline dizer que esta no ar
 ACOMODACAO_S = 10           # do "no ar" ate o primeiro evento
@@ -372,6 +376,12 @@ class Rodada:
             self.manifesto["posicionamento_s"] = g.get("posicionamento_s")
             if g.get("envio_inicio_ms"):
                 self.manifesto["gerador_inicio_ms"] = g["envio_inicio_ms"]
+            ritmo = g.get("ritmo_envio_evt_s")
+            self.manifesto["ritmo_envio_evt_s"] = ritmo
+            if ritmo is not None and ritmo < CARGA_MINIMA * self.carga:
+                self.motivos.append(
+                    f"o replayer enviou a {ritmo:.1f} evt/s, abaixo de "
+                    f"{CARGA_MINIMA:.0%} da carga pedida ({self.carga} evt/s)")
 
         self.passo(f"8/12 esperando a fila zerar (ate {self.duracao} s)")
         inicio = time.monotonic()
@@ -449,8 +459,10 @@ class Rodada:
         relatorio = METRICS / f"reconcile.{self.motor}.{self.run_id}.json"
         self.relatorio = json.loads(relatorio.read_text("utf-8")) if relatorio.is_file() else {}
 
-    def recursos(self) -> dict:
-        """CPU e memoria do conteiner do motor, do inicio do gerador ate a fila zerar.
+    def recursos(self, maquina: bool = False) -> dict:
+        """CPU e memoria do conteiner do motor — ou, com maquina=True, da maquina
+        inteira (linha `maquina` do coletor, decisao de 24/10/2026) —, do inicio do
+        envio ate a fila zerar.
 
         A CPU fica aqui como foi medida: em % de UM nucleo (100 = um nucleo
         inteiro; passa de 100 com mais de um). Junto com `nucleos`, no manifesto,
@@ -460,17 +472,19 @@ class Rodada:
         ini, fim = self.manifesto.get("gerador_inicio_ms"), self.manifesto.get("fila_zerou_ms")
         if not arquivos or ini is None or fim is None:
             return {}
+        quem = (lambda c: c == "maquina") if maquina else (lambda c: self.m["conteiner"] in c)
         linhas = [l for l in csv.DictReader(open(arquivos[-1], encoding="utf-8"))
-                  if self.m["conteiner"] in l["conteiner"] and ini <= int(l["amostra_ts"]) <= fim]
+                  if quem(l["conteiner"]) and ini <= int(l["amostra_ts"]) <= fim]
         if len(linhas) < 2:
             return {}
         segundos = (int(linhas[-1]["amostra_ts"]) - int(linhas[0]["amostra_ts"])) / 1000
         cpu = (int(linhas[-1]["cpu_ns"]) - int(linhas[0]["cpu_ns"])) / 1e9
         picos = [float(l["cpu_pct"]) for l in linhas if l["cpu_pct"]]
         mem = [int(l["mem_sem_cache_bytes"]) / 1048576 for l in linhas]
-        return {"cpu_media_pct": round(cpu / segundos * 100, 1), "cpu_pico_pct": round(max(picos), 1),
-                "mem_media_mib": round(sum(mem) / len(mem), 1), "mem_pico_mib": round(max(mem), 1),
-                "leituras": len(linhas)}
+        r = {"cpu_media_pct": round(cpu / segundos * 100, 1), "cpu_pico_pct": round(max(picos), 1),
+             "mem_media_mib": round(sum(mem) / len(mem), 1), "mem_pico_mib": round(max(mem), 1),
+             "leituras": len(linhas)}
+        return {f"maquina_{k}": v for k, v in r.items()} if maquina else r
 
     def fechar(self) -> None:
         self.passo("12/12 manifesto e arquivos da rodada")
@@ -481,6 +495,7 @@ class Rodada:
             "latencia_visibilidade_ms": lat.get("LAT. VISIBILIDADE"),
             "throughput_medio_evt_s": (self.relatorio.get("throughput_medio") or {}).get("evt_s"),
             **self.recursos(),
+            **self.recursos(maquina=True),
             "perdas": integ.get("perdas"), "duplicatas": integ.get("duplicatas"),
             "atrasados": self.relatorio.get("is_late"),
             "invalidas": integ.get("invalidas"), "nulas": integ.get("nulas"),

@@ -47,6 +47,19 @@ leva ~2 s e arredonda a memoria acima de 1 GiB.
   memoria  SEM o cache de arquivos (inactive_file), como o `docker stats` mostra:
            o kernel usa memoria livre para acelerar a escrita e a devolve quando
            alguem precisa. O total bruto fica na coluna ao lado.
+
+--- A maquina inteira (decisao de 24/10/2026) -------------------------------
+Com CONTAINERS, cada amostra ganha tambem uma linha `maquina`: o que a maquina
+inteira usou, contando o que roda FORA do Docker — o replayer, o coletor, o
+sistema. Na nuvem (2 vCPU) e o que mostra se uma carga nao foi aguentada porque
+a maquina chegou ao limite.
+
+  CPU      do /proc/stat: tempo OCUPADO de todos os nucleos (user, nice, system,
+           irq, softirq), na mesma unidade dos conteineres (% de um nucleo). Fica
+           de fora o tempo parado, a espera de disco (iowait) e o steal (o tempo
+           que o hipervisor deu a outras maquinas).
+  memoria  do /proc/meminfo: MemTotal - MemAvailable, o que o kernel nao
+           conseguiria devolver. Na coluna do bruto, MemTotal - MemFree.
 """
 
 import csv
@@ -143,6 +156,25 @@ def ler_recursos() -> dict[str, tuple[int, int, int, int]]:
             est.get("inactive_file", est.get("total_inactive_file", 0)),
         )
     return saida
+
+
+TICK_NS = 1_000_000_000 // os.sysconf("SC_CLK_TCK")    # um "jiffy" do /proc/stat, em ns
+
+
+def ler_maquina() -> tuple[int, int, int, int]:
+    """(instante_ns, cpu_ns, mem_bytes, cache_bytes) da maquina inteira, no mesmo
+    formato de ler_recursos(): mem - cache = memoria que nao volta ao kernel."""
+    antes = time.monotonic_ns()
+    with open("/proc/stat", encoding="ascii") as f:
+        campos = f.readline().split()           # "cpu  user nice system idle iowait irq softirq steal ..."
+    with open("/proc/meminfo", encoding="ascii") as f:
+        mem = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in f}
+    instante = (antes + time.monotonic_ns()) // 2
+    user, nice, system, _idle, _iowait, irq, softirq = (int(x) for x in campos[1:8])
+    ocupado = (user + nice + system + irq + softirq) * TICK_NS
+    bruto = mem["MemTotal"] - mem["MemFree"]
+    sem_cache = mem["MemTotal"] - mem["MemAvailable"]
+    return instante, ocupado, bruto, bruto - sem_cache
 
 
 def particoes(admin: AdminClient) -> list[int]:
@@ -263,6 +295,11 @@ def main() -> int:
                     if falhas_rec == 1:
                         print(f"  !! leitura de CPU/memoria falhou: {e} — o lag continua "
                               "sendo medido", file=sys.stderr)
+                try:
+                    lidos["maquina"] = ler_maquina()
+                except (OSError, ValueError, KeyError) as e:
+                    falhas_rec += 1
+                    print(f"  !! leitura da maquina falhou: {e}", file=sys.stderr)
                 for nome, (instante, cpu_ns, mem, cache) in sorted(lidos.items()):
                     pct = ""
                     if nome in anterior and instante > anterior[nome][0]:

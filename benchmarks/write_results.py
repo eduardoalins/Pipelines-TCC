@@ -11,8 +11,11 @@ para cada combinacao de intervalo e carga, os dois arquivos que se LEEM:
 
     INTERVALO, CARGA  opcionais, os dois juntos: so essa combinacao
                       (padrao: todas as que existem em results/)
-    SAIDA             pasta onde escrever (padrao: ../../Informações/Resultados Local,
-                      contado a partir do repositorio)
+    AMBIENTE          local | aws (padrao: local). Escolhe o titulo ("Resultados
+                      Local:" ou "Resultados AWS:"), a pasta padrao e, na aws, os
+                      campos de custo (decisoes de 24/10/2026)
+    SAIDA             pasta onde escrever (padrao: ../../Informações/Resultados Local
+                      ou .../Resultados AWS, contado a partir do repositorio)
     ORIGEM            pasta de onde ler (padrao: results/)
 
 Nenhum numero e copiado a mao: tudo sai do manifesto.json de cada rodada, gravado
@@ -49,8 +52,31 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+AMBIENTE = os.environ.get("AMBIENTE", "local").lower()
+if AMBIENTE not in ("local", "aws"):
+    sys.exit(f"AMBIENTE={AMBIENTE!r}: use local ou aws.")
+ROTULO = {"local": "Local", "aws": "AWS"}[AMBIENTE]
 ORIGEM = Path(os.environ.get("ORIGEM", REPO / "results"))
-SAIDA = Path(os.environ.get("SAIDA", REPO.parent.parent / "Informações" / "Resultados Local"))
+SAIDA = Path(os.environ.get("SAIDA", REPO.parent.parent / "Informações" / f"Resultados {ROTULO}"))
+
+# --- Custo na nuvem (variavel 6; decisoes de 24/10/2026) ------------------------
+# O custo da FATURA: o preco da maquina e do disco vezes o tempo. A EC2 cobra pelo
+# tempo ligado, nao pelo uso de CPU. Dois tempos por rodada: a RODADA INTEIRA (o
+# principal — inclui o motor subir, que tambem difere entre os modelos) e so a
+# INGESTAO (do primeiro envio ate a fila zerar). Para comparar os motores, o
+# custo da rodada por milhao de eventos.
+# Precos da tabela publica da AWS (pagina de precos do EC2/EBS), us-east-1,
+# publicada em 23/10/2026: m5.large Linux On-Demand e o gp3 (3.000 IOPS e 125 MB/s
+# de base, sem custo extra). O disco e cobrado por GB-mes, proporcional ao tempo
+# (a AWS conta 730 h por mes).
+PRECO_MAQUINA_HORA = 0.096
+PRECO_DISCO_GB_MES = 0.08
+DISCO_GB = 80
+HORAS_MES = 730
+PRECO_HORA = PRECO_MAQUINA_HORA + PRECO_DISCO_GB_MES * DISCO_GB / HORAS_MES
+PRECOS_TEXTO = ("m5.large US$ 0,096/h + gp3 US$ 0,08/GB-mês × 80 GB = US$ "
+                + f"{PRECO_HORA:.4f}".replace(".", ",")
+                + "/h (tabela pública da AWS, us-east-1, publicada em 23/10/2026)")
 
 RODADAS = range(1, 11)
 MOTORES = (("spark", "NRT"), ("flink", "RT"))
@@ -87,9 +113,20 @@ CAMPOS = (
     ("invalidas", "Inválidas", ("invalidas",), "", 0),
     ("nulas", "Nulas", ("nulas",), "", 0),
     ("descartadas", "Descartadas", ("descartadas",), "", 0),
+    # A maquina inteira, contando o que roda fora do Docker (decisao de 24/10/2026).
+    ("cpu_maq_med", "CPU da máquina média", ("maquina_cpu_media_pct",), "%", 1),
+    ("cpu_maq_pico", "CPU da máquina máximo", ("maquina_cpu_pico_pct",), "%", 1),
 )
+# So na nuvem. Nao estao no manifesto: saem de custo(), abaixo.
+CAMPOS_CUSTO = (
+    ("custo_rodada", "Custo da rodada", (), " US$", 4),
+    ("custo_ingestao", "Custo da ingestão", (), " US$", 4),
+    ("custo_milhao", "Custo por milhão de eventos", (), " US$", 4),
+)
+if AMBIENTE == "aws":
+    CAMPOS = CAMPOS + CAMPOS_CUSTO
 POR_CHAVE = {c[0]: c for c in CAMPOS}
-EM_PCT_DA_MAQUINA = ("cpu_med", "cpu_pico")
+EM_PCT_DA_MAQUINA = ("cpu_med", "cpu_pico", "cpu_maq_med", "cpu_maq_pico")
 
 
 class Parar(Exception):
@@ -139,7 +176,28 @@ def nucleos(manifesto: dict | None) -> int:
     return int((manifesto or {}).get("nucleos") or os.cpu_count())
 
 
+def custo(manifesto: dict, chave: str):
+    """O custo da fatura de uma rodada, em US$ (so na nuvem).
+
+    rodada     do primeiro passo da rodada (as conferencias) ao ultimo (o manifesto)
+    ingestao   do primeiro envio do replayer ate a fila zerar
+    milhao     o custo da rodada por milhao de eventos enviados
+    """
+    passos = [p["quando_ms"] for p in manifesto.get("passos") or []]
+    rodada_s = (max(passos) - min(passos)) / 1000 if len(passos) > 1 else None
+    if chave == "custo_rodada":
+        return rodada_s / 3600 * PRECO_HORA if rodada_s else None
+    if chave == "custo_ingestao":
+        ini, fim = manifesto.get("gerador_inicio_ms"), manifesto.get("fila_zerou_ms")
+        return (fim - ini) / 1000 / 3600 * PRECO_HORA if ini and fim and fim > ini else None
+    eventos = (manifesto.get("carga_evt_s") or 0) * (manifesto.get("duracao_s") or 0)
+    total = custo(manifesto, "custo_rodada")
+    return total / eventos * 1e6 if total is not None and eventos else None
+
+
 def valor(r: dict, chave: str):
+    if chave in ("custo_rodada", "custo_ingestao", "custo_milhao"):
+        return custo(r["manifesto"], chave) if r["manifesto"] else None
     v = (r["manifesto"] or {}).get("resultado") or {}
     for parte in POR_CHAVE[chave][2]:
         v = (v or {}).get(parte)
@@ -225,6 +283,16 @@ class Combinacao:
             return f"{self.duracoes[0]} s"
         return "DIFERENTE entre as rodadas: " + lista(f"{d} s" for d in self.duracoes)
 
+    def eventos(self) -> str:
+        """De onde vieram os eventos. Os manifestos sao apagados quando a combinacao
+        fecha: e aqui que fica registrado (decisao de 24/10/2026)."""
+        shas = sorted({m.get("base_sha256_gz") for m in self.manifestos if m.get("janela")})
+        if not shas:
+            return "gerador sintético (até o contrato 2.2)"
+        return ("base real da REES46, outubro de 2019 (sha256 do .gz "
+                + lista(f"{s[:12]}…" for s in shas if s)
+                + "), uma janela contínua de linhas por rodada")
+
     def falha_induzida(self) -> str:
         if not self.malformadas:
             return "nenhuma rodada com eventos malformados"
@@ -235,10 +303,14 @@ class Combinacao:
 
     # --- o .txt --------------------------------------------------------------------
     def txt(self) -> str:
-        linhas = [f"Resultados Local: {self.titulo()}",
+        linhas = [f"Resultados {ROTULO}: {self.titulo()}",
                   f"Intervalo de cada motor: {self.intervalo_dos_motores()}.",
                   f"Duração de cada rodada: {self.duracao()}.",
+                  f"Eventos: {self.eventos()}.",
                   f"CPU {self.cpu()}."]
+        if AMBIENTE == "aws":
+            linhas.append(f"Preços: {PRECOS_TEXTO}. Custo principal: a rodada inteira; "
+                          "o da ingestão vai do primeiro envio até a fila zerar.")
         if self.malformadas:
             linhas.append(f"Com falha induzida — {self.falha_induzida()}.")
         if self.total_validas < 2 * len(RODADAS):
@@ -267,7 +339,7 @@ class Combinacao:
 
     # --- o .md ----------------------------------------------------------------------
     def md(self) -> str:
-        L = [f"# Resultado — {self.titulo()}", "",
+        L = [f"# Resultado {ROTULO} — {self.titulo()}", "",
              f"> Gerado por `benchmarks/write_results.py` a partir de `results/{self.base.name}/`. "
              "As seções 1 a 6 são reescritas a cada geração; a seção 7 é preservada.", ""]
         L += self.cabecalho() + self.resumo() + self.por_rodada() + self.integridade()
@@ -287,10 +359,11 @@ class Combinacao:
                              for motor, sigla in MOTORES)
         if self.total_validas < 2 * len(RODADAS):
             validas += " — **INCOMPLETO**"
-        return ["## 1. Cabeçalho", "", "| | |", "|---|---|",
+        return (["## 1. Cabeçalho", "", "| | |", "|---|---|",
                 f"| Intervalo | {self.intervalo_dos_motores()} |",
                 f"| Carga | {self.carga} eventos por segundo |",
                 f"| Duração de cada rodada | {self.duracao()} |",
+                f"| Eventos | {self.eventos()} |",
                 f"| CPU | {self.cpu()} |",
                 f"| Rodadas válidas | {validas} |",
                 f"| Falha induzida | {self.falha_induzida()} |",
@@ -298,7 +371,8 @@ class Combinacao:
                 f"| Commit | {lista(f'`{c}`' for c in commits) if commits else '—'} |",
                 "| Imagens | " + (" · ".join(f"`{nome}` {lista(sorted(ids))}"
                                              for nome, ids in imagens.items()) or "—") + " |",
-                "| Desvio padrão | amostral (divide por n − 1) |", ""]
+                "| Desvio padrão | amostral (divide por n − 1) |"]
+                + ([f"| Preços | {PRECOS_TEXTO} |"] if AMBIENTE == "aws" else []) + [""])
 
     def resumo(self) -> list[str]:
         L = ["## 2. Resumo", "",
@@ -328,19 +402,36 @@ class Combinacao:
     def por_rodada(self) -> list[str]:
         negrito = (["", "Em negrito, as rodadas com eventos malformados."]
                    if self.malformadas else [])
+
+        def origem(r: dict) -> list[str]:
+            """A janela da base (linhas), ou a semente nas rodadas do gerador sintetico."""
+            j = r["manifesto"].get("janela")
+            if j:
+                return [f"{j['primeira_linha']:,}–{j['ultima_linha']:,}".replace(",", ".")]
+            return [str(r["manifesto"]["seed"])]
+
+        real = any(m.get("janela") for m in self.manifestos)
         return (["## 3. Por rodada", ""]
                 + self.tabela_rodadas(
-                    ["Semente", "Proc. P50", "Proc. P99", "Vis. P50", "Vis. P99", "Throughput",
-                     "CPU média", "CPU máx.", "Mem. pico"],
+                    ["Janela (linhas)" if real else "Semente", "Proc. P50", "Proc. P99", "Vis. P50", "Vis. P99", "Throughput",
+                     "CPU média", "CPU máx.", "CPU máquina", "Mem. pico"]
+                    + (["Custo rodada"] if AMBIENTE == "aws" else []),
                     ("proc_p50", "proc_p99", "vis_p50", "vis_p99", "thr", "cpu_med", "cpu_pico",
-                     "mem_pico"),
-                    lambda r: [str(r["manifesto"]["seed"])])
+                     "cpu_maq_med", "mem_pico") + (("custo_rodada",) if AMBIENTE == "aws" else ()),
+                    origem)
                 + negrito + [""])
 
     def integridade(self) -> list[str]:
+        if self.malformadas:
+            guarda = "informação: é o que cada motor fez com os eventos malformados."
+        elif any(m.get("janela") for m in self.manifestos):
+            guarda = ("guarda: sem eventos malformados, o esperado é zero — salvo os 2 eventos "
+                      "da base sem sessão, que saem como inválidos se caírem na janela.")
+        else:
+            guarda = "guarda: sem eventos malformados, o esperado é zero."
         return (["## 4. Integridade", "",
-                 "Perdas e duplicatas reprovam a rodada. Inválidas, nulas e descartadas são "
-                 "informação: é o que cada motor fez com os eventos malformados.", ""]
+                 f"Perdas e duplicatas reprovam a rodada. Inválidas, nulas e descartadas são {guarda}",
+                 ""]
                 + self.tabela_rodadas(
                     ["Mensagens no tópico", "Perdas", "Duplicatas", "Atrasados", "Inválidas",
                      "Nulas", "Descartadas"],

@@ -48,6 +48,17 @@ variable "disco_gb" {
   }
 }
 
+variable "autodestruicao_min" {
+  description = "Minutos depois do boot em que a maquina se encerra sozinha. 210 = 3h30, dentro da sessao de 4 h do laboratorio."
+  type        = number
+  default     = 210
+
+  validation {
+    condition     = var.autodestruicao_min >= 30 && var.autodestruicao_min <= 235
+    error_message = "Entre 30 e 235 minutos: a sessao do laboratorio dura 4 h."
+  }
+}
+
 variable "chave_ssh" {
   description = "Nome do par de chaves na AWS. O vockey vem pronto no Learner Lab."
   type        = string
