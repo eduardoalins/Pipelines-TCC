@@ -10,11 +10,12 @@
 # sessao. Tudo que sai na tela vai tambem para ~/tcc-data/preparacao.txt, com o
 # tempo de cada passo.
 #
-# Os passos sao os do README (2 a 5, 12 e 13 e o relogio), na mesma ordem:
-#   1. pacotes do sistema     5. Kafka e o topico de 24 particoes
-#   2. Docker (versoes do WSL) 6. 6000 eventos e as duas cadeias conferidas
-#   3. ambiente Python        7. versoes de tudo (scripts/versoes.sh)
-#   4. as duas imagens        8. o relogio
+# Os passos sao os do README (2 a 5, a base, 12 e 13 e o relogio), na ordem:
+#   1. pacotes do sistema      6. Kafka e o topico de 24 particoes
+#   2. Docker (versoes do WSL) 7. 6000 eventos reais e as duas cadeias
+#   3. ambiente Python         8. versoes de tudo (scripts/versoes.sh)
+#   4. as duas imagens         9. o relogio
+#   5. a base real (scripts/preparar_base.sh, CONTRATO.md 1.5)
 #
 # E idempotente: rodar de novo pula o que ja esta feito.
 #
@@ -137,8 +138,15 @@ docker compose build spark
 passo "4. Imagem do Flink"
 docker compose build flink
 
-# --- 5. Kafka e o topico ----------------------------------------------------
-passo "5. Kafka"
+# --- 5. A base real ---------------------------------------------------------
+# Desde o contrato 3.0 os eventos vem da base da REES46. O mesmo script do WSL:
+# baixa dentro da AWS (1,7 GB), confere o sha256 — se nao bater, para aqui —,
+# descompacta (5,7 GB) e confere a contagem.
+passo "5. A base real"
+bash scripts/preparar_base.sh
+
+# --- 6. Kafka e o topico ----------------------------------------------------
+passo "6. Kafka"
 docker compose up -d --wait
 if ! docker exec kafka ls /var/lib/kafka/data | grep -q meta.properties; then
   echo "ERRO: o Kafka nao esta gravando no volume (README, passo 3). Parei."
@@ -147,20 +155,21 @@ fi
 echo "OK: o Kafka grava no volume"
 bash scripts/create_topic.sh
 
-# --- 6. Eventos e as duas cadeias -------------------------------------------
-# O check_chain_flink.py exige o topico povoado. 6000 eventos, em 6 s.
-passo "6. Gerador (6000 eventos) e as cadeias"
-RATE=1000 DURATION=6 "$HOME/.venvs/tcc/bin/python" shared/data-generator/generator.py
+# --- 7. Eventos reais e as duas cadeias -------------------------------------
+# O check_chain_flink.py exige o topico povoado: 6000 eventos reais, em 6 s, pelo
+# replayer (o gerador sintetico ficou sem uso no contrato 3.0).
+passo "7. Replayer (6000 eventos reais) e as cadeias"
+RATE=1000 DURATION=6 "$HOME/.venvs/tcc/bin/python" shared/data-generator/replayer.py
 docker compose run --rm spark python scripts/check_chain.py
 docker compose run --rm flink python scripts/check_chain_flink.py
 
-# --- 7. Versoes ---------------------------------------------------------------
-passo "7. Versoes"
+# --- 8. Versoes ---------------------------------------------------------------
+passo "8. Versoes"
 bash scripts/versoes.sh
 
-# --- 8. O relogio -------------------------------------------------------------
+# --- 9. O relogio -------------------------------------------------------------
 # Fora do WSL ha um sincronizador so, e ele ligado e o estado certo.
-passo "8. Relogio"
+passo "9. Relogio"
 "$HOME/.venvs/tcc/bin/python" scripts/check_clock.py
 
 passo "Maquina pronta"
