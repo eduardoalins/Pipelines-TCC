@@ -6,7 +6,7 @@ unica do schema, que o pipeline Flink tambem le (decisao da Etapa RT-3). Assim o
 schema do Spark e o do Flink nao tem como divergir — uma mudanca so pode ser
 feita num lugar, e chega aos dois.
 
-OS DEZ CAMPOS SAO CARREGADOS COMO TEXTO (CONTRATO.md 2.0). O pipeline nao
+OS ONZE CAMPOS SAO CARREGADOS COMO TEXTO (CONTRATO.md 2.0; onze desde o 3.0). O pipeline nao
 interpreta tipo: `"user_id": 17` e `"user_id": "17"` chegam ao destino como o
 texto 17; `"seq": "abc"` chega como abc. Quem converte para o tipo do contrato —
 e decide o que fazer com o que nao converte — e o Transform, DEPOIS do Load. Os
@@ -24,7 +24,7 @@ so lendo os dados antes — o que uma consulta de streaming nao pode fazer. E o
 schema e uma INVARIANTE DE COMPARABILIDADE (CONTRATO.md secao 5): inferido, ele
 dependeria do que apareceu na amostra.
 
-Um campo ausente vira NULL. Uma mensagem que nao e JSON vira uma linha com os dez
+Um campo ausente vira NULL. Uma mensagem que nao e JSON vira uma linha com os onze
 campos nulos — o gerador nao envia mensagens assim (CONTRATO.md 2.6).
 """
 
@@ -39,7 +39,7 @@ ARQUIVO_SCHEMA = Path(__file__).resolve().parents[2] / "shared" / "schema" / "ev
 # Os tipos logicos que o contrato conhece. Nenhum e aplicado aqui — todo campo e
 # carregado como texto —, mas um tipo desconhecido no evento.json FALHA, como no
 # lado do Flink: quem converte depois do Load nao pode encontrar surpresa.
-TIPOS_CONHECIDOS = ("string", "int32", "int64", "float64")
+TIPOS_CONHECIDOS = ("string", "int32", "int64", "float64", "decimal(10,2)", "timestamp")
 
 _schema = json.loads(ARQUIVO_SCHEMA.read_text(encoding="utf-8"))
 

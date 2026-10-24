@@ -68,15 +68,18 @@ SAIDA = Path(os.environ.get("SAIDA", REPO.parent.parent / "Informações" / f"Re
 # Precos da tabela publica da AWS (pagina de precos do EC2/EBS), us-east-1,
 # publicada em 23/10/2026: m5.large Linux On-Demand e o gp3 (3.000 IOPS e 125 MB/s
 # de base, sem custo extra). O disco e cobrado por GB-mes, proporcional ao tempo
-# (a AWS conta 730 h por mes).
+# (a AWS conta 730 h por mes). O IPv4 publico da maquina (so para o SSH) tambem
+# entra na fatura: pagina de precos da VPC, conferida em 24/10/2026.
 PRECO_MAQUINA_HORA = 0.096
 PRECO_DISCO_GB_MES = 0.08
 DISCO_GB = 80
 HORAS_MES = 730
-PRECO_HORA = PRECO_MAQUINA_HORA + PRECO_DISCO_GB_MES * DISCO_GB / HORAS_MES
-PRECOS_TEXTO = ("m5.large US$ 0,096/h + gp3 US$ 0,08/GB-mês × 80 GB = US$ "
-                + f"{PRECO_HORA:.4f}".replace(".", ",")
-                + "/h (tabela pública da AWS, us-east-1, publicada em 23/10/2026)")
+PRECO_IPV4_HORA = 0.005
+PRECO_HORA = PRECO_MAQUINA_HORA + PRECO_DISCO_GB_MES * DISCO_GB / HORAS_MES + PRECO_IPV4_HORA
+PRECOS_TEXTO = ("m5.large US$ 0,096/h + gp3 US$ 0,08/GB-mês × 80 GB + IPv4 público "
+                "US$ 0,005/h = US$ " + f"{PRECO_HORA:.4f}".replace(".", ",")
+                + "/h (tabelas públicas da AWS, us-east-1: EC2/EBS publicada em "
+                "23/10/2026, VPC conferida em 24/10/2026)")
 
 RODADAS = range(1, 11)
 MOTORES = (("spark", "NRT"), ("flink", "RT"))

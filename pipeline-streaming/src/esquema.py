@@ -5,7 +5,7 @@ Os campos NAO estao escritos aqui: vem de shared/schema/evento.json, a mesma
 fonte unica que o pipeline-nrt/src/esquema.py le (decisao da Etapa RT-3). Assim
 o schema do Flink e o do Spark nao tem como divergir.
 
-OS DEZ CAMPOS SAO CARREGADOS COMO TEXTO (CONTRATO.md 2.0). O pipeline nao
+OS ONZE CAMPOS SAO CARREGADOS COMO TEXTO (CONTRATO.md 2.0; onze desde o 3.0). O pipeline nao
 interpreta tipo: `"user_id": 17` e `"user_id": "17"` chegam ao destino como o
 texto 17; `"seq": "abc"` chega como abc. Quem converte para o tipo do contrato —
 e decide o que fazer com o que nao converte — e o Transform, DEPOIS do Load. Os
@@ -35,7 +35,7 @@ ARQUIVO_SCHEMA = Path(__file__).resolve().parents[2] / "shared" / "schema" / "ev
 # Os tipos logicos que o contrato conhece. Nenhum e aplicado aqui — toda coluna
 # e STRING —, mas um tipo desconhecido no evento.json FALHA, como no lado do
 # Spark: quem converte depois do Load nao pode encontrar surpresa.
-TIPOS_CONHECIDOS = ("string", "int32", "int64", "float64")
+TIPOS_CONHECIDOS = ("string", "int32", "int64", "float64", "decimal(10,2)", "timestamp")
 
 _schema = json.loads(ARQUIVO_SCHEMA.read_text(encoding="utf-8"))
 

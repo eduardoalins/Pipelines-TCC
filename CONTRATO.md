@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 3.0 — 23/10/2026**
+**Versão 3.1 — 24/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -36,10 +36,10 @@ alteração é registrada na seção 8, com data, motivo e execuções invalidad
   "event_type": "string — da base: view | cart | purchase",
   "user_id":    "int    — da base: o usuário real",
   "product_id": "int    — da base: o produto real",
-  "amount":     "float  — da base (price): o preço do produto, em todo evento; viaja como texto",
+  "amount":     "decimal(10,2) — da base (price): o preço do produto, em todo evento; viaja como texto",
   "session_id": "string — da base (user_session)",
   "event_ts":   "int64  — epoch em MILISSEGUNDOS, momento do ENVIO",
-  "event_time": "string — da base: o instante original do evento na loja"
+  "event_time": "timestamp — da base: o instante original do evento na loja, em UTC; viaja como texto"
 }
 ```
 
@@ -482,7 +482,7 @@ método nos dois motores, **depois de converter** os campos (seção 2.7):
 
 | Contagem | Definição |
 |---|---|
-| **Inválidas** | linhas gravadas com **algum campo obrigatório nulo depois da conversão** — porque não veio, ou porque veio um texto que não converte para o tipo do contrato. Obrigatório é qualquer campo do evento menos o `amount`, que a seção 1.1 permite nulo; e o `run_id`, quando a linha está na partição nula |
+| **Inválidas** | linhas gravadas com **algum campo obrigatório nulo depois da conversão** — porque não veio, ou porque veio um texto que não converte para o tipo do contrato. **Desde a versão 3.1, os onze campos do evento são obrigatórios**, inclusive o `amount` e o `event_time`, que todo evento da base traz (um preço 0 é valor, não falta); e o `run_id`, quando a linha está na partição nula. Até a 3.0 o `amount` ficava de fora, porque o gerador sintético o deixava nulo em parte dos eventos |
 | **Nulas** | linhas gravadas com **todos** os campos do evento nulos |
 | **Descartadas** | mensagens que estavam no tópico e não viraram linha: *mensagens recebidas pelo tópico na execução − linhas no destino*, descontadas as duplicatas |
 
@@ -618,6 +618,21 @@ e os dois motores gravam o mesmo texto, igual ao da base. O tipo do contrato
 canônica no replayer foi considerado e recusado, por ser transformação antes do
 Load. Os inteiros (`user_id`, `product_id`) seguem como número: nesses os dois
 motores gravam o mesmo texto.
+
+**Desde a versão 3.1 (decisão do autor, 24/10/2026), dois tipos novos.** Com o
+`float64`, a conversão perdia de novo, depois do Load, o que a decisão acima
+protegeu na carga: `"543.10"` virava 543,1, e somas de preços em ponto flutuante
+acumulam erros pequenos. E o `event_time` em texto obrigava cada consulta a
+convertê-lo. Por isso:
+
+| Campo | Tipo até a 3.0 | Tipo desde a 3.1 | Converte quando o texto é | Senão |
+|---|---|---|---|---|
+| `amount` | `float64` | `decimal(10,2)`: exato, duas casas | um número com até 8 dígitos inteiros e até 2 casas decimais | nulo — nada é arredondado |
+| `event_time` | `string` | `timestamp`: data e hora em UTC | exatamente `AAAA-MM-DD HH:MM:SS UTC`, a forma da base | nulo |
+
+Os pipelines **não mudam**: continuam carregando os onze campos como texto, e só
+aprendem os dois nomes de tipo, para não recusarem o `evento.json`. O destino é o
+mesmo byte a byte.
 
 ---
 
@@ -1032,6 +1047,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 3.1 | 24/10/2026 | **§1.1, §2.6 e §2.7 alterados.** Dois tipos novos, para a conversão depois do Load: `amount` passa de `float64` a **`decimal(10,2)`**, exato, para `"543.10"` continuar 543,10 também depois de convertido; `event_time` passa de `string` a **`timestamp`** em UTC. **Os onze campos passam a ser obrigatórios** na contagem de inválidas: entram o `amount`, que a base traz em todo evento, e o `event_time`. Decisões do autor, ao começar o módulo de Transform. Os pipelines continuam carregando texto e só aprendem os nomes dos tipos novos | **Nenhuma medida.** O destino não muda. Nenhuma rodada do benchmark com a base real havia sido feita: só testes (23/10 local, 24/10 na nuvem) |
 | 3.0 | 23/10/2026 | **§1.5 novo; §1.1, §1.3, §1.4, §2.6, §2.7, §5, §5.1, §5.2 e §6 alterados.** Os eventos passam a ser **reais**: a base *eCommerce behavior data from multi category store* (REES46, outubro de 2019, 42.448.764 eventos, sha256 conferido), pedido da orientação. Um **replayer** substitui o gerador sintético nas rodadas: cada rodada recebe uma **janela contínua** da base, com o início sorteado pela seed da rodada, a mesma nos dois motores, carregada antes da medição. O evento ganha o 11º campo, **`event_time`**, o instante original; o `event_ts` passa a ser o instante do envio, e o `event_id`, o endereço da linha na base. Tipos de evento, preço, usuários e produtos passam a ser os da loja, como vieram. **Sem eventos malformados no benchmark.** Versão maior porque **a fonte dos dados** muda | **Todas as do benchmark.** A bateria local de 12–13/10/2026 (120 rodadas, gerador sintético) e o ensaio da nuvem de 21/10/2026 foram feitos com eventos gerados; ficam como histórico, e a bateria local **será refeita** com a base real (decisão do autor, 23/10/2026) |
 | 2.2 | 12/10/2026 | **§2.3 alterado.** O descarte de aquecimento deixa de ser a primeira unidade de progresso de cada motor e passa a ser um **tempo fixo de eventos, igual nos dois motores**: os eventos gerados nos primeiros 5 s nas rodadas de 60 s, e nos primeiros 30 s nas de 300 s. Os dois motores descartam o mesmo trecho da carga. O throughput médio segue a mesma regra | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |
 | 2.1 | 12/10/2026 | **§5.2 ampliado.** Fixado o que se varia no benchmark: **o trigger do Spark em 5 s e 30 s, com o checkpoint do Flink fixo em 5 s**; cargas de 1.000, 7.500 e 15.000 mensagens por segundo; rodadas de 60 s nas combinações de intervalo 5 e de 300 s nas de intervalo 30. Até a 2.0 o intervalo era o mesmo para os dois motores. | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |

@@ -29,11 +29,10 @@ nenhum deles.
   `.crc` e `_SUCCESS` do Spark, pastas `_temporary` — a mesma convencao de
   "arquivo oculto" que o Hadoop usa.
 - O pipeline NAO limpa eventos (ELT estrito, Etapa 7) e NAO interpreta tipos
-  (CONTRATO.md 2.0): os dez campos chegam ao destino como TEXTO. A conversao
-  para o tipo do contrato e feita AQUI, na leitura, com a mesma regra para os
-  dois motores — ver selecao_tipada(). E uma regra provisoria e sem conserto: o
-  que converte e usado, o que nao converte fica nulo. O lugar definitivo dela e
-  o modulo de Transform, a escrever.
+  (CONTRATO.md 2.0): os onze campos chegam ao destino como TEXTO. A conversao
+  para o tipo do contrato e feita na leitura, com a mesma regra para os dois
+  motores, a do modulo de Transform (shared/transform/conversao.py, desde o
+  contrato 3.1): o que converte e usado, o que nao converte fica nulo.
 - Tres contagens, pelo mesmo metodo nos dois motores: INVALIDAS, NULAS e
   DESCARTADAS. Para isso este arquivo le tambem a particao nula do destino, onde
   vao as linhas sem run_id. As duas ultimas so aparecem com mensagens que nao
@@ -54,6 +53,10 @@ import sys
 from pathlib import Path
 
 import duckdb
+
+# A regra do texto ao tipo mora no modulo de Transform (shared/transform/).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "transform"))
+from conversao import CAMPOS, NO_CAMINHO, OBRIGATORIOS, selecao_tipada  # noqa: E402
 
 DATA_DIR = Path(os.getenv("DATA_DIR", Path.home() / "tcc-data"))
 MOTOR = os.getenv("MOTOR", "spark")
@@ -82,36 +85,12 @@ ATRASO_WATERMARK_MS = 60_000
 # primeiro checkpoint do Flink as vezes tinha pouquissimos eventos.
 AQUECIMENTO_S = float(os.getenv("AQUECIMENTO_S", "5"))
 
-# --- Do texto ao tipo do contrato (CONTRATO.md 2.0) -------------------------
-# Os pipelines carregam os dez campos como TEXTO. Os tipos estao na fonte unica
-# do schema, a mesma que os dois pipelines leem.
-ARQUIVO_SCHEMA = Path(__file__).resolve().parents[1] / "schema" / "evento.json"
-
-# tipo logico -> (tipo no DuckDB, a forma que o texto precisa ter, INTEIRO).
-# A forma e conferida ANTES do cast porque o cast de texto do DuckDB e
-# complacente: '1.5' viraria o inteiro 2. Aqui '1.5' num campo inteiro nao
-# converte. O TRY_CAST cuida do que tem a forma certa e nao cabe no tipo.
-_INTEIRO = r"-?[0-9]+"
-_NUMERO = r"-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?"
-CONVERSAO = {
-    "int32": ("INTEGER", _INTEIRO),
-    "int64": ("BIGINT", _INTEIRO),
-    "float64": ("DOUBLE", _NUMERO),
-}
-
 # --- Eventos com defeito ------------------------------------------------------
 # O pipeline NAO limpa nada (ELT estrito, decisao de 11/10/2026) e nao decide o
-# que e valido: isso e contado AQUI, depois do Load.
-#
-# Campos do evento como chegam ao Parquet (CONTRATO.md 1.1). As colunas de
-# particao (run_id, dt, hh) ficam no caminho, nao no arquivo.
-CAMPOS_EVENTO = ("event_id", "seq", "gen_id", "event_type", "user_id", "product_id",
-                 "amount", "session_id", "event_ts")
-
-# Campos que um evento valido NUNCA traz nulos: todos, menos o amount, que o
-# contrato permite nulo (pageview e add_to_cart). O run_id tambem e obrigatorio,
-# mas e conferido pela pasta: quem esta na particao nula nao o tem.
-OBRIGATORIOS = tuple(c for c in CAMPOS_EVENTO if c != "amount")
+# que e valido: isso e contado AQUI, depois do Load. Os campos do evento e os
+# obrigatorios (os onze, desde o contrato 3.1) vem do modulo de conversao, que
+# os le do evento.json. O run_id e conferido pela pasta: no destino ele e o
+# caminho, nao uma coluna, e quem esta na particao nula nao o tem.
 
 # Onde cada motor grava a linha SEM run_id. O nome difere: o primeiro e o do
 # Spark, o segundo o do Flink (verificado em 11/10/2026).
@@ -170,52 +149,6 @@ def manifestos(run_id: str) -> dict[int, dict]:
     return saida
 
 
-# --- Do texto ao tipo do contrato ---------------------------------------------
-
-def selecao_tipada(con, fonte: str) -> tuple[str, list[str]]:
-    """O comeco de um SELECT que le `fonte` com os campos nos tipos do contrato.
-
-    Devolve ("SELECT * REPLACE (...), <campo> AS <campo>__txt ...", convertidos).
-    Quem chama completa com o FROM. Cada campo numerico que esta em TEXTO no
-    destino e substituido pelo valor convertido, e o texto original fica ao
-    lado, em <campo>__txt — e por ele que se conta o que nao converteu.
-
-    A regra, igual para os dois motores porque e aplicada aqui e nao neles:
-
-        inteiro   so digitos, com sinal opcional, e que caiba no tipo
-        decimal   um numero escrito por extenso ou em notacao cientifica
-        texto     como veio
-
-    O que nao converte fica NULO. Nada e consertado, arredondado ou adivinhado.
-    Um campo que ja esta tipado no arquivo (destino gravado antes do contrato
-    2.0) passa direto.
-
-    processed_ts e timestamp desde o CONTRATO.md 1.5 (2.5); antes era inteiro
-    (epoch ms). Tudo aqui trabalha em epoch ms, que e tambem como os logs de
-    progresso o guardam — entao ele e convertido na entrada.
-    """
-    tipos = {c[0]: c[1].upper() for c in con.execute(f"DESCRIBE SELECT * FROM {fonte}").fetchall()}
-    trocas, originais, convertidos = [], [], []
-    if "TIMESTAMP" in tipos.get("processed_ts", ""):
-        trocas.append("epoch_ms(processed_ts) AS processed_ts")
-    for campo in json.loads(ARQUIVO_SCHEMA.read_text(encoding="utf-8"))["campos"]:
-        nome, tipo = campo["nome"], campo["tipo"]
-        if tipo == "string":
-            continue
-        if tipo not in CONVERSAO:
-            raise ValueError(f"tipo '{tipo}' do campo '{nome}' em {ARQUIVO_SCHEMA} nao tem "
-                             f"conversao. Tipos conhecidos: string, {', '.join(CONVERSAO)}")
-        if tipos.get(nome) != "VARCHAR":
-            continue                    # ausente, ou ja tipado no arquivo
-        destino, forma = CONVERSAO[tipo]
-        trocas.append(f"CASE WHEN regexp_full_match({nome}, '{forma}') "
-                      f"THEN TRY_CAST({nome} AS {destino}) END AS {nome}")
-        originais.append(f"{nome} AS {nome}__txt")
-        convertidos.append(nome)
-    selecao = "SELECT *" + (f" REPLACE ({', '.join(trocas)})" if trocas else "")
-    return selecao + "".join(f", {o}" for o in originais), convertidos
-
-
 # --- Estatistica ------------------------------------------------------------
 
 def resumo(con, expr: str, origem: str, filtro: str = "") -> dict | None:
@@ -260,15 +193,14 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
 
         INVALIDAS    linha gravada com ALGUM campo obrigatorio nulo DEPOIS da
                      conversao — porque nao veio, ou porque veio um texto que
-                     nao converte para o tipo do contrato. Obrigatorio e
-                     qualquer campo do evento menos o amount; e o run_id,
-                     quando a linha esta na particao nula
+                     nao converte para o tipo do contrato. Obrigatorios sao os
+                     onze campos do evento (contrato 3.1); e o run_id, quando
+                     a linha esta na particao nula
         NULAS        linha gravada com TODOS os campos do evento nulos
         DESCARTADAS  mensagem que estava no topico e nao virou linha nenhuma
 
-    Limite da INVALIDAS: o amount pode ser nulo num evento valido (pageview e
-    add_to_cart), entao um amount que nao converte NAO entra nela. Ele aparece
-    na linha "texto que nao converte", que e so informacao.
+    A linha "texto que nao converte" separa, dentro das invalidas, o campo que
+    veio com texto do campo que nao veio.
 
     `"user_id": "17"` NAO e invalida: o texto 17 converte.
 
@@ -277,9 +209,9 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
     <run_id>.topico.json (gravada pelo run_round.py). Sem ela, fica
     indisponivel — nunca e estimada.
     """
-    campos = [c for c in CAMPOS_EVENTO if c in colunas]
+    campos = [c for c in CAMPOS if c in colunas and c not in NO_CAMINHO]
     tudo_nulo = " AND ".join(f"{c} IS NULL" for c in campos)
-    obrigatorios = [c for c in OBRIGATORIOS if c in colunas]
+    obrigatorios = [c for c in OBRIGATORIOS if c in colunas and c not in NO_CAMINHO]
     obrigatorio_nulo = " OR ".join(f"{c} IS NULL" for c in obrigatorios)
 
     na_pasta, nulas, invalidas = con.execute(f"""
