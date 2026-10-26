@@ -683,6 +683,7 @@ não provam que duas linhas são iguais. A repetida da origem só é achada se a
 duas cópias caírem na mesma rodada. A etapa 2 compara os seis campos que o
 evento leva; a contagem de 23/10/2026 (30.220 linhas repetidas, seção 1.5)
 comparava as nove colunas da base, inclusive marca e categoria, que não viajam.
+Na base, as duas regras dão o **mesmo número**: 30.220 (conferido em 26/10/2026).
 
 **O que o Transform não faz:** não conserta (um valor que não converte fica nulo,
 e a linha fica), não enriquece (categoria e marca dos produtos foram levantadas
@@ -693,8 +694,18 @@ e ficaram de fora, por decisão do autor), não lê a partição nula (uma linha
 da remoção de duplicatas:** o `reconcile.py` com a regra no módulo deu o mesmo
 relatório que antes, nos dois motores; a tabela tipada do Spark e a do Flink
 saíram idênticas (0 diferenças), e as duas iguais ao texto da base nos seis
-campos da loja, com os 486 preços de zero à direita preservados. **A remoção de
-duplicatas está escrita e ainda não foi testada.**
+campos da loja, com os 486 preços de zero à direita preservados.
+
+**A remoção de duplicatas, verificada em 26/10/2026:** numa bancada com uma
+duplicata técnica só no destino do Spark, uma repetida da origem, linhas
+incompletas e uma "quase igual", saíram exatamente as esperadas (Spark: 8 linhas
+lidas, 1 técnica e 1 da origem removidas; Flink: 7 lidas, 0 e 1), e as duas
+tabelas ficaram idênticas. Na base inteira, a regra dos seis campos acha as mesmas
+30.220 repetidas da regra das nove colunas, e só 2 linhas ficam fora dela por
+estarem incompletas (os 2 eventos sem sessão). Numa rodada real de cada motor
+(6.000 eventos, mesma janela), as duas tabelas tiraram 0 duplicatas técnicas e 7
+repetidas da origem — exatamente as que a base tem naquela janela — e ficaram com
+as mesmas 5.993 linhas, iguais ao texto da base.
 
 ---
 

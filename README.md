@@ -428,7 +428,7 @@ docker exec kafka /opt/kafka/bin/kafka-get-offsets.sh \
 > gerador sintético (2000 usuários uniformes): **186 e 317**. Com os usuários reais
 > da base (3 milhões, concentração baixa — `CONTRATO.md` §1.4) a expectativa é um
 > espalhamento parecido ou mais uniforme; o valor de referência será medido de novo
-> no começo da bateria local.
+> depois da bateria local refeita.
 
 O desequilíbrio entre partições é declarado no `CONTRATO.md` §1.4. Ele não ameaça
 a comparação: a rodada N recebe a **mesma janela** da base nos dois motores, então
@@ -1091,7 +1091,7 @@ OK: perdas=0  duplicatas=0  invalidas=0  nulas=0  descartadas=?
 Uma segunda execução, logo em seguida, deu 3914 e 4386 ms. Em setembro, com o
 Spark ainda no host, eram 3903 e 4298 ms. **Com a base real** (23/10/2026, pelo
 script de rodada, 100 evt/s): 3919 e 4410 ms — a mesma faixa. O bloco acima é
-**a remedir** com o replayer à mão, no começo da bateria local.
+**a remedir** com o replayer à mão, depois da bateria local refeita.
 
 A **espera no trigger** com mediana perto de **metade do trigger** (2,6 s de 5 s) é a
 aritmética do micro-batch aparecendo no dado. O programa sai com **0** se não há
@@ -1260,9 +1260,19 @@ tabela tipada ..... /home/<usuário>/tcc-data/transformado/spark/run_id=…/even
 
 Agora a saída tem também duas linhas novas, entre a tabela de campos e a tabela
 tipada: `duplicatas tecnicas removidas` e `repetidas da origem removidas`.
-**A remedir:** a remoção de duplicatas foi escrita em 24/10/2026 e ainda não rodou
-sobre uma execução real. Numa janela de 6.000 eventos, o esperado é 0 técnicas e
-poucas repetidas da origem (a base tem 0,07% de linhas repetidas).
+Medido em 26/10/2026, na mesma janela (linhas 27.139.042 a 27.145.041), nos dois
+motores:
+
+```
+duplicatas tecnicas removidas ...... 0   (mesmo event_id)
+repetidas da origem removidas ...... 7   (os seis campos da loja iguais)
+...
+5993 linhas gravadas, de 6000 lidas; 0 valores nao converteram
+```
+
+As 7 são exatamente as linhas que a base tem repetidas dentro dessa janela: as 5.993
+que ficam são as esperadas, iguais ao texto da base, e iguais nos dois motores. A
+saída acima, de 24/10, é de antes da remoção existir (6.000 linhas gravadas).
 
 **O que a tabela tipada tem:**
 
@@ -1993,7 +2003,7 @@ Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
 - [x] Os dois motores gravam os campos do evento como texto, inclusive o `event_time` do contrato 3.0, sem mudança nos pipelines
 - [x] Com a base real, os dois destinos saem idênticos entre si e iguais às linhas da base, com o preço exatamente como veio (`543.10`)
 - [x] O `transform.py` grava a tabela tipada de cada motor: `amount` em `DECIMAL(10,2)` com o `543.10` intacto, `event_time` em `TIMESTAMP`, e as duas tabelas iguais entre si e à base
-- [ ] O `transform.py` remove as duplicatas técnicas e as repetidas da origem — escrito em 24/10/2026, a testar
+- [x] O `transform.py` remove as duplicatas técnicas e as repetidas da origem: em bancada, na base (as mesmas 30.220 repetidas) e numa rodada real (7 repetidas na janela, 0 técnicas, 5.993 linhas iguais à base nos dois motores)
 - [ ] ~~Com eventos malformados, o `reconcile.py` conta 18 inválidas~~ — passo 21 aposentado no contrato 3.0 (resultado de 12/10/2026)
 - [x] O `run_round.py` fecha uma rodada válida de cada motor: 0 perdas, 0 duplicatas, fila zerada
 - [x] Nas rodadas com malformados a rodada vale, e as inválidas saem iguais nos dois motores (até o contrato 2.2)
