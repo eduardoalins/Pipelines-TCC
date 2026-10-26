@@ -53,12 +53,14 @@ tenderiam a divergir.
 | 12 a 16 | pipeline Streaming (Flink), em contêiner | Etapa RT-3 — Parquet com checkpoint |
 | antes do 17 | **conferir o relógio** — obrigatório antes de qualquer medição | Etapa 6.2 |
 | 17 a 20 | instrumento de medição, nos dois motores | Etapa 6 / RT-4 — lag, reconciliação e latências |
+| depois do 20 | **o Transform**: a tabela tipada, sem duplicatas, depois do Load | Etapa Transform (contrato 3.1) |
 | 21 | eventos malformados — **aposentado** no contrato 3.0; fica o registro do que foi medido | Etapa 7 / RT-5, revista na 8.1 |
 | 22 a 24 | o benchmark: uma rodada, as dez rodadas de uma combinação e os arquivos de resultado | Etapa 8 / RT-6 |
 | 25 | a bateria local: as seis combinações | Etapa 9 / RT-7 |
 | 26 | as ferramentas e as credenciais da nuvem | Etapa 10 — em andamento |
 | 27 | criar e destruir a máquina na AWS, com o Terraform | Etapa 10 — em andamento |
 | 28 | preparar a máquina da AWS: Docker, imagens, Kafka e conferências | Etapa 10 — em andamento |
+| 29 | uma sessão inteira na nuvem, num comando: combinação oficial ou ensaio de cargas, com autodestruição | Etapa 10 — em andamento |
 
 **Por que isso existe.** Reprodutibilidade é critério declarado do trabalho. Um
 ambiente que só funciona porque comandos foram digitados uma vez, numa máquina
@@ -1446,7 +1448,7 @@ combinação fechar (passo 23):
 | Arquivo | O quê |
 |---|---|
 | `manifesto.json` | a rodada inteira: parâmetros, seed, **janela da base**, commit do código, imagens, relógio, cada passo com horário, códigos de saída e os números |
-| `metrics/lag.*.csv`, `metrics/recursos.*.csv` | a fila, a CPU e a memória, uma amostra por segundo |
+| `metrics/lag.*.csv`, `metrics/recursos.*.csv` | a fila, a CPU e a memória, uma amostra por segundo — por contêiner e, desde 24/10/2026, uma linha `maquina` com a máquina inteira |
 | `spark.progresso.*.jsonl` | o log de progresso do motor |
 | `reconcile.txt` e `reconcile.spark.*.json` | o relatório do reconciliador |
 | `pipeline.txt`, `replayer.txt` (`gerador.txt` até o 3.0), `coletor.txt`, `relogio.txt` | as telas de cada programa |
@@ -1457,6 +1459,29 @@ fica, para investigar. `MANTER_PARQUET=1` guarda sempre.
 
 Sai com **0** se a rodada vale; **1** se não vale, e o `manifesto.json` diz por
 quê; **2** se nem começou.
+
+**Quando uma rodada não vale.** Qualquer um destes motivos, que o manifesto
+registra por extenso:
+
+- o pipeline caiu, durante o envio ou enquanto esvaziava a fila;
+- o replayer saiu com erro;
+- **o replayer enviou abaixo de 99% da carga pedida** (decisão de 24/10/2026) — a
+  rodada mediria outra carga, não a da combinação. O ritmo de envio fica no
+  manifesto (`ritmo_envio_evt_s`) e aparece na tela do replayer;
+- a fila não zerou no tempo de espera;
+- o pipeline não obedeceu ao arquivo de parada, ou saiu com erro;
+- o reconciliador achou perda ou duplicata entre os eventos válidos.
+
+A regra dos 99% nasceu do ensaio da nuvem de 21/10/2026, em que a máquina da AWS não
+conseguiu enviar 15.000 evt/s: sem ela, a rodada "valeria" com menos carga do que a
+pedida. No WSL ela nunca disparou.
+
+**A máquina inteira** (desde 24/10/2026). Além da CPU e da memória de cada
+contêiner, o coletor lê a **máquina inteira** pelo `/proc/stat` e pelo
+`/proc/meminfo` — o que inclui o Kafka, o replayer e o próprio coletor, que rodam
+fora do contêiner do motor. Na AWS, com tudo numa máquina de 2 núcleos, é o número
+que diz se a máquina estava no limite. Conferido contra consumo conhecido no WSL:
+0,3%, 100,1% e 200,3% de um núcleo para zero, um e dois laços ocupando a CPU.
 
 ---
 
@@ -1598,7 +1623,28 @@ Rodada 1 NRT: Latência de processamento P50 - 18624 ms, Latência de processame
 - a **CPU** sai em **% da máquina inteira**, média e máximo: o que o coletor mede em
   % de um núcleo, dividido pelo número de núcleos que o Docker enxerga (8 na
   máquina original, gravado no manifesto de cada rodada). 100% são todos os
-  núcleos ocupados (decisão de 12/10/2026).
+  núcleos ocupados (decisão de 12/10/2026);
+- desde 24/10/2026, também a **CPU da máquina** inteira, média e máximo, na mesma
+  escala (passo 22) — por rodada, no `.md`, na coluna "CPU máquina";
+- desde a base real, uma linha **"Eventos:"** diz de onde vieram (a base, com o
+  começo do sha256), e a tabela por rodada do `.md` mostra a **janela** de cada
+  rodada (ex. `27.139.042–27.145.041`) no lugar da seed.
+
+**Os resultados da nuvem** (decisões de 24/10/2026). Com `AMBIENTE=aws` o
+programa escreve "Resultados AWS" no título, grava por padrão em
+`../../Informações/Resultados AWS` e acrescenta o **custo**:
+
+| Campo | Como é calculado |
+|---|---|
+| Custo da rodada — **o principal** | preço por hora × a rodada inteira, do primeiro ao último passo: o tempo de o motor subir também é uma diferença de modelo |
+| Custo da ingestão | preço por hora × do primeiro envio até a fila zerar |
+| Custo por milhão de eventos | o custo da rodada ÷ (carga × duração) × 1 milhão — para comparar os motores |
+
+O preço por hora é o da fatura: m5.large US$ 0,096/h + disco gp3 de 80 GB (US$ 0,08
+por GB-mês) + IPv4 público US$ 0,005/h = **US$ 0,1098/h**, das tabelas públicas
+da AWS em us-east-1 (EC2/EBS publicada em 23/10/2026, VPC conferida em 24/10/2026).
+A EC2 cobra pelo tempo ligada, não pelo uso de CPU. A linha "Preços:" do `.txt` e o
+cabeçalho do `.md` citam os valores e a fonte.
 
 Nenhum número é copiado à mão, e rodar de novo com as mesmas rodadas escreve
 exatamente os mesmos arquivos.
@@ -1849,6 +1895,19 @@ do console por cerca de uma hora e não cobra mais.
 > **Se o seu IP mudar**, o SSH para de entrar. Um novo `terraform apply` lê o IP
 > atual e atualiza só a regra, sem recriar a máquina.
 
+**A máquina se destrói sozinha** (decisão de 24/10/2026). Ela nasce com um
+desligamento agendado para **210 minutos (3h30) depois de ligar**, e um
+desligamento pedido de dentro vira **encerramento**: a máquina some, e o disco
+junto. Mesmo que o seu computador trave ou a sessão do laboratório acabe no meio,
+ela não fica ligada cobrando. A rede (VPC, sub-rede, regra de SSH) não cobra, mas
+continua sobrando até o próximo `terraform destroy`.
+
+É a única coisa que a máquina faz sozinha ao ligar (uma linha de `user_data`); a
+preparação continua sendo por SSH (passo 28), para a saída aparecer na tela. Para
+outro tempo: `terraform apply -var autodestruicao_min=120` — o Terraform recusa
+menos de 30 ou mais de 235 minutos (a sessão do laboratório dura 4 h). Para ver o
+horário marcado, dentro da máquina: `sudo shutdown --show`.
+
 ---
 
 ## Passo 28 — Preparar a máquina da AWS
@@ -1973,9 +2032,109 @@ congelado, qualquer pessoa consegue montar de novo.
 
 ---
 
+## Passo 29 — Uma sessão inteira na nuvem
+
+Os passos 27 e 28, mais as rodadas e a volta dos arquivos, num comando só, rodado
+no WSL (decisão de 24/10/2026). Ele não precisa de ninguém olhando: as rodadas
+correm **dentro da máquina**, desligadas do SSH, e continuam mesmo que a conexão
+caia ou o seu computador trave.
+
+**Antes:** o código publicado no GitHub (a máquina clona de lá) e o ritual das
+credenciais do passo 26, com o **Start Lab apertado agora** — o relógio da sessão
+recomeça em 4 h, e as credenciais vencem com ela.
+
+**Uma combinação oficial por sessão:**
+
+```bash
+INTERVALO=5 CARGA=1000 DURACAO=60 bash scripts/sessao_aws.sh
+```
+
+`RODADAS=1,2,3,4,5` faz só parte das rodadas — para uma combinação que não cabe
+numa sessão (abaixo).
+
+**O ensaio de cargas**, várias cargas numa sessão, para escolher as cargas da
+nuvem (não entra nos resultados oficiais):
+
+```bash
+CARGAS="1000 2500 5000 7500" bash scripts/sessao_aws.sh
+```
+
+Em cada carga, subindo, uma rodada de cada motor nos dois intervalos com as
+durações oficiais (`PARES`, padrão `5:60 30:300`); termina a carga em que algo
+falhar e não sobe mais.
+
+**O que ele faz, em ordem:**
+
+| | |
+|---|---|
+| 1 | confere as credenciais, o commit publicado e se tudo **cabe antes da autodestruição**; se não couber, não começa |
+| 2 | `terraform apply` (passo 27) |
+| 3 | a preparação (passo 28) |
+| 4 | lança as rodadas dentro da máquina, com `AMBIENTE=aws` |
+| 5 | mostra a rodada em andamento a cada 5 minutos |
+| 6 | traz os arquivos (abaixo) |
+| 7 | `terraform destroy` e a conferência — **sempre**, mesmo se algo falhar no meio |
+
+**O que volta, e para onde:**
+
+| | Para onde |
+|---|---|
+| O `.txt` e o `.md` de uma combinação que **fechou** | `../../Informações/Resultados AWS/` |
+| O material bruto de uma combinação que **não fechou** | `~/tcc-data/bruto_aws/<combinação>.tgz` |
+| O material bruto e o resumo do **ensaio** (`ensaio.txt`, uma linha por rodada) | `~/tcc-data/sessoes_aws/<data>_Ensaio/` |
+| As telas da sessão, da preparação e das rodadas | `~/tcc-data/sessoes_aws/<data>_<combinação>/` |
+
+**Uma combinação em duas sessões.** A estimativa de tempo do passo 1 é de ~1,1 ×
+a duração + 85 s por rodada, com 30% de folga, mais 15 minutos de preparação. Uma
+combinação de 300 s cabe por pouco (~194 de 200 minutos); se não couber, rode
+`RODADAS=1,2,3,4,5` numa sessão e `RODADAS=6,7,8,9,10` noutra. O material bruto da
+primeira sessão fica em `~/tcc-data/bruto_aws/` e **volta para a máquina** na
+segunda, antes de começar: o `run_combination.py` vê as rodadas já válidas e fecha
+a combinação quando as 20 estiverem prontas. O material bruto do ensaio **nunca**
+vai para `bruto_aws/`, para não entrar numa combinação oficial de mesmo nome.
+
+**Esperado** (teste de 24/10/2026, `INTERVALO=5 CARGA=100 DURACAO=60 RODADAS=1`):
+
+```
+===== 1. Conferencias (14:36:46)
+credenciais OK
+a maquina vai rodar o publicado: 76935de Step 10: Config updates
+  intervalo 5 s, carga 100 evt/s, 60 s: 2 rodadas de ~151 s
+===== 2. terraform apply (14:36:50)
+Apply complete! Resources: 7 added, 0 changed, 0 destroyed.
+maquina no ar; autodestruicao: Shutdown scheduled for Sat 2026-10-24 21:11:28 UTC, ...
+===== 3. Preparacao ...
+OK: relogio sao. Pode medir.
+===== 4. Combinacao Intervalo5Carga100 (rodadas 1), dentro da maquina (14:49:41)
+  (14:50) --- [1/2] rodada 01, spark ----------------------------------------
+  (14:55) RODADA VALIDA.
+===== 5. A combinacao terminou (15:00:06)
+===== 6. Trazendo os arquivos (15:00:07)
+combinacao AINDA ABERTA: material bruto guardado em /home/<usuário>/tcc-data/bruto_aws/Intervalo5Carga100.tgz para a proxima sessao
+===== 7. terraform destroy (15:00:19)
+Destroy complete! Resources: 7 destroyed.
+i-0578d829a3133d354	terminated
+```
+
+Trinta minutos ao todo, uns US$ 0,05. As duas rodadas valeram, com o replayer a
+100,02 evt/s; a máquina inteira chegou ao teto de 2 núcleos (200%) em algum momento
+das duas, mesmo a 100 evt/s. O `.tgz` desse teste foi apagado depois.
+
+**Ainda não exercitados:** a volta do material bruto numa segunda sessão e o
+fechamento de uma combinação na nuvem — o primeiro par de sessões de uma combinação
+oficial os testa. O modo ensaio foi testado sem a AWS (o laço, com um
+`run_combination` falso, e o resumo, com manifestos de teste).
+
+> **Um travamento do seu computador não deixa a máquina cobrando**: as rodadas
+> seguem, e a autodestruição (passo 27) a encerra. Mas o `destroy` da rede e a
+> volta dos arquivos dependem do script: se ele morrer, rode `terraform destroy` à
+> mão, e os arquivos da sessão se perdem com a máquina.
+
+---
+
 ## Verificação final
 
-Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
+Se os vinte e nove passos acima funcionaram, o ambiente está reproduzido:
 
 - [x] `free -h` mostra o teto configurado da VM
 - [x] `docker compose ps` mostra o broker `healthy`
@@ -2015,6 +2174,11 @@ Se os vinte e oito passos acima funcionaram, o ambiente está reproduzido:
 - [x] O `terraform apply` cria 7 recursos, o SSH entra numa `m5.large` com 2 núcleos, e o `terraform destroy` apaga os 7 sem deixar sobra
 - [x] O `preparar_maquina.sh` deixa a máquina pronta em ~6 minutos, com o mesmo Docker do WSL, as duas cadeias completas e o relógio são
 - [x] O `apt` das imagens e o do host leem só do arquivo histórico do Ubuntu, e as versões de dentro das imagens saem iguais às da bateria local
+- [x] A máquina da AWS nasce com a autodestruição marcada para 3h30 depois de ligar (`sudo shutdown --show`)
+- [x] O `sessao_aws.sh` faz uma sessão inteira sozinho — apply, preparação, rodadas dentro da máquina, volta dos arquivos e destroy — e guarda o material bruto de uma combinação que não fechou
+- [x] A rodada registra o ritmo de envio do replayer e a CPU da máquina inteira (conferida contra 0, 1 e 2 núcleos ocupados)
+- [ ] Uma combinação da nuvem em duas sessões, fechada com os custos no `.txt` — o primeiro par de sessões oficiais testa
+- [ ] O ensaio de cargas da nuvem (`CARGAS=…`) — testado sem a AWS; roda no ensaio
 
 ---
 
@@ -2109,6 +2273,7 @@ scripts/check_clock.py    confere o relógio antes de medir         (Etapa 6.2)
 scripts/preparar_base.sh  baixa, confere e descompacta a base real (Etapa 9.1)
 scripts/setup_aws_tools.sh  instala o Terraform e a AWS CLI no WSL   (Etapa 10)
 scripts/preparar_maquina.sh prepara a máquina da AWS, dentro dela    (Etapa 10)
+scripts/sessao_aws.sh     uma sessão inteira na nuvem, do apply ao destroy (Etapa 10)
 scripts/versoes.sh        versões do Docker e de dentro das imagens, para comparar ambientes
 shared/                   ARNÊS COMPARTILHADO — Spark e Flink usam igual
   schema/evento.json      fonte única do schema — lida pelos dois  (RT-3)
@@ -2145,8 +2310,8 @@ benchmarks/               o benchmark                              (Etapas 8 e 9
   write_results.py        escreve o .txt e o .md de cada combinação
 infra/                    Terraform: rede, acesso e a máquina na AWS (Etapa 10)
   versions.tf             Terraform 1.16.4 e os plugins; o .terraform.lock.hcl trava as versões
-  variables.tf            região, tipo, disco e chave — com as guardas dos limites do laboratório
-  main.tf                 VPC, sub-rede, rotas, regra de SSH, imagem do Ubuntu e a máquina
+  variables.tf            região, tipo, disco, chave e autodestruição — com as guardas dos limites do laboratório
+  main.tf                 VPC, sub-rede, rotas, regra de SSH, imagem do Ubuntu e a máquina, com a autodestruição
   outputs.tf              IP, comando de SSH e a imagem usada
 results/                  material bruto das rodadas — fora do git, apagado ao fechar a combinação
 ```
@@ -2203,6 +2368,13 @@ Em 24/10/2026 o **T** do ELT deixou de ser só declarado (contrato 3.1): o módu
 `shared/transform/` converte o texto do destino para os tipos do contrato — o
 preço em decimal exato, o instante original em data e hora — e grava uma tabela
 tipada por execução, sem duplicatas, depois do Load e fora da medição.
+
+No mesmo dia a Etapa 10 ganhou o que faltava para as rodadas da nuvem: a regra dos
+99% (uma rodada em que o replayer não envia a carga pedida não vale), a CPU da
+máquina inteira, o custo de cada rodada nos arquivos de resultado e o
+`sessao_aws.sh`, que faz uma sessão inteira sozinho, com a máquina se destruindo
+em 3h30 se algo der errado. Falta o ensaio de cargas, para escolher as cargas da
+nuvem.
 
 ### Pipeline Streaming (Flink) — `planoRT.md`
 
@@ -2266,6 +2438,9 @@ tipada por execução, sem duplicatas, depois do Load e fora da medição.
       Contrato 3.0
 - [ ] **Etapa 10** — Terraform e AWS: ferramentas, Terraform e preparação da
       máquina feitos e testados, ambiente da nuvem congelado; o ensaio de carga
-      mostrou que uma `m5.large` com tudo dentro não aguenta 15.000 evt/s
+      mostrou que uma `m5.large` com tudo dentro não aguenta 15.000 evt/s. Em
+      24/10: regra dos 99%, CPU da máquina inteira, custo por rodada e o
+      `sessao_aws.sh` com autodestruição, testado numa sessão real. Falta o
+      ensaio de cargas e a escolha das cargas da nuvem
 - [ ] **Etapa 11** — Benchmarks oficiais
 - [ ] **Etapa 12** — Análise e guia de decisão
