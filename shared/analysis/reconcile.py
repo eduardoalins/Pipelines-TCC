@@ -65,6 +65,15 @@ BASE = Path(os.getenv("BASE", DATA_DIR / "out" / MOTOR))
 EVENTOS = BASE / "events"
 METRICS = DATA_DIR / "metrics"
 
+# Teto de memoria do DuckDB (decisao de 27/10/2026). Sem ele, o DuckDB usa ate
+# ~80% da memoria do WSL, e uma rodada de dezenas de milhoes de eventos, com o
+# Kafka ligado ao lado, pode derrubar o WSL (aconteceu em 24/10/2026 com uma
+# consulta sobre a base inteira). Com ele, o que nao cabe vai para o disco; se nem
+# assim couber, sai um erro de memoria, e a rodada nao vale — o WSL fica de pe.
+# Nao muda nenhum numero.
+MEMORIA_DUCKDB = os.getenv("DUCKDB_MEMORIA", "1.5GB")
+TEMP_DUCKDB = DATA_DIR / "duckdb_tmp"
+
 # CONTRATO.md 2.1: watermark = maximo ACUMULADO de event_ts menos 60 s.
 ATRASO_WATERMARK_MS = 60_000
 
@@ -449,6 +458,7 @@ def main() -> int:
         return 2
 
     con = duckdb.connect()
+    con.execute(f"SET memory_limit = '{MEMORIA_DUCKDB}'; SET temp_directory = '{TEMP_DUCKDB}'")
     # filename = true: cada linha traz o arquivo de onde veio. No Flink e ele
     # que liga o evento ao instante de visibilidade (CONTRATO.md 1.6, 2.2).
     con.execute(f"""

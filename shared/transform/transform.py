@@ -72,6 +72,11 @@ RUN_ID = os.getenv("RUN_ID", "")
 EVENTOS = DATA_DIR / "out" / MOTOR / "events"
 SAIDA = DATA_DIR / "transformado" / MOTOR / f"run_id={RUN_ID}"
 
+# Teto de memoria do DuckDB, o mesmo do reconcile.py (decisao de 27/10/2026): o
+# que nao cabe vai para o disco, em vez de derrubar o WSL.
+MEMORIA_DUCKDB = os.getenv("DUCKDB_MEMORIA", "1.5GB")
+TEMP_DUCKDB = DATA_DIR / "duckdb_tmp"
+
 # Os campos que vem da loja (CONTRATO.md 1.5): os que dizem se duas linhas sao o
 # mesmo evento repetido na origem.
 DA_LOJA = ("event_time", "event_type", "product_id", "user_id", "amount", "session_id")
@@ -103,6 +108,7 @@ def main() -> int:
         return 2
 
     con = duckdb.connect()
+    con.execute(f"SET memory_limit = '{MEMORIA_DUCKDB}'; SET temp_directory = '{TEMP_DUCKDB}'")
     lista = "[" + ", ".join("'" + str(a).replace("'", "''") + "'" for a in arqs) + "]"
     con.execute(f"CREATE VIEW bruto AS SELECT * FROM read_parquet({lista}, hive_partitioning = true)")
     colunas = {c[0] for c in con.execute("DESCRIBE bruto").fetchall()}
