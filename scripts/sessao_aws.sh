@@ -10,9 +10,10 @@
 #
 #   ENSAIO — varias cargas numa sessao, para escolher as cargas da nuvem:
 #     CARGAS="1000 2500 5000 7500" bash scripts/sessao_aws.sh
-#       Uma rodada de cada motor por carga, nos dois intervalos com as duracoes
-#       oficiais (PARES, padrao "5:60 30:300"), subindo. Termina a carga em que
-#       algo falhar e nao sobe mais. Nada do ensaio entra nos resultados oficiais:
+#       Uma rodada de cada motor por carga, nos pares intervalo:duracao de PARES
+#       (padrao "5:60 30:300"), subindo. Roda TODAS as cargas, mesmo depois de
+#       uma falha (27/10/2026); so um problema do ambiente para o ensaio. Nada do
+#       ensaio entra nos resultados oficiais:
 #       o material bruto e o resumo ficam so nos registros da sessao.
 #
 # Antes: o codigo publicado no GitHub (a maquina clona de la) e o ritual das
@@ -210,21 +211,18 @@ PY_MAQ='$HOME/.venvs/tcc/bin/python -u benchmarks/run_combination.py'
 if [ "$ENSAIO" = 1 ]; then
   passo "4. Ensaio: cargas $CARGAS, dentro da maquina"
   # O laco roda na maquina. Codigo 2 do run_combination.py = problema do
-  # ambiente: para tudo. Codigo 1 = alguma rodada nao valeu: termina a carga
-  # atual (os dois intervalos) e nao sobe mais.
+  # ambiente: para tudo. Codigo 1 = alguma rodada nao valeu: segue para a
+  # proxima carga mesmo assim (decisao de 27/10/2026) — os motores se separam
+  # muito, e parar na primeira falha esconderia o maximo do outro motor. Ate
+  # entao (24/10) o ensaio parava na primeira carga que falhava.
   "${SSH[@]}" "cat > ensaio_aws.sh" <<FIM || exit 1
 cd \$HOME/Pipelines-TCC || exit 1
-carga_falhou=""
 while read -r i c d; do
-  if [ -n "\$carga_falhou" ] && [ "\$c" != "\$carga_falhou" ]; then
-    echo "##### a carga \$carga_falhou falhou: o ensaio para aqui"; break
-  fi
   echo "##### ensaio: intervalo \$i s, carga \$c evt/s, \$d s"
   AMBIENTE=aws SAIDA=\$HOME/resultados INTERVALO=\$i CARGA=\$c DURACAO=\$d RODADAS=1 $PY_MAQ < /dev/null
   codigo=\$?
   echo "##### codigo \$codigo"
   [ \$codigo -eq 2 ] && { echo "##### problema do ambiente: o ensaio para aqui"; exit 2; }
-  [ \$codigo -ne 0 ] && carga_falhou=\$c
 done <<'LISTA'
 $COMBOS
 LISTA
