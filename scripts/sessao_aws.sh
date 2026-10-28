@@ -108,29 +108,42 @@ if [ "$ESTIMADO_MIN" -gt $(( AUTODESTRUICAO_MIN - 10 )) ]; then
 fi
 
 # --- 6 e 7. O fim, sempre -------------------------------------------------------
-# O resumo do ensaio: uma linha por rodada, lida dos manifestos trazidos.
+# O resumo do ensaio: uma linha por rodada, lida dos manifestos trazidos, com a
+# classificacao do ensaio local (decisao de 27/10/2026):
+#   ACOMPANHOU    rodada valida e fila zerada em ate 120 s depois do fim do envio
+#   CORREU ATRAS  rodada valida, mas a fila levou mais que isso
+#   NAO AGUENTOU  rodada invalida
 resumir_ensaio() {
   local d; d=$(mktemp -d)
   tar xzf "$REGISTRO/bruto.tgz" -C "$d" && python3 - "$d" > "$REGISTRO/ensaio.txt" <<'PY'
 import json, re, sys
 from pathlib import Path
-print(f"{'intervalo':>9} {'carga':>6} {'motor':<6}{'pasta':<12}{'vale':<5}{'envio':>8} {'thr':>8}"
-      f" {'proc P50':>9} {'vis P50':>9} {'CPU motor':>9} {'maq med':>8} {'maq pico':>8}  motivos")
+print(f"{'intervalo':>9} {'carga':>6} {'motor':<6}{'pasta':<12}{'classe':<13}{'fila s':>7} {'esperas':>8}"
+      f" {'envio':>8} {'thr':>8} {'proc P50':>9} {'vis P50':>9} {'CPU motor':>9} {'maq med':>8}"
+      f" {'maq pico':>8} {'mem MiB':>8}  motivos")
 linhas = []
 for m in Path(sys.argv[1]).glob("results/Intervalo*Carga*/*/rodada-*/manifesto.json"):
     i, c = map(int, re.findall(r"\d+", m.parts[-4]))
     j = json.loads(m.read_text("utf-8")); r = j.get("resultado") or {}
+    fila = (j.get("fila") or {}).get("espera_s")
+    classe = ("NAO AGUENTOU" if not j.get("valida")
+              else "ACOMPANHOU" if fila is not None and fila <= 120 else "CORREU ATRAS")
+    gen = next(m.parent.glob("*.gen0.json"), None)
+    esperas = json.loads(gen.read_text("utf-8")).get("esperas_fila_cheia", "-") if gen else "-"
     p50 = lambda k: (r.get(k) or {}).get("p50", "-")
-    linhas.append((c, i, m.parts[-3], m.parts[-2], "sim" if j.get("valida") else "NAO",
+    linhas.append((c, i, m.parts[-3], m.parts[-2], classe, "-" if fila is None else fila, esperas,
                    j.get("ritmo_envio_evt_s", "-"), r.get("throughput_medio_evt_s", "-"),
                    p50("latencia_processamento_ms"), p50("latencia_visibilidade_ms"),
                    r.get("cpu_media_pct", "-"), r.get("maquina_cpu_media_pct", "-"),
-                   r.get("maquina_cpu_pico_pct", "-"), "; ".join(j.get("motivos") or [])))
+                   r.get("maquina_cpu_pico_pct", "-"), r.get("mem_pico_mib", "-"),
+                   "; ".join(j.get("motivos") or [])))
 for c, i, motor, pasta, *resto in sorted(linhas, key=lambda l: l[:4]):
     v = [str(x) for x in resto]
-    print(f"{i:>9} {c:>6} {motor:<6}{pasta:<12}{v[0]:<5}{v[1]:>8} {v[2]:>8} {v[3]:>9} {v[4]:>9}"
-          f" {v[5]:>9} {v[6]:>8} {v[7]:>8}  {v[8]}")
+    print(f"{i:>9} {c:>6} {motor:<6}{pasta:<12}{v[0]:<13}{v[1]:>7} {v[2]:>8} {v[3]:>8} {v[4]:>8}"
+          f" {v[5]:>9} {v[6]:>9} {v[7]:>9} {v[8]:>8} {v[9]:>8} {v[10]:>8}  {v[11]}")
 print("\nCPU em % de UM nucleo (a m5.large tem 2: o teto e 200). envio = ritmo do replayer, evt/s.")
+print("fila s = segundos para a fila zerar depois do fim do envio; esperas = vezes que o replayer")
+print("esperou a fila do produtor (em vez de descartar).")
 PY
   rm -rf "$d"
   cat "$REGISTRO/ensaio.txt"
