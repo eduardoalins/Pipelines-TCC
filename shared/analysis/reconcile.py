@@ -47,6 +47,7 @@ Invalidas, nulas e descartadas sao reportadas, mas NAO reprovam: no benchmark, 4
 das 10 rodadas de cada combinacao levam eventos malformados de proposito.
 """
 
+import atexit
 import json
 import os
 import sys
@@ -71,7 +72,19 @@ METRICS = DATA_DIR / "metrics"
 # consulta sobre a base inteira). Com ele, o que nao cabe vai para o disco; se nem
 # assim couber, sai um erro de memoria, e a rodada nao vale — o WSL fica de pe.
 # Nao muda nenhum numero.
-MEMORIA_DUCKDB = os.getenv("DUCKDB_MEMORIA", "1.5GB")
+#
+# O teto so vale para o que o DuckDB guarda; cada linha de execucao paralela
+# usa memoria propria, fora dele. Com 1,5 GB e as 8 linhas padrao, uma rodada de
+# 36 milhoes de eventos levou a maquina a 3,4 GB de 3,9 — sem o Kafka (medido em
+# 27/10/2026). Por isso 1 GB e 2 linhas; nenhuma conta depende da ordem das
+# linhas, entao a ordem de insercao tambem nao e preservada.
+#
+# As tabelas montadas aqui (`ev`, `lat`) ficam num ARQUIVO temporario, nao na
+# memoria: num banco so em memoria o que e guardado em tabela nao vai para o
+# disco, e o teto deixava de valer (2,2 GB com teto de 1 GB, 27/10/2026). O
+# arquivo e apagado no fim de cada execucao.
+MEMORIA_DUCKDB = os.getenv("DUCKDB_MEMORIA", "1GB")
+LINHAS_DUCKDB = int(os.getenv("DUCKDB_LINHAS", "2"))
 TEMP_DUCKDB = DATA_DIR / "duckdb_tmp"
 
 # CONTRATO.md 2.1: watermark = maximo ACUMULADO de event_ts menos 60 s.
@@ -161,17 +174,51 @@ def manifestos(run_id: str) -> dict[int, dict]:
 # --- Estatistica ------------------------------------------------------------
 
 def resumo(con, expr: str, origem: str, filtro: str = "") -> dict | None:
-    """P50, P95, P99, media, min e max de uma expressao em milissegundos."""
+    """P50, P95, P99, media, min e max de uma expressao em milissegundos.
+
+    Pelas CONTAGENS de cada valor, nao pelos valores um a um (decisao de
+    27/10/2026). O quantile_cont do DuckDB guarda todos os valores de uma vez, fora
+    do teto de memoria: com 42 milhoes de eventos, o reconcile passou de 2,4 GB.
+    As latencias sao inteiras, em ms, e se repetem muito — umas poucas dezenas de
+    milhares de valores distintos —, entao a tabela "valor -> quantas vezes" e
+    pequena seja qual for o tamanho da rodada.
+
+    O percentil sai pela MESMA regra do quantile_cont (interpolacao linear,
+    como o percentile_cont do SQL): a posicao (n - 1) * q na lista ordenada; se
+    cai entre dois valores, o de baixo mais a fracao da diferenca. Mesmos numeros
+    (verificado contra a versao anterior em 27/10/2026).
+    """
     onde = f"WHERE x IS NOT NULL {('AND ' + filtro) if filtro else ''}"
-    r = con.execute(f"""
-        SELECT count(x), quantile_cont(x, 0.5), quantile_cont(x, 0.95),
-               quantile_cont(x, 0.99), avg(x), min(x), max(x)
-        FROM (SELECT {expr} AS x, * FROM {origem}) {onde}
-    """).fetchone()
-    if not r[0]:
+    contagem = con.execute(f"""
+        SELECT x, count(*) FROM (SELECT {expr} AS x, * FROM {origem}) {onde}
+        GROUP BY x ORDER BY x
+    """).fetchall()
+    n = sum(c for _, c in contagem)
+    if not n:
         return None
+
+    def no_lugar(posicao: int):
+        """O valor na posicao `posicao` (a partir de 0) da lista ordenada."""
+        vistos = 0
+        for valor, c in contagem:
+            vistos += c
+            if posicao < vistos:
+                return valor
+        return contagem[-1][0]
+
+    def percentil(q: float) -> float:
+        posicao = (n - 1) * q
+        baixo, alto = int(posicao // 1), -int(-posicao // 1)
+        v_baixo = no_lugar(baixo)
+        if alto == baixo:
+            return float(v_baixo)
+        return v_baixo + (posicao - baixo) * (no_lugar(alto) - v_baixo)
+
+    media = sum(v * c for v, c in contagem) / n
+    valores = [n, percentil(0.5), percentil(0.95), percentil(0.99), media,
+               contagem[0][0], contagem[-1][0]]
     chaves = ["n", "p50", "p95", "p99", "media", "min", "max"]
-    return {k: (round(v) if k != "n" else v) for k, v in zip(chaves, r)}
+    return {k: (round(v) if k != "n" else v) for k, v in zip(chaves, valores)}
 
 
 def corte_do_aquecimento(con) -> tuple[str, dict]:
@@ -223,14 +270,18 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
     obrigatorios = [c for c in OBRIGATORIOS if c in colunas and c not in NO_CAMINHO]
     obrigatorio_nulo = " OR ".join(f"{c} IS NULL" for c in obrigatorios)
 
-    na_pasta, nulas, invalidas = con.execute(f"""
+    # Tudo numa passada so pela tabela (decisao de 27/10/2026): antes era uma
+    # leitura por campo.
+    contagens = con.execute(f"""
         SELECT count(*), count(*) FILTER (WHERE {tudo_nulo}),
                count(*) FILTER (WHERE NOT ({tudo_nulo}) AND ({obrigatorio_nulo}))
+               {"".join(f", count(*) FILTER (WHERE NOT ({tudo_nulo}) AND {c} IS NULL)" for c in obrigatorios)}
+               {"".join(f", count(*) FILTER (WHERE {c}__nc)" for c in convertidos)}
         FROM ev
     """).fetchone()
-    por_campo = {c: con.execute(
-        f"SELECT count(*) FROM ev WHERE NOT ({tudo_nulo}) AND {c} IS NULL").fetchone()[0]
-        for c in obrigatorios}
+    na_pasta, nulas, invalidas = contagens[:3]
+    por_campo = dict(zip(obrigatorios, contagens[3:3 + len(obrigatorios)]))
+    nc_na_pasta = dict(zip(convertidos, contagens[3 + len(obrigatorios):]))
 
     fora = 0
     if tem_particao_nula:
@@ -248,10 +299,11 @@ def contar_ilegiveis(con, colunas: set, tem_particao_nula: bool, duplicatas: int
 
     # Texto que chegou ao destino e nao converte para o tipo do contrato. Ja
     # esta dentro dos "nulos por campo" acima; aqui e separado do campo ausente.
+    # Na tabela `ev` isso ja vem marcado (<campo>__nc); a particao nula, que e
+    # pequena, continua lida com o texto ao lado.
     nao_convertem = {}
     for c in convertidos:
-        n = con.execute(
-            f"SELECT count(*) FROM ev WHERE {c}__txt IS NOT NULL AND {c} IS NULL").fetchone()[0]
+        n = nc_na_pasta[c]
         if tem_particao_nula and f"{c}__txt" in colunas_de(con, "sem_run_id"):
             n += con.execute(f"SELECT count(*) FROM sem_run_id "
                              f"WHERE {c}__txt IS NOT NULL AND {c} IS NULL").fetchone()[0]
@@ -358,7 +410,7 @@ def agrupar_por_checkpoint(ctimes: dict[Path, int]) -> dict[Path, int]:
     return unidade
 
 
-def latencia_por_arquivo(con, logs: list[Path]) -> dict:
+def latencia_por_arquivo(con, logs: list[Path], duplicatas: int) -> dict:
     """Latencias do Flink, com o committed_ts vindo do ctime de cada arquivo.
 
     Sem batch nao ha "espera no trigger" nem "processamento do lote": o evento
@@ -370,15 +422,27 @@ def latencia_por_arquivo(con, logs: list[Path]) -> dict:
         visibilidade            committed_ts - event_ts
 
     O log de checkpoints NAO entra na conta: e so conferido contra o ctime.
+
+    Uma linha por evento: a PRIMEIRA gravacao dele. Sem duplicatas (o normal),
+    cada evento ja tem uma linha so, e a ordenacao que escolheria a primeira e
+    pulada — com dezenas de milhoes de eventos, era ela que estourava a memoria
+    (27/10/2026). A tabela `lat` e montada uma vez e lida por todas as contas.
     """
-    con.execute("""
-        CREATE VIEW lat AS
-        SELECT * FROM (
-            SELECT gen_id, seq, event_ts, processed_ts, committed_ts, unidade,
-                   row_number() OVER (PARTITION BY gen_id, seq ORDER BY processed_ts) AS rn
+    if duplicatas:
+        con.execute("""
+            CREATE TABLE lat AS
+            SELECT * FROM (
+                SELECT gen_id, seq, event_ts, processed_ts, committed_ts, unidade,
+                       row_number() OVER (PARTITION BY gen_id, seq ORDER BY processed_ts) AS rn
+                FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL
+            ) WHERE rn = 1
+        """)
+    else:
+        con.execute("""
+            CREATE TABLE lat AS
+            SELECT gen_id, seq, event_ts, processed_ts, committed_ts, unidade
             FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL
-        ) WHERE rn = 1
-    """)
+        """)
     n_unidades, n_instantes = con.execute(
         "SELECT count(DISTINCT unidade), count(DISTINCT committed_ts) FROM lat"
     ).fetchone()
@@ -457,8 +521,21 @@ def main() -> int:
         print(f"ERRO: nenhum arquivo de dados em {pasta}", file=sys.stderr)
         return 2
 
-    con = duckdb.connect()
-    con.execute(f"SET memory_limit = '{MEMORIA_DUCKDB}'; SET temp_directory = '{TEMP_DUCKDB}'")
+    TEMP_DUCKDB.mkdir(parents=True, exist_ok=True)
+    banco = TEMP_DUCKDB / f"reconcile.{MOTOR}.{RUN_ID}.duckdb"
+    restos = (banco, banco.with_name(banco.name + ".wal"))
+    for arq in restos:
+        arq.unlink(missing_ok=True)      # sobra de uma execucao interrompida
+    con = duckdb.connect(str(banco))
+
+    def apagar_banco() -> None:
+        con.close()
+        for arq in restos:
+            arq.unlink(missing_ok=True)
+    atexit.register(apagar_banco)        # tambem quando sai por erro
+
+    con.execute(f"SET memory_limit = '{MEMORIA_DUCKDB}'; SET temp_directory = '{TEMP_DUCKDB}'; "
+                f"SET threads = {LINHAS_DUCKDB}; SET preserve_insertion_order = false")
     # filename = true: cada linha traz o arquivo de onde veio. No Flink e ele
     # que liga o evento ao instante de visibilidade (CONTRATO.md 1.6, 2.2).
     con.execute(f"""
@@ -494,12 +571,23 @@ def main() -> int:
                         [(str(a), ctimes[a], unidades[a]) for a in arqs])
         # O `*` da selecao ja traz committed_ts e unidade, vindos de arq_ctime.
         con.execute(f"""
-            CREATE VIEW ev AS
+            CREATE VIEW ev_convertido AS
             {selecao}
             FROM ev_bruto JOIN arq_ctime USING (filename)
         """)
     else:
-        con.execute(f"CREATE VIEW ev AS {selecao}, {pts_ms} AS unidade FROM ev_bruto")
+        con.execute(f"CREATE VIEW ev_convertido AS {selecao}, {pts_ms} AS unidade FROM ev_bruto")
+
+    # Le o Parquet e converte os tipos UMA vez (decisao de 27/10/2026). Como
+    # visao, cada uma das ~30 consultas abaixo relia o destino e refazia a
+    # conversao: com dezenas de milhoes de eventos, mais de 20 minutos e falta de
+    # memoria. A tabela guarda o mesmo conteudo, menos o nome do arquivo (ja
+    # usado acima) e o texto original dos campos convertidos, que so servia para
+    # saber se o campo nao converteu — isso fica numa marca, <campo>__nc. O que
+    # nao cabe no teto de memoria vai para o disco (TEMP_DUCKDB).
+    sem = ", ".join(["filename"] + [f"{c}__txt" for c in convertidos])
+    marcas = "".join(f", ({c}__txt IS NOT NULL AND {c} IS NULL) AS {c}__nc" for c in convertidos)
+    con.execute(f"CREATE TABLE ev AS SELECT * EXCLUDE ({sem}){marcas} FROM ev_convertido")
     relatorio: dict = {"motor": MOTOR, "run_id": RUN_ID, "unidade_de_progresso": modo}
 
     # LINHAS SEM run_id — ficam fora da pasta desta execucao, na particao nula
@@ -616,7 +704,7 @@ def main() -> int:
     if "processed_ts" not in colunas:
         print("  indisponivel: o destino nao tem processed_ts")
     elif modo == "arquivo":
-        relatorio.update(latencia_por_arquivo(con, logs))
+        relatorio.update(latencia_por_arquivo(con, logs, total_dup))
     elif not logs:
         print(f"  indisponivel: sem log de progresso ({METRICS}/{MOTOR}.progresso.*.jsonl)")
     else:
@@ -632,16 +720,28 @@ def main() -> int:
         #
         # A ligacao com o log e o par (batch_id, processed_ts): o batch_id
         # sozinho repete quando o checkpoint e apagado ou um batch e refeito.
-        con.execute("""
-            CREATE VIEW lat AS
-            WITH primeiro AS (
+        #
+        # Sem duplicatas, cada evento ja tem uma linha so, e a ordenacao que
+        # escolheria a primeira gravacao e pulada (27/10/2026: com dezenas de
+        # milhoes de eventos, era ela que estourava a memoria). A tabela `lat` e
+        # montada uma vez e lida por todas as contas.
+        if total_dup:
+            primeiro = """
                 SELECT gen_id, seq, event_ts, batch_id, processed_ts,
                        row_number() OVER (PARTITION BY gen_id, seq ORDER BY processed_ts) AS rn
-                FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL
-            )
+                FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL"""
+            so_o_primeiro = "WHERE rn = 1"
+        else:
+            primeiro = """
+                SELECT gen_id, seq, event_ts, batch_id, processed_ts
+                FROM ev WHERE gen_id IS NOT NULL AND seq IS NOT NULL"""
+            so_o_primeiro = ""
+        con.execute(f"""
+            CREATE TABLE lat AS
+            WITH primeiro AS ({primeiro})
             SELECT p.*, g.inicio_ts, g.committed_ts
             FROM primeiro p LEFT JOIN prog g USING (batch_id, processed_ts)
-            WHERE rn = 1
+            {so_o_primeiro}
         """)
         sem_log = con.execute(
             "SELECT count(*) FROM lat WHERE committed_ts IS NULL").fetchone()[0]

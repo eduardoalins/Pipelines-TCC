@@ -65,6 +65,7 @@ BASE_ORIGEM = {
     "sha256_gz": "8ebca1ad741295297368f2cf0315e3f36853a1a11768fb16babf8c9b83838147",
 }
 MES = "2019-10"                     # prefixo do event_id
+ESPERA_MAXIMA_S = 30                # fila do produtor cheia por mais que isso: desiste do evento
 CABECALHO = "event_time,event_type,product_id,category_id,category_code,brand,price,user_id,user_session"
 
 
@@ -171,6 +172,7 @@ def main() -> int:
     envio_inicio_ms = int(time.time() * 1000)
     t0 = time.perf_counter()
     proximo_aviso = 10.0
+    esperas, tempo_esperando = 0, 0.0      # fila local do produtor cheia
 
     for i in range(total_previsto):
         # Cronograma ABSOLUTO, como no generator.py: o alvo do evento i e
@@ -189,17 +191,40 @@ def main() -> int:
         chave = campos[7].encode("utf-8")       # user_id: a chave da mensagem (CONTRATO 1.3)
 
         cont.tentados += 1
-        try:
-            produtor.produce(topico, key=chave, value=payload, callback=entregue)
-            cont.enfileirados += 1
-            cont.bytes_payload += len(payload)
-        except BufferError:
-            # Fila local do produtor cheia: a carga oferecida deixa de virar
-            # carga atingida. Contado e reportado, como no generator.py.
-            cont.nao_enfileirados += 1
-        except KafkaException as e:
-            cont.nao_enfileirados += 1
-            print(f"[erro] produce falhou: {e}", file=sys.stderr)
+        # Fila local do produtor cheia (BufferError): o replayer ESPERA o Kafka
+        # abrir espaco e tenta de novo, como um produtor real (decisao de
+        # 27/10/2026). Ate entao a mensagem era descartada, e um unico descarte
+        # invalidava a rodada — media-se o produtor, nao o motor: no ensaio a
+        # 70 mil o Flink acompanhou, mas a disputa de CPU fez o replayer
+        # descartar 0,65% e depois 0,09%. A espera atrasa o envio; se ele cair
+        # abaixo de 99% da carga pedida, a rodada nao vale (run_round.py). O
+        # event_ts e o do momento em que a mensagem foi montada: a espera entra na
+        # latencia, igual para os dois motores. Ao fim de ESPERA_MAXIMA_S sem
+        # espaco (o Kafka parou?), a mensagem e contada como nao enfileirada.
+        inicio_espera = None
+        while True:
+            try:
+                produtor.produce(topico, key=chave, value=payload, callback=entregue)
+                cont.enfileirados += 1
+                cont.bytes_payload += len(payload)
+                break
+            except BufferError:
+                agora = time.perf_counter()
+                if inicio_espera is None:
+                    inicio_espera = agora
+                    esperas += 1
+                elif agora - inicio_espera > ESPERA_MAXIMA_S:
+                    cont.nao_enfileirados += 1
+                    print(f"[erro] fila do produtor cheia por mais de {ESPERA_MAXIMA_S} s: "
+                          f"evento {i} nao enfileirado", file=sys.stderr)
+                    break
+                produtor.poll(0.05)     # serve as confirmacoes, que liberam a fila
+            except KafkaException as e:
+                cont.nao_enfileirados += 1
+                print(f"[erro] produce falhou: {e}", file=sys.stderr)
+                break
+        if inicio_espera is not None:
+            tempo_esperando += time.perf_counter() - inicio_espera
 
         produtor.poll(0)
 
@@ -229,6 +254,7 @@ def main() -> int:
     print(f"tentados ................ {cont.tentados}")
     print(f"enfileirados ............ {cont.enfileirados}")
     print(f"nao enfileirados ........ {cont.nao_enfileirados}")
+    print(f"esperas por fila cheia .. {esperas}  ({tempo_esperando:.2f}s esperando)")
     print(f"confirmados pelo broker . {cont.confirmados}")
     print(f"erros de entrega ........ {cont.erros_entrega}")
     print(f"pendentes no flush ...... {pendentes}")
@@ -264,6 +290,8 @@ def main() -> int:
                 "tentados": cont.tentados,
                 "enfileirados": cont.enfileirados,
                 "nao_enfileirados": cont.nao_enfileirados,
+                "esperas_fila_cheia": esperas,
+                "espera_fila_cheia_s": round(tempo_esperando, 3),
                 "confirmados": cont.confirmados,
                 "erros_entrega": cont.erros_entrega,
                 "pendentes_no_flush": pendentes,

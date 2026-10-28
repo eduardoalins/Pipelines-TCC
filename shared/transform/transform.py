@@ -72,9 +72,12 @@ RUN_ID = os.getenv("RUN_ID", "")
 EVENTOS = DATA_DIR / "out" / MOTOR / "events"
 SAIDA = DATA_DIR / "transformado" / MOTOR / f"run_id={RUN_ID}"
 
-# Teto de memoria do DuckDB, o mesmo do reconcile.py (decisao de 27/10/2026): o
-# que nao cabe vai para o disco, em vez de derrubar o WSL.
-MEMORIA_DUCKDB = os.getenv("DUCKDB_MEMORIA", "1.5GB")
+# Teto de memoria e linhas de execucao do DuckDB, os mesmos do reconcile.py
+# (decisao de 27/10/2026): o que nao cabe vai para o disco, em vez de derrubar o
+# WSL. A ordem de insercao continua preservada aqui: a tabela tipada e gravada
+# em ordem.
+MEMORIA_DUCKDB = os.getenv("DUCKDB_MEMORIA", "1GB")
+LINHAS_DUCKDB = int(os.getenv("DUCKDB_LINHAS", "2"))
 TEMP_DUCKDB = DATA_DIR / "duckdb_tmp"
 
 # Os campos que vem da loja (CONTRATO.md 1.5): os que dizem se duas linhas sao o
@@ -108,7 +111,8 @@ def main() -> int:
         return 2
 
     con = duckdb.connect()
-    con.execute(f"SET memory_limit = '{MEMORIA_DUCKDB}'; SET temp_directory = '{TEMP_DUCKDB}'")
+    con.execute(f"SET memory_limit = '{MEMORIA_DUCKDB}'; SET temp_directory = '{TEMP_DUCKDB}'; "
+                f"SET threads = {LINHAS_DUCKDB}")
     lista = "[" + ", ".join("'" + str(a).replace("'", "''") + "'" for a in arqs) + "]"
     con.execute(f"CREATE VIEW bruto AS SELECT * FROM read_parquet({lista}, hive_partitioning = true)")
     colunas = {c[0] for c in con.execute("DESCRIBE bruto").fetchall()}
