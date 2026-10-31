@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 3.1 — 24/10/2026**
+**Versão 3.2 — 31/10/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -965,8 +965,8 @@ Se estes itens não forem idênticos no pipeline Flink, o OE 3 não se sustenta.
 
 **Cada rodada recebe uma janela contínua da base** (decisão do autor, 23/10/2026):
 os eventos de uma faixa de linhas consecutivas, na ordem original. O tamanho da
-janela é o número de eventos da rodada — **carga × duração**: 60 mil a 1.000 evt/s
-por 60 s, 4,5 milhões a 15.000 evt/s por 300 s.
+janela é o número de eventos da rodada — **carga × duração**: 1,5 milhão a
+5.000 evt/s por 300 s, 8,25 milhões a 27.500 evt/s por 300 s.
 
 **Onde a janela começa é sorteado pela seed da rodada**, a mesma de antes: 41 + N.
 A linha inicial é sorteada, com um gerador pseudoaleatório semeado por ela, entre
@@ -979,7 +979,7 @@ desfaria as sessões (`view → cart → purchase` de um mesmo usuário) e os pi
 movimento da loja — justamente o que torna o dado real. A janela os preserva.
 
 **As janelas podem se sobrepor**, e isso é aceito. Na carga mais pesada, dez
-janelas de 4,5 milhões não cabem nos 42,4 milhões do mês sem se cruzar. Não dá
+janelas de 8,25 milhões não cabem nos 42,4 milhões do mês sem se cruzar. Não dá
 vantagem a nenhuma rodada: cada uma começa do zero — tópico recriado, checkpoint
 apagado, JVM nova (seção 5.2) — e o motor não guarda nada da anterior.
 
@@ -989,6 +989,12 @@ mais de uma das 10 rodadas: **0%** nas combinações de 1.000 × 60 s, 7.500 × 
 15.000 × 300 s — o mínimo inevitável nesta seria ~6%. O sorteio é livre em todo o
 mês; sortear a rodada N dentro de uma faixa N do mês reduziria a sobreposição, e
 foi considerado e recusado pelo autor, para manter a regra mais simples.
+
+**Nas cargas da versão 3.2** (seção 5.2), calculada em 31/10/2026 pela mesma regra
+do replayer (seeds 42 a 51), a parte do que é enviado que aparece em mais de uma
+rodada é de **4,5%** em 5.000 × 300 s, **33,4%** em 15.000 × 300 s e **30,0%** em
+27.500 × 300 s. O cálculo reproduz os 10,8% medidos em 7.500 × 300 s; em
+15.000 × 300 s dá 33,4%, não os 34,2% medidos em 23/10/2026.
 
 **A janela é lida durante a medição, linha a linha** (decisão do autor,
 23/10/2026). **Antes** de o relógio da rodada começar, o replayer só avança no
@@ -1048,8 +1054,33 @@ esquentar, outro programa abrir — pesa igual sobre os dois.
 **O relógio é conferido antes de cada rodada** (`scripts/check_clock.py`); uma
 rodada com o relógio reprovado não começa.
 
-**O que se varia (versão 2.1, decisão de 12/10/2026).** Só duas coisas: o
-intervalo do Spark e a carga.
+**O que se varia (versão 3.2, decisões do autor de 31/10/2026).** Só a carga.
+
+| Trigger do Spark | Checkpoint do Flink | Cargas (mensagens/s) | Duração da rodada |
+|---|---|---|---|
+| 30 s | 5 s | 5.000, 15.000, 27.500 e uma quarta, a definir | 300 s |
+
+São quatro combinações, com 10 rodadas de cada motor em cada uma; as três
+primeiras são feitas antes, e a quarta carga entra nesta seção quando for
+definida.
+
+- **Um intervalo de cada motor.** O Spark com trigger de 30 s e o Flink com
+  checkpoint de 5 s, os mesmos em todas as cargas. O trigger de 5 s, que a
+  versão 2.1 também media, saiu da bateria.
+- **A carga de 27.500 é a maior que o Spark acompanhou** no ensaio local de
+  30/10/2026, já com a base real: com trigger de 30 s e rodadas de 300 s, fechou
+  lotes de ~825 mil eventos em 8 a 10 s e esvaziou a fila 22 s depois do fim do
+  envio, com pico de memória de 1.524,6 MiB num contêiner de 1.536. A 30.000
+  caiu por memória (lotes de ~900 mil), e a 25.000 acompanhou com pico de
+  1.489,9 MiB. O que limita o Spark nesta máquina é a memória, não o tempo de
+  processar. O Flink, no mesmo ensaio, acompanhou até 140.000 mensagens por
+  segundo, o limite que a base permite em 300 s.
+- **A rodada vale pela regra do `run_round.py`**, sem critério extra de
+  sustentação: envio de pelo menos 99% da carga, fila zerada em até a duração da
+  rodada, sem perdas nem duplicatas.
+
+O que segue é o que se variava **na versão 2.1** (decisão de 12/10/2026), mantido
+como registro: o intervalo do Spark e a carga.
 
 | Combinação | Trigger do Spark | Checkpoint do Flink | Cargas (mensagens/s) | Duração da rodada |
 |---|---|---|---|---|
@@ -1120,6 +1151,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 3.2 | 31/10/2026 | **§5.2 alterado; §5.1 ajustado.** O que se varia passa a ser **só a carga**: o Spark com trigger de **30 s** e o Flink com checkpoint de **5 s** em todas as combinações (sai o trigger de 5 s); cargas de **5.000, 15.000 e 27.500** mensagens por segundo e uma quarta a definir; rodadas de **300 s**, 10 por motor. A carga de 27.500 é a maior que o Spark acompanhou no ensaio local de 30/10/2026. A validade da rodada segue a regra do `run_round.py`. Decisões do autor depois dos ensaios de carga de 27/10 a 31/10/2026, local e na nuvem. O §5.1 ganha a sobreposição das janelas nas cargas novas | **Nenhuma medida.** Nenhuma rodada do benchmark com a base real havia sido feita: só ensaios de carga (27/10 a 31/10, local e na nuvem), que não entram nos resultados |
 | 3.1 | 24/10/2026 | **§2.8 novo; §1.1, §2.6 e §2.7 alterados.** O módulo de Transform passa a existir (`shared/transform/`): a regra de conversão sai do `reconcile.py` para ele, e um programa grava, depois do Load e fora da medição, a tabela tipada de cada rodada, sem duplicatas técnicas nem repetidas da origem. Dois tipos novos, para a conversão depois do Load: `amount` passa de `float64` a **`decimal(10,2)`**, exato, para `"543.10"` continuar 543,10 também depois de convertido; `event_time` passa de `string` a **`timestamp`** em UTC. **Os onze campos passam a ser obrigatórios** na contagem de inválidas: entram o `amount`, que a base traz em todo evento, e o `event_time`. Decisões do autor, ao começar o módulo de Transform. Os pipelines continuam carregando texto e só aprendem os nomes dos tipos novos | **Nenhuma medida.** O destino não muda. Nenhuma rodada do benchmark com a base real havia sido feita: só testes (23/10 local, 24/10 na nuvem) |
 | 3.0 | 23/10/2026 | **§1.5 novo; §1.1, §1.3, §1.4, §2.6, §2.7, §5, §5.1, §5.2 e §6 alterados.** Os eventos passam a ser **reais**: a base *eCommerce behavior data from multi category store* (REES46, outubro de 2019, 42.448.764 eventos, sha256 conferido), pedido da orientação. Um **replayer** substitui o gerador sintético nas rodadas: cada rodada recebe uma **janela contínua** da base, com o início sorteado pela seed da rodada, a mesma nos dois motores, carregada antes da medição. O evento ganha o 11º campo, **`event_time`**, o instante original; o `event_ts` passa a ser o instante do envio, e o `event_id`, o endereço da linha na base. Tipos de evento, preço, usuários e produtos passam a ser os da loja, como vieram. **Sem eventos malformados no benchmark.** Versão maior porque **a fonte dos dados** muda | **Todas as do benchmark.** A bateria local de 12–13/10/2026 (120 rodadas, gerador sintético) e o ensaio da nuvem de 21/10/2026 foram feitos com eventos gerados; ficam como histórico, e a bateria local **será refeita** com a base real (decisão do autor, 23/10/2026) |
 | 2.2 | 12/10/2026 | **§2.3 alterado.** O descarte de aquecimento deixa de ser a primeira unidade de progresso de cada motor e passa a ser um **tempo fixo de eventos, igual nos dois motores**: os eventos gerados nos primeiros 5 s nas rodadas de 60 s, e nos primeiros 30 s nas de 300 s. Os dois motores descartam o mesmo trecho da carga. O throughput médio segue a mesma regra | **Nenhuma medida.** Nenhuma rodada do benchmark havia sido feita |
