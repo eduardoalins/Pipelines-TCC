@@ -61,6 +61,14 @@ O Parquet NAO vai para results/. Fica em ~/tcc-data e e APAGADO quando o
 reconciliador da OK: a 10 mil evt/s, uma rodada de 10 min passa de 1 GB. Com
 DIVERGENCIA ele fica, porque e nele que se investiga. MANTER_PARQUET=1 guarda sempre.
 
+--- Estresse (ESTRESSE=1, decisoes de 01/11/2026) ---------------------------------
+Para a carga posta de proposito acima do limite, em que as rodadas nao valem. A
+rodada e feita igual; mudam tres coisas:
+  - o manifesto leva "estresse": true;
+  - o Parquet e apagado depois do reconciliador mesmo que a rodada nao valha;
+  - quando a fila nao chega a zerar (o motor caiu), a CPU e a memoria sao
+    resumidas ate a ultima leitura do coletor, em vez de ficarem de fora.
+
 Mudancas nao commitadas NAO impedem a rodada: o manifesto anota o commit e se a
 pasta local diferia dele.
 
@@ -104,6 +112,7 @@ ESPERA_PRONTO_S = 180       # ate o pipeline dizer que esta no ar
 ACOMODACAO_S = 10           # do "no ar" ate o primeiro evento
 ESPERA_ENCERRAR_S = 120     # do arquivo de parada ate o processo sair
 INTERVALO_FLINK_S = 5       # o checkpoint do Flink e fixo (decisao de 12/10/2026)
+ESTRESSE = os.environ.get("ESTRESSE") == "1"
 
 # "intervalo": o intervalo que ESTE motor usa numa combinacao de intervalo i.
 MOTORES = {
@@ -173,6 +182,8 @@ class Rodada:
             "intervalo_do_motor_s": self.intervalo_motor, "carga_evt_s": self.carga, "duracao_s": self.duracao, "rodada": self.rodada,
             "seed": self.seed, "malformed_rate": self.malformados, "passos": [],
         }
+        if ESTRESSE:
+            self.manifesto["estresse"] = True
 
     # --- utilitarios -------------------------------------------------------
     def passo(self, texto: str) -> None:
@@ -470,6 +481,8 @@ class Rodada:
         """
         arquivos = sorted((self.pasta / "metrics").glob("recursos.*.csv"))
         ini, fim = self.manifesto.get("gerador_inicio_ms"), self.manifesto.get("fila_zerou_ms")
+        if ESTRESSE and fim is None:
+            fim = float("inf")      # o motor caiu: ate a ultima leitura do coletor
         if not arquivos or ini is None or fim is None:
             return {}
         quem = (lambda c: c == "maquina") if maquina else (lambda c: self.m["conteiner"] in c)
@@ -514,12 +527,13 @@ class Rodada:
                 shutil.copy2(log, self.pasta / log.name)
 
         dados = DATA_DIR / "out" / self.motor / "events"
-        if self.motivos or os.environ.get("MANTER_PARQUET") == "1":
+        if (self.motivos and not ESTRESSE) or os.environ.get("MANTER_PARQUET") == "1":
             self.manifesto["parquet"] = f"mantido em {dados}/run_id={self.run_id}"
         else:
             for pasta in [f"run_id={self.run_id}"] + [f"run_id={p}" for p in self.m["particoes_nulas"]]:
                 shutil.rmtree(dados / pasta, ignore_errors=True)
-            self.manifesto["parquet"] = "apagado depois do reconciliador (rodada valida)"
+            self.manifesto["parquet"] = ("apagado depois do reconciliador "
+                                         + ("(estresse)" if self.motivos else "(rodada valida)"))
 
     # --- a rodada ---------------------------------------------------------------------
     def rodar(self) -> int:

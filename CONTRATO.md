@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 3.2 — 31/10/2026**
+**Versão 3.3 — 01/11/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -1058,11 +1058,32 @@ rodada com o relógio reprovado não começa.
 
 | Trigger do Spark | Checkpoint do Flink | Cargas (mensagens/s) | Duração da rodada |
 |---|---|---|---|
-| 30 s | 5 s | 5.000, 15.000, 27.500 e uma quarta, a definir | 300 s |
+| 30 s | 5 s | 5.000, 15.000 e 27.500 | 300 s |
+| 30 s | 5 s | **200.000, de estresse** (versão 3.3) | **180 s** |
 
-São quatro combinações, com 10 rodadas de cada motor em cada uma; as três
-primeiras são feitas antes, e a quarta carga entra nesta seção quando for
-definida.
+São quatro combinações, com 10 rodadas de cada motor em cada uma.
+
+**A carga de estresse (versão 3.3, decisões do autor de 01/11/2026).** A carga de
+200.000 mensagens por segundo é posta de propósito acima do limite: o Spark cai
+por memória, e o gerador desta máquina entrega cerca de 180.000 com o Flink
+rodando junto (ensaio de 31/10/2026), abaixo dos 99% que a regra exige. Nenhuma
+rodada deve valer, e a combinação existe para mostrar **como** cada motor se
+comporta acima do limite. Por isso ela roda com `ESTRESSE=1`, que muda só ela:
+
+- **uma tentativa por rodada**, em vez de duas;
+- **a combinação fecha mesmo sem rodada válida**: o `.txt` e o `.md` mostram cada
+  rodada com o motivo e os números que existirem — as latências dos eventos
+  gravados antes da queda, a CPU e a memória até a última leitura do coletor;
+- a **média e o desvio padrão continuam só das rodadas válidas**;
+- o `.md` ganha o resumo de cada rodada (quando o motor caiu, contado do início
+  do envio; quanto o gerador enviou; quantos eventos foram gravados; a maior fila;
+  os picos de CPU e memória da máquina, do Kafka e do motor) e a **série do
+  coletor de 5 em 5 s**, e pode passar do limite de linhas;
+- o Parquet é apagado depois do reconciliador mesmo com a rodada inválida, e o
+  material bruto é apagado no fechamento, como nas outras.
+
+Quando o motor cai durante o envio, a rodada é encerrada ali (seção 5.2, passo 8):
+o replayer é interrompido, e o estado da máquina fica registrado até a queda.
 
 - **Um intervalo de cada motor.** O Spark com trigger de 30 s e o Flink com
   checkpoint de 5 s, os mesmos em todas as cargas. O trigger de 5 s, que a
@@ -1151,6 +1172,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 3.3 | 01/11/2026 | **§5.2 alterado.** A quarta carga passa a ser a de **estresse**: **200.000** mensagens por segundo, rodadas de **180 s**, 10 por motor, com `ESTRESSE=1` — uma tentativa por rodada, fechamento mesmo sem rodada válida, cada rodada com o motivo e os números que existirem, média e desvio só das válidas, e no `.md` o resumo de cada rodada e a série do coletor de 5 em 5 s. Decisões do autor | **Nenhuma medida.** As combinações de 5.000 e 27.500 já fechadas (31/10/2026) não mudam: o modo só age com `ESTRESSE=1`, e sem ele os arquivos de resultado saem idênticos aos da versão anterior do `write_results.py` (verificado em 01/11/2026) |
 | 3.2 | 31/10/2026 | **§5.2 alterado; §5.1 ajustado.** O que se varia passa a ser **só a carga**: o Spark com trigger de **30 s** e o Flink com checkpoint de **5 s** em todas as combinações (sai o trigger de 5 s); cargas de **5.000, 15.000 e 27.500** mensagens por segundo e uma quarta a definir; rodadas de **300 s**, 10 por motor. A carga de 27.500 é a maior que o Spark acompanhou no ensaio local de 30/10/2026. A validade da rodada segue a regra do `run_round.py`. Decisões do autor depois dos ensaios de carga de 27/10 a 31/10/2026, local e na nuvem. O §5.1 ganha a sobreposição das janelas nas cargas novas | **Nenhuma medida.** Nenhuma rodada do benchmark com a base real havia sido feita: só ensaios de carga (27/10 a 31/10, local e na nuvem), que não entram nos resultados |
 | 3.1 | 24/10/2026 | **§2.8 novo; §1.1, §2.6 e §2.7 alterados.** O módulo de Transform passa a existir (`shared/transform/`): a regra de conversão sai do `reconcile.py` para ele, e um programa grava, depois do Load e fora da medição, a tabela tipada de cada rodada, sem duplicatas técnicas nem repetidas da origem. Dois tipos novos, para a conversão depois do Load: `amount` passa de `float64` a **`decimal(10,2)`**, exato, para `"543.10"` continuar 543,10 também depois de convertido; `event_time` passa de `string` a **`timestamp`** em UTC. **Os onze campos passam a ser obrigatórios** na contagem de inválidas: entram o `amount`, que a base traz em todo evento, e o `event_time`. Decisões do autor, ao começar o módulo de Transform. Os pipelines continuam carregando texto e só aprendem os nomes dos tipos novos | **Nenhuma medida.** O destino não muda. Nenhuma rodada do benchmark com a base real havia sido feita: só testes (23/10 local, 24/10 na nuvem) |
 | 3.0 | 23/10/2026 | **§1.5 novo; §1.1, §1.3, §1.4, §2.6, §2.7, §5, §5.1, §5.2 e §6 alterados.** Os eventos passam a ser **reais**: a base *eCommerce behavior data from multi category store* (REES46, outubro de 2019, 42.448.764 eventos, sha256 conferido), pedido da orientação. Um **replayer** substitui o gerador sintético nas rodadas: cada rodada recebe uma **janela contínua** da base, com o início sorteado pela seed da rodada, a mesma nos dois motores, carregada antes da medição. O evento ganha o 11º campo, **`event_time`**, o instante original; o `event_ts` passa a ser o instante do envio, e o `event_id`, o endereço da linha na base. Tipos de evento, preço, usuários e produtos passam a ser os da loja, como vieram. **Sem eventos malformados no benchmark.** Versão maior porque **a fonte dos dados** muda | **Todas as do benchmark.** A bateria local de 12–13/10/2026 (120 rodadas, gerador sintético) e o ensaio da nuvem de 21/10/2026 foram feitos com eventos gerados; ficam como histórico, e a bateria local **será refeita** com a base real (decisão do autor, 23/10/2026) |

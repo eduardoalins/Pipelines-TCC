@@ -48,6 +48,13 @@ e nao apaga nada.
 Uma combinacao fechada nao e refeita por engano: se a pasta dela nao existe em
 results/ e o .txt dela existe, a sequencia nao comeca.
 
+--- Estresse (ESTRESSE=1, decisoes de 01/11/2026) ---------------------------------
+Para a carga posta de proposito acima do limite. Cada rodada tem UMA tentativa —
+repetir uma rodada que vai cair de novo nao acrescenta nada —, e uma rodada que ja
+tem manifesto conta como feita, valendo ou nao. Quando as 20 tem manifesto, a
+combinacao fecha do mesmo jeito, mesmo sem rodada valida: o .txt e o .md mostram
+cada rodada com o motivo e os numeros que existirem (write_results.py).
+
 Sai com 0 se as rodadas pedidas estao todas validas; 1 se alguma ficou faltando,
 ou se a combinacao estava completa e os arquivos de resultado nao sairam; 2 se
 parou por problema do ambiente.
@@ -67,6 +74,7 @@ from write_results import SAIDA
 
 REPO = Path(__file__).resolve().parent.parent
 PREPARO_S = 90      # relogio, topico e subida do pipeline, medido em 11/10/2026
+ESTRESSE = os.environ.get("ESTRESSE") == "1"
 TODAS = [(n, motor) for n in range(1, 11) for motor in ("spark", "flink")]
 
 
@@ -77,7 +85,8 @@ def manifesto(pasta: Path) -> dict | None:
 
 def fechar(base: Path, intervalo: int, carga: int) -> bool:
     """Escreve o .txt e o .md da combinacao e, se sairam, apaga o material bruto."""
-    print("\n=== fechamento: as 20 rodadas estao validas " + "=" * 24, flush=True)
+    print("\n=== fechamento: " + ("as 20 rodadas estao feitas (estresse) " if ESTRESSE
+                                  else "as 20 rodadas estao validas ") + "=" * 24, flush=True)
     inicio = time.time()
     codigo = subprocess.run(
         [sys.executable, "-u", "benchmarks/write_results.py"], cwd=REPO,
@@ -89,7 +98,7 @@ def fechar(base: Path, intervalo: int, carga: int) -> bool:
     elif not all(a.is_file() and a.stat().st_size and a.stat().st_mtime >= inicio - 2
                  for a in (txt, md)):
         problema = f"os arquivos nao foram escritos agora em {SAIDA}"
-    elif "INCOMPLETO" in txt.read_text("utf-8"):
+    elif "INCOMPLETO" in txt.read_text("utf-8") and not ESTRESSE:
         problema = f"o {txt.name} saiu marcado como INCOMPLETO"
     if problema:
         print(f"\nNAO FECHEI: {problema}.\nO material bruto CONTINUA em {base}. "
@@ -124,12 +133,16 @@ def main() -> int:
             ordem.append((n, motor))
     pasta = lambda n, motor: base / motor / f"rodada-{n:02d}"
     valida = lambda n, motor: bool((manifesto(pasta(n, motor)) or {}).get("valida"))
+    # No estresse uma rodada com manifesto esta feita, valendo ou nao.
+    feita = (lambda n, motor: manifesto(pasta(n, motor)) is not None) if ESTRESSE else valida
 
-    pendentes = [(n, m) for n, m in ordem if not valida(n, m)]
+    pendentes = [(n, m) for n, m in ordem if not feita(n, m)]
     minutos = len(pendentes) * (duracao + PREPARO_S) / 60
     print(f"=== combinacao: intervalo {intervalo} s, carga {carga} msg/s, {duracao} s por rodada ===")
-    print(f"    rodadas pedidas: {len(ordem)}   ja validas: {len(ordem) - len(pendentes)}   "
-          f"a fazer: {len(pendentes)}")
+    if ESTRESSE:
+        print("    ESTRESSE: uma tentativa por rodada; fecha mesmo sem rodada valida")
+    print(f"    rodadas pedidas: {len(ordem)}   ja {'feitas' if ESTRESSE else 'validas'}: "
+          f"{len(ordem) - len(pendentes)}   a fazer: {len(pendentes)}")
     print(f"    tempo estimado: {minutos:.0f} min ({minutos / 60:.1f} h)   "
           f"termina por volta de {time.strftime('%H:%M', time.localtime(time.time() + minutos * 60))}")
     print()
@@ -137,7 +150,7 @@ def main() -> int:
     faltaram = []
     for i, (n, motor) in enumerate(pendentes, 1):
         print(f"--- [{i}/{len(pendentes)}] rodada {n:02d}, {motor} " + "-" * 40, flush=True)
-        for tentativa in (1, 2):
+        for tentativa in ((1,) if ESTRESSE else (1, 2)):
             env = {**os.environ, "MOTOR": motor, "INTERVALO": str(intervalo), "CARGA": str(carga),
                    "DURACAO": str(duracao), "RODADA": str(n)}
             # Uma tentativa anterior que nao valeu e guardada ao lado, nunca apagada.
@@ -151,11 +164,12 @@ def main() -> int:
                 print(f"\nSEQUENCIA INTERROMPIDA: a rodada {n:02d} de {motor} nem comecou. "
                       "Corrija o ambiente e rode o mesmo comando — ele retoma daqui.")
                 return 2
-            if tentativa == 1:
+            if tentativa == 1 and not ESTRESSE:
                 print(f"\n   a rodada nao valeu; tentando mais uma vez\n", flush=True)
         else:
             faltaram.append((n, motor))
-            print(f"\n   a rodada {n:02d} de {motor} falhou duas vezes; seguindo\n", flush=True)
+            print(f"\n   a rodada {n:02d} de {motor} " + ("nao valeu (estresse); seguindo\n"
+                  if ESTRESSE else "falhou duas vezes; seguindo\n"), flush=True)
         print(flush=True)
 
     print("=== resumo " + "=" * 57)
@@ -171,6 +185,13 @@ def main() -> int:
               f"{celula('throughput_medio_evt_s'):>8}{celula('cpu_media_pct'):>9}"
               f"{celula('mem_pico_mib'):>9}{celula('invalidas'):>7}{celula('nulas'):>7}"
               f"{celula('descartadas'):>6}")
+    if ESTRESSE:
+        if faltaram:
+            print("\nNAO VALERAM (estresse, esperado): "
+                  + ", ".join(f"rodada {n:02d} de {m}" for n, m in faltaram))
+        if all(feita(n, motor) for n, motor in TODAS):
+            return 0 if fechar(base, intervalo, carga) else 1
+        return 0
     if faltaram:
         print("\nFICARAM FALTANDO: " + ", ".join(f"rodada {n:02d} de {m}" for n, m in faltaram))
         print("As tentativas falhas estao guardadas ao lado, em results/. "

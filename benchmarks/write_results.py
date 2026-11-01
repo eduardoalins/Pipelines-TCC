@@ -38,11 +38,22 @@ escreve exatamente o mesmo.
                 a reescreve: preserva tudo o que estiver abaixo da linha de
                 marcacao, e avisa quando os numeros mudaram com ela ja escrita.
 
+--- Estresse (decisoes de 01/11/2026) ----------------------------------------------
+Uma combinacao cujas rodadas tem "estresse" no manifesto (run_round.py com
+ESTRESSE=1) e a carga posta de proposito acima do limite. Nela:
+  - a rodada que nao valeu mostra o motivo E os numeros que existirem;
+  - a media e o desvio padrao continuam so das rodadas validas;
+  - o cabecalho (periodo, commit, imagens, duracao) sai de todas as rodadas;
+  - o .md ganha, depois das Ocorrencias, o resumo de cada rodada (quando o motor
+    caiu, quanto enviou e gravou, a maior fila, os picos da maquina) e a serie do
+    coletor de 5 em 5 s — e pode passar do limite de linhas, sem aviso.
+
 Sai com 0 se escreveu; 2 se nao havia o que ler ou onde escrever.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -88,6 +99,10 @@ LIMITE_LINHAS_MD = 300
 MARCA = ("<!-- LEITURA: daqui para baixo o texto e escrito a mao; "
          "benchmarks/write_results.py preserva o que estiver abaixo desta linha -->")
 LEITURA_VAZIA = "## 7. Leitura\n\n_Ainda não escrita._\n"
+# Estresse: o nome do conteiner de cada motor nas leituras do coletor, e o passo da serie.
+CONTEINER = {"spark": "spark-run", "flink": "flink-run"}
+PASSO_SERIE_S = 5
+MIB = 1048576
 
 # chave, nome completo, onde esta no bloco "resultado" do manifesto, unidade, casas
 # decimais na linha da rodada. A media e o desvio padrao levam uma casa a mais.
@@ -149,6 +164,7 @@ def carregar(base: Path) -> dict:
             pasta = base / motor / f"rodada-{n:02d}"
             relatorios = sorted(pasta.glob(f"reconcile.{motor}.*.json")) if pasta.is_dir() else []
             rodadas[motor, n] = {
+                "pasta": pasta,
                 "existe": pasta.is_dir(),
                 "manifesto": ler(pasta / "manifesto.json"),
                 "relatorio": ler(relatorios[-1]) if relatorios else None,
@@ -237,8 +253,14 @@ class Combinacao:
         self.validas = {motor: [n for n in RODADAS if vale(self.rodadas[motor, n])]
                         for motor, _ in MOTORES}
         self.total_validas = sum(len(v) for v in self.validas.values())
+        self.estresse = any((r["manifesto"] or {}).get("estresse") for r in self.rodadas.values())
+        # As rodadas que descrevem a combinacao (cabecalho, intervalos): as validas — ou,
+        # no estresse, todas as que tem manifesto.
+        self.descritas = {motor: [n for n in RODADAS if self.rodadas[motor, n]["manifesto"]
+                                  and (self.estresse or vale(self.rodadas[motor, n]))]
+                          for motor, _ in MOTORES}
         self.manifestos = [self.rodadas[motor, n]["manifesto"]
-                           for motor, _ in MOTORES for n in self.validas[motor]]
+                           for motor, _ in MOTORES for n in self.descritas[motor]]
         self.duracoes = sorted({m["duracao_s"] for m in self.manifestos})
         self.nucleos = sorted({nucleos(m) for m in self.manifestos})
         # O intervalo que cada motor usou de fato. O da combinacao e o do Spark; o
@@ -247,7 +269,7 @@ class Combinacao:
         self.intervalos = {
             motor: sorted({self.rodadas[motor, n]["manifesto"].get(
                 "intervalo_do_motor_s", self.rodadas[motor, n]["manifesto"]["intervalo_s"])
-                for n in self.validas[motor]})
+                for n in self.descritas[motor]})
             for motor, _ in MOTORES}
         # {rodada: proporcao} das rodadas que levaram eventos malformados, como foi gravado.
         self.malformadas = {}
@@ -324,7 +346,10 @@ class Combinacao:
                 r = self.rodadas[motor, n]
                 campos = ", ".join(f"{nome} - {celula(valor(r, chave), chave)}"
                                    for chave, nome, *_ in CAMPOS)
-                linhas.append(f"Rodada {n} {sigla}: {situacao(r) or campos}")
+                if self.estresse and r["manifesto"] and situacao(r):
+                    linhas.append(f"Rodada {n} {sigla}: {situacao(r)} | {campos}")
+                else:
+                    linhas.append(f"Rodada {n} {sigla}: {situacao(r) or campos}")
             linhas.append("")
         for rotulo, indice in (("Media", 0), ("Desvio padrão", 1)):
             for motor, sigla in MOTORES:
@@ -347,6 +372,8 @@ class Combinacao:
              "As seções 1 a 6 são reescritas a cada geração; a seção 7 é preservada.", ""]
         L += self.cabecalho() + self.resumo() + self.por_rodada() + self.integridade()
         L += self.apoio() + self.ocorrencias()
+        if self.estresse:
+            L += self.estresse_resumo() + self.estresse_serie()
         return "\n".join(L) + "\n"
 
     def cabecalho(self) -> list[str]:
@@ -368,8 +395,11 @@ class Combinacao:
                 f"| Duração de cada rodada | {self.duracao()} |",
                 f"| Eventos | {self.eventos()} |",
                 f"| CPU | {self.cpu()} |",
-                f"| Rodadas válidas | {validas} |",
-                f"| Falha induzida | {self.falha_induzida()} |",
+                f"| Rodadas válidas | {validas} |"]
+                + (["| Estresse | carga posta acima do limite: uma tentativa por rodada; a rodada "
+                    "que não valeu aparece com o motivo e os números que existirem; média e "
+                    "desvio padrão só das válidas (seções 6.1 e 6.2) |"] if self.estresse else [])
+                + [f"| Falha induzida | {self.falha_induzida()} |",
                 f"| Período | {dia(min(quando))} a {dia(max(quando))} |" if quando else "| Período | — |",
                 f"| Commit | {lista(f'`{c}`' for c in commits) if commits else '—'} |",
                 "| Imagens | " + (" · ".join(f"`{nome}` {lista(sorted(ids))}"
@@ -390,15 +420,24 @@ class Combinacao:
         return L + [""]
 
     def tabela_rodadas(self, cabecalho: list[str], chaves: tuple, extra) -> list[str]:
-        """Uma linha por rodada e por motor; as rodadas com malformados em negrito."""
+        """Uma linha por rodada e por motor; as rodadas com malformados em negrito.
+        No estresse, uma coluna a mais diz se a rodada valeu, e a que nao valeu mostra
+        os numeros que tiver (o motivo esta nas Ocorrencias)."""
+        if self.estresse:
+            cabecalho = ["Situação"] + cabecalho
         L = ["| Rodada | Motor | " + " | ".join(cabecalho) + " |",
              "|---|---|" + "---:|" * len(cabecalho)]
         for n in RODADAS:
             rotulo = f"**{n}**" if n in self.malformadas else str(n)
             for motor, sigla in MOTORES:
                 r = self.rodadas[motor, n]
-                celulas = ([situacao(r)] if situacao(r) else
-                           extra(r) + [celula(valor(r, c), c, 0, "—") for c in chaves])
+                numeros = lambda: extra(r) + [celula(valor(r, c), c, 0, "—") for c in chaves]
+                if self.estresse and r["manifesto"]:
+                    celulas = ["válida" if vale(r) else "não valeu"] + numeros()
+                elif situacao(r):
+                    celulas = [situacao(r)]
+                else:
+                    celulas = numeros()
                 L.append(f"| {rotulo} | {sigla} | " + " | ".join(celulas) + " |")
         return L
 
@@ -406,14 +445,16 @@ class Combinacao:
         negrito = (["", "Em negrito, as rodadas com eventos malformados."]
                    if self.malformadas else [])
 
+        real = any(m.get("janela") for m in self.manifestos)
+
         def origem(r: dict) -> list[str]:
-            """A janela da base (linhas), ou a semente nas rodadas do gerador sintetico."""
+            """A janela da base (linhas), ou a semente nas rodadas do gerador sintetico.
+            Sem janela numa combinacao da base real: a rodada caiu antes de o replayer
+            terminar, e ele nao chegou a registra-la."""
             j = r["manifesto"].get("janela")
             if j:
                 return [f"{j['primeira_linha']:,}–{j['ultima_linha']:,}".replace(",", ".")]
-            return [str(r["manifesto"]["seed"])]
-
-        real = any(m.get("janela") for m in self.manifestos)
+            return ["—"] if real else [str(r["manifesto"]["seed"])]
         return (["## 3. Por rodada", ""]
                 + self.tabela_rodadas(
                     ["Janela (linhas)" if real else "Semente", "Proc. P50", "Proc. P99", "Vis. P50", "Vis. P99", "Throughput",
@@ -504,10 +545,134 @@ class Combinacao:
             itens.append("As rodadas válidas não usaram todas as mesmas imagens.")
         return ["## 6. Ocorrências", ""] + [f"- {i}" for i in itens or ["Nenhuma."]] + [""]
 
+    # --- estresse (decisoes de 01/11/2026) ---------------------------------------------
+    def leituras(self, motor: str, r: dict) -> dict | None:
+        """As leituras do coletor de uma rodada, do inicio do envio em diante.
+
+        {"t0": ms, "recursos": {categoria: [(ts, cpu_ns, cpu_pct, mem_mib)]}, "fila": [(ts, total)]}
+        com as categorias maquina, kafka e motor. Le os CSVs que o coletor grava na
+        pasta da rodada; None se eles nao existem."""
+        m, pasta = r["manifesto"], r["pasta"]
+        rec = sorted((pasta / "metrics").glob("recursos.*.csv"))
+        lag = sorted((pasta / "metrics").glob("lag.*.csv"))
+        t0 = (m or {}).get("gerador_inicio_ms")
+        if not rec or t0 is None:
+            return None
+        recursos = {"maquina": [], "kafka": [], "motor": []}
+        for l in csv.DictReader(open(rec[-1], encoding="utf-8")):
+            ts, c = int(l["amostra_ts"]), l["conteiner"]
+            cat = ("maquina" if c == "maquina" else "kafka" if c == "kafka"
+                   else "motor" if CONTEINER[motor] in c else None)
+            if cat and ts >= t0:
+                recursos[cat].append((ts, int(l["cpu_ns"]), float(l["cpu_pct"]) if l["cpu_pct"] else None,
+                                      int(l["mem_sem_cache_bytes"]) / MIB))
+        por_ts = {}
+        for l in csv.DictReader(open(lag[-1], encoding="utf-8")) if lag else []:
+            ts = int(l["amostra_ts"])
+            if ts >= t0 and l["lag"]:
+                por_ts[ts] = por_ts.get(ts, 0) + int(l["lag"])
+        return {"t0": t0, "recursos": recursos, "fila": sorted(por_ts.items())}
+
+    @staticmethod
+    def cpu_media(linhas: list) -> float | None:
+        """Tempo de CPU consumido / tempo decorrido, como o run_round.py — em % de UM nucleo."""
+        if len(linhas) < 2:
+            return None
+        segundos = (linhas[-1][0] - linhas[0][0]) / 1000
+        return (linhas[-1][1] - linhas[0][1]) / 1e9 / segundos * 100 if segundos > 0 else None
+
+    def queda(self, r: dict, s: dict | None) -> str:
+        """Quando o motor caiu, contado do inicio do envio: a ultima leitura do conteiner dele."""
+        quebrou = (r["manifesto"] or {}).get("quebrou")
+        if not quebrou:
+            return "não caiu"
+        motor = (s or {}).get("recursos", {}).get("motor")
+        quando = (f"aos {(motor[-1][0] - s['t0']) / 1000:.0f} s" if motor else "antes da 1ª leitura")
+        return quando + (" (durante o envio)" if "DURANTE" in quebrou else " (esvaziando a fila)")
+
+    def estresse_resumo(self) -> list[str]:
+        L = ["## 6.1 Estresse: o que aconteceu em cada rodada", "",
+             "Contado do início do envio. CPU em porcentagem da máquina inteira; memória sem "
+             "o cache de arquivos, como no resto do arquivo. Picos e médias do início do envio "
+             "até a última leitura do coletor.", "",
+             "| Rodada | Motor | Situação | Queda | Envio real | Eventos gravados | Maior fila "
+             "| CPU máquina média | CPU máquina máx. | Mem. máquina pico | Mem. Kafka pico "
+             "| Mem. motor pico |",
+             "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+        inteiro = lambda v: "—" if v is None else f"{v:,.0f}".replace(",", ".")
+        pct = lambda v, k: "—" if v is None else num(v / k, 1) + "%"
+        for n in RODADAS:
+            for motor, sigla in MOTORES:
+                r = self.rodadas[motor, n]
+                m = r["manifesto"]
+                if not m:
+                    L.append(f"| {n} | {sigla} | {situacao(r)} |" + " — |" * 9)
+                    continue
+                s, k = self.leituras(motor, r), nucleos(m)
+                rec = (s or {}).get("recursos", {})
+                pico = lambda cat, i: max((l[i] for l in rec.get(cat, []) if l[i] is not None),
+                                          default=None)
+                gravados = ((r["relatorio"] or {}).get("destino") or {}).get("linhas")
+                ritmo = m.get("ritmo_envio_evt_s")
+                L.append(" | ".join([
+                    f"| {n}", sigla, "válida" if vale(r) else "não valeu", self.queda(r, s),
+                    (num(ritmo, 1) + " evt/s") if ritmo is not None else "interrompido",
+                    inteiro(gravados),
+                    inteiro(max((f for _, f in (s or {}).get("fila", [])), default=None)),
+                    pct(self.cpu_media(rec.get("maquina", [])), k), pct(pico("maquina", 2), k),
+                    inteiro(pico("maquina", 3)) + " MiB", inteiro(pico("kafka", 3)) + " MiB",
+                    inteiro(pico("motor", 3)) + " MiB"]) + " |")
+        return L + [""]
+
+    def estresse_serie(self) -> list[str]:
+        L = ["## 6.2 Estresse: a máquina ao longo da rodada", "",
+             f"Leituras do coletor de {PASSO_SERIE_S} em {PASSO_SERIE_S} s, contadas do início "
+             "do envio: em cada instante, a última leitura até ele. CPU em porcentagem da "
+             "máquina inteira; memória em MiB, sem o cache; fila em eventos. Depois da queda, "
+             "as colunas do motor ficam vazias.", ""]
+        for n in RODADAS:
+            for motor, sigla in MOTORES:
+                r = self.rodadas[motor, n]
+                if not r["manifesto"]:
+                    continue
+                s, k = self.leituras(motor, r), nucleos(r["manifesto"])
+                L += [f"### Rodada {n} {sigla} — "
+                      + ("válida" if vale(r) else "não valeu") + f", {self.queda(r, s)}", ""]
+                if not s:
+                    L += ["Sem leituras do coletor.", ""]
+                    continue
+                rec = s["recursos"]
+                fim = max([l[0] for ls in rec.values() for l in ls] + [t for t, _ in s["fila"]],
+                          default=s["t0"])
+
+                def ate(lista: list, ts: int):
+                    """A ultima leitura ate o instante ts, ou None."""
+                    antes = [l for l in lista if l[0] <= ts]
+                    return antes[-1] if antes else None
+
+                L += ["| t (s) | CPU máquina | Mem. máquina | Mem. Kafka | CPU motor | Mem. motor | Fila |",
+                      "|---:|---:|---:|---:|---:|---:|---:|"]
+                for t in range(0, int((fim - s["t0"]) / 1000) + 1, PASSO_SERIE_S):
+                    ts = s["t0"] + t * 1000
+                    maq, kaf, mot = (ate(rec[c], ts) for c in ("maquina", "kafka", "motor"))
+                    # O motor so conta enquanto ainda aparece nas leituras: depois da queda, vazio.
+                    if mot and rec["motor"] and ts > rec["motor"][-1][0] + 1000:
+                        mot = None
+                    fila = ate(s["fila"], ts)
+                    if not (maq or kaf or mot or fila):
+                        continue        # ainda nenhuma leitura neste instante
+                    cpu = lambda l: "—" if not l or l[2] is None else num(l[2] / k, 1) + "%"
+                    mem = lambda l: "—" if not l else f"{l[3]:,.0f}".replace(",", ".")
+                    L.append(f"| {t} | {cpu(maq)} | {mem(maq)} | {mem(kaf)} | {cpu(mot)} | {mem(mot)} | "
+                             + ("—" if not fila else f"{fila[1]:,}".replace(",", ".")) + " |")
+                L.append("")
+        return L
+
 
 # --- escrita -----------------------------------------------------------------------
-def escrever_md(destino: Path, gerado: str) -> list[str]:
-    """Reescreve as secoes geradas e preserva o que estiver abaixo da linha de marcacao."""
+def escrever_md(destino: Path, gerado: str, com_limite: bool = True) -> list[str]:
+    """Reescreve as secoes geradas e preserva o que estiver abaixo da linha de marcacao.
+    com_limite=False (estresse): o .md leva a serie do coletor e passa do limite de linhas."""
     leitura, avisos = LEITURA_VAZIA, []
     if destino.is_file():
         antigo = destino.read_text("utf-8")
@@ -519,7 +684,7 @@ def escrever_md(destino: Path, gerado: str) -> list[str]:
         if leitura.strip() != LEITURA_VAZIA.strip() and antes != gerado:
             avisos.append("os numeros MUDARAM e a secao Leitura ja estava escrita: releia-a.")
     texto = gerado + MARCA + "\n\n" + leitura
-    if texto.count("\n") > LIMITE_LINHAS_MD:
+    if com_limite and texto.count("\n") > LIMITE_LINHAS_MD:
         avisos.append(f"o .md ficou com {texto.count(chr(10))} linhas; o limite e {LIMITE_LINHAS_MD}.")
     destino.write_text(texto, encoding="utf-8")
     return avisos
@@ -547,7 +712,7 @@ def main() -> int:
         for base in bases:
             c = Combinacao(base)
             # O .md primeiro: e ele que pode se recusar, e ai o .txt tambem nao muda.
-            avisos = escrever_md(SAIDA / f"{c.nome}.md", c.md())
+            avisos = escrever_md(SAIDA / f"{c.nome}.md", c.md(), com_limite=not c.estresse)
             (SAIDA / f"{c.nome}.txt").write_text(c.txt(), encoding="utf-8")
             print(f"{c.nome}  (.txt e .md)")
             print("   rodadas validas: " + ", ".join(
