@@ -62,9 +62,9 @@ services:
       KAFKA_LOG_DIRS: /var/lib/kafka/data
 
       # --- Replicacao ----------------------------------------------------
-      # Fator 1 porque ha um broker so. Na AWS (Etapa 10) sobe para 3 com
-      # min.insync.replicas=2, e o CONTRATO.md registra a diferenca: os
-      # numeros locais e os da nuvem nao sao intercambiaveis.
+      # Fator 1 porque ha um broker so, tambem na AWS (Etapa 10). O RF 3
+      # previsto para a nuvem servia ao teste de queda de broker, que ficou
+      # fora do escopo (CONTRATO.md, versao 3.4).
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1

@@ -1,6 +1,6 @@
 # CONTRATO DE DADOS
 
-**Versão 3.3 — 01/11/2026**
+**Versão 3.4 — 24/11/2026**
 **Status: congelado, sem pendências**
 
 ---
@@ -715,8 +715,8 @@ as mesmas 5.993 linhas, iguais ao texto da base.
 |---|---|---|
 | Nome | `ecommerce.events.v1` | Sufixo de versão evita ambiguidade se o schema mudar |
 | Partições | **24** | Teto do paralelismo dos dois frameworks; fixado uma vez e nunca alterado |
-| Fator de replicação | 1 local, **3** na nuvem | RF 3 é necessário para o teste de queda de broker (cenário C2) |
-| `min.insync.replicas` | 1 local, **2** na nuvem | Sem isso, `acks=all` com RF 3 ainda perde dados (decisão E1) |
+| Fator de replicação | **1**, local e nuvem | Um único broker nos dois ambientes (versão 3.4). O RF 3 na nuvem estava previsto para o teste de queda de broker (cenário C2), que ficou fora do escopo |
+| `min.insync.replicas` | **1**, local e nuvem | Com um broker só, não há réplica para exigir. O valor 2 acompanhava o RF 3 previsto para a nuvem (decisão E1), que não foi usado |
 | `retention.ms` | **168 h** | ver 3.1 |
 | `retention.bytes` | **1 GiB por partição** | ver 3.2 |
 | `compression.type` (tópico) | `producer` | O broker preserva a compressão aplicada pelo produtor |
@@ -746,8 +746,8 @@ nem do outro motor.
 
 **Limite declarado.** Fora do script de rodada — nas execuções feitas à mão — as
 mensagens ficam no tópico por até 168 h, e passado esse prazo o Kafka apaga tudo
-sem aviso (visto em 07/10/2026). Na nuvem o valor é revisto junto com o fator de
-replicação.
+sem aviso (visto em 07/10/2026). Na nuvem vale o mesmo valor: o fator de
+replicação também ficou em 1, com um único broker (versão 3.4).
 
 ### 3.2 Retenção por tamanho — a unidade importa
 
@@ -1172,6 +1172,7 @@ no S3 e é uma das diferenças que a comparação existe para revelar.
 | Versão | Data | Alteração | Execuções invalidadas |
 |---|---|---|---|
 | 1.0 | 04/09/2026 | Congelamento inicial | — |
+| 3.4 | 24/11/2026 | **§3 corrigido (registro, não desenho).** O fator de replicação e o `min.insync.replicas` passam a constar como **1 nos dois ambientes**, como de fato rodou: a nuvem usou um único broker, e o `create_topic.sh` cria o tópico com RF 1 por padrão, sem nenhum script da AWS mudar isso. O RF 3 previsto para a nuvem servia ao teste de queda de broker (cenário C2), que ficou fora do escopo. A nota do §3.1 sobre rever a retenção na nuvem foi ajustada pelo mesmo motivo. Correção apontada na revisão do texto do TCC, que passou a indicar este contrato | **Nenhuma.** Todas as rodadas, locais e na nuvem, já foram feitas com RF 1 |
 | 3.3 | 01/11/2026 | **§5.2 alterado.** A quarta carga passa a ser a de **estresse**: **200.000** mensagens por segundo, rodadas de **180 s**, 10 por motor, com `ESTRESSE=1` — uma tentativa por rodada, fechamento mesmo sem rodada válida, cada rodada com o motivo e os números que existirem, média e desvio só das válidas, e no `.md` o resumo de cada rodada e a série do coletor de 5 em 5 s. Decisões do autor | **Nenhuma medida.** As combinações de 5.000 e 27.500 já fechadas (31/10/2026) não mudam: o modo só age com `ESTRESSE=1`, e sem ele os arquivos de resultado saem idênticos aos da versão anterior do `write_results.py` (verificado em 01/11/2026) |
 | 3.2 | 31/10/2026 | **§5.2 alterado; §5.1 ajustado.** O que se varia passa a ser **só a carga**: o Spark com trigger de **30 s** e o Flink com checkpoint de **5 s** em todas as combinações (sai o trigger de 5 s); cargas de **5.000, 15.000 e 27.500** mensagens por segundo e uma quarta a definir; rodadas de **300 s**, 10 por motor. A carga de 27.500 é a maior que o Spark acompanhou no ensaio local de 30/10/2026. A validade da rodada segue a regra do `run_round.py`. Decisões do autor depois dos ensaios de carga de 27/10 a 31/10/2026, local e na nuvem. O §5.1 ganha a sobreposição das janelas nas cargas novas | **Nenhuma medida.** Nenhuma rodada do benchmark com a base real havia sido feita: só ensaios de carga (27/10 a 31/10, local e na nuvem), que não entram nos resultados |
 | 3.1 | 24/10/2026 | **§2.8 novo; §1.1, §2.6 e §2.7 alterados.** O módulo de Transform passa a existir (`shared/transform/`): a regra de conversão sai do `reconcile.py` para ele, e um programa grava, depois do Load e fora da medição, a tabela tipada de cada rodada, sem duplicatas técnicas nem repetidas da origem. Dois tipos novos, para a conversão depois do Load: `amount` passa de `float64` a **`decimal(10,2)`**, exato, para `"543.10"` continuar 543,10 também depois de convertido; `event_time` passa de `string` a **`timestamp`** em UTC. **Os onze campos passam a ser obrigatórios** na contagem de inválidas: entram o `amount`, que a base traz em todo evento, e o `event_time`. Decisões do autor, ao começar o módulo de Transform. Os pipelines continuam carregando texto e só aprendem os nomes dos tipos novos | **Nenhuma medida.** O destino não muda. Nenhuma rodada do benchmark com a base real havia sido feita: só testes (23/10 local, 24/10 na nuvem) |
